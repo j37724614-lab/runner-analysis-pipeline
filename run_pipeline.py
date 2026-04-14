@@ -22,6 +22,7 @@ import shutil
 import argparse
 import subprocess
 import resource
+from pathlib import Path
 
 # -----------------------------------------------------------------------
 # 啟動時將 RLIMIT_NPROC 軟限制提升至硬限制上限。
@@ -36,24 +37,27 @@ except Exception:
     pass  # 部分系統不支援或無權限，靜默略過
 
 # =======================================================================
-# 路徑設定（只需修改此區即可搬移整個 pipeline）
+# 路徑設定：以此腳本所在目錄為 repo 根目錄，自動推算所有路徑。
+# clone 下來後無需修改任何路徑，直接執行即可。
 # =======================================================================
 
+BASE_DIR = Path(__file__).resolve().parent   # repo 根目錄（run_pipeline.py 所在處）
+
 # Step 1：追蹤腳本路徑與輸出目錄
-TRACK_SCRIPT  = "/home/jeter/MotionAGFormer/scripts/tracking/track_crop_roi.py"
-TRACK_OUT_DIR = "/home/jeter/MotionAGFormer/output_cut"
+TRACK_SCRIPT  = BASE_DIR / "scripts" / "tracking" / "track_crop_roi.py"
+TRACK_OUT_DIR = BASE_DIR / "output_cut"
 # track_crop_roi.py 執行完畢後，會將實際輸出的影片檔名（不含路徑）
 # 寫入此 marker 檔；step2_copy() 讀取它以取得動態命名的結果。
-TRACK_MARKER  = os.path.join(TRACK_OUT_DIR, ".last_output_name")
+TRACK_MARKER  = TRACK_OUT_DIR / ".last_output_name"
 
 # Step 3：vis.py 的相關路徑
 # vis.py 使用相對路徑載入模型權重，因此必須以 VIS_WORKDIR 作為工作目錄執行。
-VIS_WORKDIR   = "/home/jeter/MotionAGFormer/MotionAGFormer"
+VIS_WORKDIR   = BASE_DIR / "MotionAGFormer"
 VIS_SCRIPT    = "demo/vis.py"    # 相對於 VIS_WORKDIR
 VIS_VIDEO_DIR = "demo/video"     # vis.py 讀取輸入影片的目錄（相對於 VIS_WORKDIR）
 
 # Step 4：角度疊加腳本
-OVERLAY_SCRIPT = "/home/jeter/MotionAGFormer/scripts/visualization/add_angle_overlay.py"
+OVERLAY_SCRIPT = BASE_DIR / "scripts" / "visualization" / "add_angle_overlay.py"
 
 # =======================================================================
 
