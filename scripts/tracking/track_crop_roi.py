@@ -77,8 +77,10 @@ OUTPUT_DIR = str(BASE_DIR / "output_cut")
 
 # 固定裁剪尺寸（以最快人物中心為基準）
 # 建議值：先執行一次看底部「建議 CROP_WIDTH/CROP_HEIGHT」的統計輸出再調整
+# 或在 config 加入 auto_crop: true，讓程式自動以中位數 × 2 決定尺寸
 CROP_WIDTH  = 200
 CROP_HEIGHT = 260
+AUTO_CROP   = False  # True → 先 dry-run 收集 bbox 統計，自動設定裁剪尺寸
 
 # 是否在裁剪畫面上疊加框
 #   True  = 綠色 bbox（最快跑者）+ 藍色 ROI 框
@@ -393,6 +395,134 @@ def process_frame(img, model, velocity_tracker, device,
     return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig
 
 
+def _process_cameras(caps, cameras, model, out, dry_run=False):
+    """
+    逐台相機執行 YOLO 追蹤並（選擇性）寫入影片。
+
+    dry_run=True  → 只收集 bbox 統計，不呼叫 out.write()，用於 auto_crop 第一遍掃描。
+    dry_run=False → 正常模式，將裁剪後的幀寫入 out。
+
+    回傳: (total_written, total_skipped, bbox_widths, bbox_heights, max_w, max_h)
+    """
+    total_written = 0
+    total_skipped = 0
+    all_bbox_widths  = []
+    all_bbox_heights = []
+    max_bbox_width   = 0
+    max_bbox_height  = 0
+
+    for cam_idx, (cam, cap) in enumerate(zip(cameras, caps)):
+        if not cap.isOpened():
+            raise ValueError(f"無法開啟相機 {cam_idx+1}: {cam['video_path']}")
+
+        vid_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if not dry_run:
+            print(f"{'─'*60}")
+            print(f"相機 {cam_idx+1}/{len(cameras)}: {cam['video_path']}")
+            print(f"  解析度: {vid_w}x{vid_h}，幀數: {total}，FPS: {fps:.1f}")
+
+        cp = cam['crop_params']
+        if cp and not dry_run:
+            cx1c, cy1c = max(0, cp[0]), max(0, cp[1])
+            cx2c, cy2c = min(vid_w, cp[2]), min(vid_h, cp[3])
+            print(f"  CROP: ({cx1c},{cy1c}) → ({cx2c},{cy2c})，"
+                  f"裁剪後: {cx2c-cx1c}x{cy2c-cy1c}")
+
+        if not dry_run:
+            if cam['roi_enabled'] and not cam['roi_zones']:
+                rx, ry = cam['roi_zones'][0]['x'], cam['roi_zones'][0]['y'] if cam['roi_zones'] else (None, None)
+                for j, z in enumerate(cam['roi_zones']):
+                    print(f"  ROI 區域 {j+1}: X={z['x']}, Y={z['y']}")
+            elif cam['roi_enabled']:
+                for j, z in enumerate(cam['roi_zones']):
+                    print(f"  ROI 區域 {j+1}: X={z['x']}, Y={z['y']}")
+
+        switch_x    = cam.get('switch_x')
+        is_last_cam = (cam_idx == len(cameras) - 1)
+        if not dry_run:
+            if switch_x:
+                ref_label = 'bx2（右緣）' if is_last_cam else 'center_x'
+                print(f"  切換條件: 最快人物 {ref_label}（原始座標）> {switch_x}px")
+            else:
+                print(f"  切換條件: 跑完整段影片")
+
+        crop_x_offset = cp[0] if cp else 0
+        crop_y_offset = cp[1] if cp else 0
+
+        velocity_tracker = {}
+        _instant_start = (cam_idx > 0)
+        cam_skipped = 0
+        cam_written = 0
+        frame_count = 0
+
+        if not dry_run:
+            print(f"  [處理中...]")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_count += 1
+
+            try:
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
+                    frame, model, velocity_tracker, DEVICE,
+                    cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
+                    crop_x_offset, crop_y_offset,
+                    instant_start=_instant_start,
+                )
+            except RuntimeError:
+                torch.cuda.empty_cache()
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
+                    frame, model, velocity_tracker, DEVICE,
+                    cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
+                    crop_x_offset, crop_y_offset,
+                    instant_start=_instant_start,
+                )
+
+            if crop_frame is None:
+                cam_skipped   += 1
+                total_skipped += 1
+                continue
+
+            if fastest_id is not None and fastest_id in velocity_tracker:
+                bx1, by1, bx2, by2 = velocity_tracker[fastest_id]['bbox']
+                bw = bx2 - bx1; bh = by2 - by1
+                all_bbox_widths.append(bw); all_bbox_heights.append(bh)
+                if bw > max_bbox_width:  max_bbox_width  = bw
+                if bh > max_bbox_height: max_bbox_height = bh
+
+            if not dry_run:
+                out.write(crop_frame)
+                cam_written  += 1
+                total_written += 1
+                if frame_count % 100 == 0:
+                    print(f"  [幀 {frame_count}/{total}] 追蹤: {len(velocity_tracker)} | "
+                          f"寫入: {cam_written} | 捨棄: {cam_skipped}")
+            else:
+                cam_written  += 1
+                total_written += 1
+
+            if switch_x is not None and fastest_id is not None:
+                trigger = fastest_bx2_orig if is_last_cam else fastest_center_orig
+                if trigger is not None and trigger > switch_x:
+                    if not dry_run:
+                        ref_name = 'bx2' if is_last_cam else 'center_x'
+                        print(f"  → 觸發{'退出ROI' if is_last_cam else '切換'}："
+                              f"{ref_name}={trigger:.0f} > {switch_x}")
+                    break
+
+        cap.release()
+        if not dry_run:
+            print(f"  相機 {cam_idx+1} 完成：寫入 {cam_written}，捨棄 {cam_skipped}")
+
+    return total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height
+
+
 def main():
     # --config 參數：若提供則從 YAML 動態載入相機設定，否則沿用上方硬編碼的 CAM1~CAM6
     _parser = argparse.ArgumentParser(add_help=False)
@@ -418,10 +548,11 @@ def main():
 
     # 允許 config 覆蓋全域常數（--config 與 --config-json 共用）
     if _cfg:
-        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, SHOW_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY
+        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, AUTO_CROP, SHOW_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY
         if 'output_dir'          in _cfg: OUTPUT_DIR         = _cfg['output_dir']
         if 'crop_width'          in _cfg: CROP_WIDTH          = int(_cfg['crop_width'])
         if 'crop_height'         in _cfg: CROP_HEIGHT         = int(_cfg['crop_height'])
+        if 'auto_crop'           in _cfg: AUTO_CROP           = bool(_cfg['auto_crop'])
         if 'show_overlay'        in _cfg: SHOW_OVERLAY        = bool(_cfg['show_overlay'])
         if 'movement_threshold'  in _cfg: MOVEMENT_THRESHOLD  = int(_cfg['movement_threshold'])
         if 'min_movement_frames' in _cfg: MIN_MOVEMENT_FRAMES = int(_cfg['min_movement_frames'])
@@ -479,39 +610,13 @@ def main():
     with open(os.path.join(OUTPUT_DIR, ".last_output_name"), "w") as _f:
         _f.write(OUTPUT_NAME)
 
-    print(f"輸出路徑: {output_path}")
-
-    # VideoWriter（輸出尺寸固定為 CROP_WIDTH × CROP_HEIGHT）
     first_fps = caps[0].get(cv2.CAP_PROP_FPS) or 60.0
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, first_fps, (CROP_WIDTH, CROP_HEIGHT))
 
-    total_written = 0
-    total_skipped = 0
-
-    # BBox 統計（用於最後建議合適的 crop 尺寸）
-    all_bbox_widths  = []
-    all_bbox_heights = []
-    max_bbox_width   = 0
-    max_bbox_height  = 0
-
-    # -----------------------------------------------------------------------
-    # 逐台相機串接處理
-    # -----------------------------------------------------------------------
+    # crop 驗證（開始前確認所有相機的 crop 參數合法）
     for cam_idx, (cam, cap) in enumerate(zip(CAMERAS, caps)):
-        if not cap.isOpened():
-            raise ValueError(f"無法開啟相機 {cam_idx+1}: {cam['video_path']}")
-
-        vid_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps    = cap.get(cv2.CAP_PROP_FPS) or 60.0
-        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        print(f"{'─'*60}")
-        print(f"相機 {cam_idx+1}/{len(CAMERAS)}: {cam['video_path']}")
-        print(f"  解析度: {vid_w}x{vid_h}，幀數: {total}，FPS: {fps:.1f}")
-
-        # crop 驗證
+        vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cp = cam['crop_params']
         if cp:
             cx1c, cy1c = max(0, cp[0]), max(0, cp[1])
@@ -523,97 +628,36 @@ def main():
                     f"  影片範圍: x=(0,{vid_w}) y=(0,{vid_h})\n"
                     f"  請將座標調整在影片解析度範圍內。"
                 )
-            print(f"  CROP: ({cx1c},{cy1c}) → ({cx2c},{cy2c})，"
-                  f"裁剪後: {cx2c-cx1c}x{cy2c-cy1c}")
 
-        if cam['roi_enabled']:
-            for j, z in enumerate(cam['roi_zones']):
-                print(f"  ROI 區域 {j+1}: X={z['x']}, Y={z['y']}")
-
-        switch_x    = cam.get('switch_x')
-        is_last_cam = (cam_idx == len(CAMERAS) - 1)
-        if switch_x:
-            ref_label = 'bx2（右緣）' if is_last_cam else 'center_x'
-            print(f"  切換條件: 最快人物 {ref_label}（原始座標）> {switch_x}px")
+    # -----------------------------------------------------------------------
+    # auto_crop：第一遍 dry-run 收集 bbox 統計，自動決定裁剪尺寸
+    # -----------------------------------------------------------------------
+    if AUTO_CROP:
+        print("auto_crop 模式：第一遍掃描（分析 bbox 尺寸，不寫影片）...")
+        _, _, dry_bw, dry_bh, _, _ = _process_cameras(caps, CAMERAS, model, None, dry_run=True)
+        # dry-run 已讀完所有影片，重新開啟
+        caps = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
+        if dry_bw and dry_bh:
+            CROP_WIDTH  = int(np.median(dry_bw)) * 2
+            CROP_HEIGHT = int(np.median(dry_bh)) * 2
+            print(f"  自動設定裁剪尺寸: {CROP_WIDTH} x {CROP_HEIGHT}（中位數 × 2）\n")
         else:
-            print(f"  切換條件: 跑完整段影片")
+            print("  警告：未收集到 bbox 資料，沿用預設尺寸\n")
 
-        # crop offset（bbox 轉回原始座標用）
-        crop_x_offset = cp[0] if cp else 0
-        crop_y_offset = cp[1] if cp else 0
+    print(f"輸出路徑: {output_path}")
+    out = cv2.VideoWriter(output_path, fourcc, first_fps, (CROP_WIDTH, CROP_HEIGHT))
 
-        # 每台相機重置速度追蹤表
-        velocity_tracker = {}
-        _instant_start = (cam_idx > 0)   # 非第一台 → 進入 ROI 第 1 幀即輸出
-        cam_skipped  = 0
-        cam_written  = 0
-        frame_count  = 0
-
-        print(f"  [處理中...]")
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_count += 1
-
-            try:
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
-                    frame, model, velocity_tracker, DEVICE,
-                    cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
-                    crop_x_offset, crop_y_offset,
-                    instant_start=_instant_start,
-                )
-            except RuntimeError:
-                torch.cuda.empty_cache()
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
-                    frame, model, velocity_tracker, DEVICE,
-                    cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
-                    crop_x_offset, crop_y_offset,
-                    instant_start=_instant_start,
-                )
-
-            # ROI 內無有效人物 → 跳過此幀
-            if crop_frame is None:
-                cam_skipped   += 1
-                total_skipped += 1
-                continue
-
-            # BBox 統計
-            if fastest_id is not None and fastest_id in velocity_tracker:
-                bx1, by1, bx2, by2 = velocity_tracker[fastest_id]['bbox']
-                bw = bx2 - bx1; bh = by2 - by1
-                all_bbox_widths.append(bw); all_bbox_heights.append(bh)
-                if bw > max_bbox_width:  max_bbox_width  = bw
-                if bh > max_bbox_height: max_bbox_height = bh
-
-            out.write(crop_frame)
-            cam_written  += 1
-            total_written += 1
-
-            if frame_count % 100 == 0:
-                print(f"  [幀 {frame_count}/{total}] 追蹤: {len(velocity_tracker)} | "
-                      f"寫入: {cam_written} | 捨棄: {cam_skipped}")
-
-            # 相機切換判斷
-            #   非最後一機 → center_x 超過 switch_x 時切換
-            #   最後一機   → bx2（右緣）超過 switch_x 時視為退出 ROI
-            if switch_x is not None and fastest_id is not None:
-                trigger = fastest_bx2_orig if is_last_cam else fastest_center_orig
-                if trigger is not None and trigger > switch_x:
-                    ref_name = 'bx2' if is_last_cam else 'center_x'
-                    print(f"  → 觸發{'退出ROI' if is_last_cam else '切換'}："
-                          f"{ref_name}={trigger:.0f} > {switch_x}")
-                    break
-
-        cap.release()
-        print(f"  相機 {cam_idx+1} 完成：寫入 {cam_written}，捨棄 {cam_skipped}")
+    # -----------------------------------------------------------------------
+    # 正式處理：逐台相機串接追蹤 + 寫入影片
+    # -----------------------------------------------------------------------
+    total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
+        _process_cameras(caps, CAMERAS, model, out)
 
     # -----------------------------------------------------------------------
     # 收尾
     # -----------------------------------------------------------------------
     out.release()
 
-    # BBox 統計輸出（協助決定合適的 CROP_WIDTH/CROP_HEIGHT）
     avg_w = int(np.mean(all_bbox_widths))  if all_bbox_widths  else 0
     avg_h = int(np.mean(all_bbox_heights)) if all_bbox_heights else 0
     med_w = int(np.median(all_bbox_widths))  if all_bbox_widths  else 0
@@ -627,7 +671,11 @@ def main():
     print(f"  最大寬/高: {max_bbox_width} / {max_bbox_height} px")
     print(f"  平均寬/高: {avg_w} / {avg_h} px")
     print(f"  中位數寬/高: {med_w} / {med_h} px")
-    print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {med_w*2} / {med_h*2}  (中位數 × 2)")
+    if AUTO_CROP:
+        print(f"  裁剪尺寸已自動套用（中位數 × 2）")
+    else:
+        print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {med_w*2} / {med_h*2}  (中位數 × 2)")
+        print(f"  （提示：config 加入 auto_crop: true 可下次自動套用）")
 
 
 if __name__ == '__main__':

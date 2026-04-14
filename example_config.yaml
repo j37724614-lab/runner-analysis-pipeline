@@ -11,14 +11,14 @@
 # 相機設定（必填：video_path；其餘選填）
 # -----------------------------------------------------------------------
 cameras:
-  - video_path: /path/to/your/camera1.mp4   # 請填入相機 1 影片的絕對路徑
+  - video_path: /home/jeter/pipeline_release/0331-1.mp4   # 請填入相機 1 影片的絕對路徑
     crop: [0, 450, 1920, 800]   # [x起, y起, x終, y終]，送 YOLO 前先裁剪，縮小搜索範圍
     roi_x: [150, 1820]          # bbox 中心 x 的有效範圍；超出此範圍的偵測結果會被過濾
     roi_y: [0, 9999]            # bbox 中心 y 的有效範圍；通常不限制可省略
     switch_x: 1800              # 跑者 center_x（原始座標）超過此值 → 切換到下一台
                                 # 最後一台改用 bx2（右緣）判斷；省略 → 跑完整段再切
 
-  - video_path: /path/to/your/camera2.mp4   # 請填入相機 2 影片的絕對路徑
+  - video_path: /home/jeter/pipeline_release/0331-2.mp4   # 請填入相機 2 影片的絕對路徑
     crop: [0, 450, 1920, 800]
     roi_x: [150, 1820]
     switch_x: 1800
@@ -37,8 +37,9 @@ cameras:
 # 輸出設定
 # -----------------------------------------------------------------------
 # output_dir: /path/to/your/output_cut   # 輸出目錄（預設：repo 根目錄下的 output_cut/）
-# crop_width: 200     # 最終輸出影片寬度（px）；建議 = bbox 中位數寬 × 2
-# crop_height: 260    # 最終輸出影片高度（px）；建議 = bbox 中位數高 × 2
+# auto_crop: true     # 自動以 bbox 中位數 × 2 決定裁剪尺寸（兩遍掃描，無需手動填寬高）
+# crop_width: 200     # 手動指定輸出寬度（auto_crop: true 時忽略此項）
+# crop_height: 260    # 手動指定輸出高度（auto_crop: true 時忽略此項）
 # show_overlay: true  # true = 顯示綠色 bbox + 藍色 ROI 框；false = 乾淨畫面
 
 
