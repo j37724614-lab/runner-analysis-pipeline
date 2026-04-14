@@ -1,0 +1,49 @@
+# Core deep learning
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+torchaudio==2.7.0+cu128
+triton==3.3.0
+timm==0.9.16
+
+# YOLO / object detection
+ultralytics==8.4.21
+ultralytics-thop==2.0.18
+
+# Pose estimation / tracking
+filterpy==1.4.5
+lap==0.5.13
+numba==0.65.0
+llvmlite==0.47.0
+
+# Computer vision
+opencv-python==4.13.0.92
+scikit-image==0.26.0
+pillow==11.0.0
+imageio-ffmpeg==0.6.0
+ImageIO==2.37.3
+moviepy==1.0.3
+
+# Data processing
+numpy==1.26.3
+pandas==3.0.1
+polars==1.39.0
+scipy==1.13.1
+scikit-learn==1.6.1
+
+# Visualization
+matplotlib==3.9.4
+
+# Utilities
+PyYAML==6.0.3
+easydict==1.13
+yacs==0.1.8
+tqdm==4.67.1
+huggingface_hub==1.9.0
+safetensors==0.7.0
+requests==2.32.5
+filelock==3.13.1
+packaging==24.2
+
+# NVIDIA CUDA (auto-installed with torch, listed for reference)
+# nvidia-cublas-cu12==12.8.3.14
+# nvidia-cudnn-cu12==9.7.1.26
