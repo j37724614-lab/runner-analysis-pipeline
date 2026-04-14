@@ -1,5 +1,21 @@
-請從 MotionAGFormer 官方 repo 下載模型權重後放置於此目錄：
-  motionagformer-l-h36m.pth.tr  ← vis.py 預設載入此檔
+請下載以下模型權重並放置於此目錄（checkpoint/）
 
-下載來源：
-  https://github.com/TaatiTeam/MotionAGFormer
+vis.py 預設載入：motionagformer-l-h36m.pth.tr
+
+MotionAGFormer 官方 Google Drive 下載連結：
+
+  MotionAGFormer-L (H3.6M) ← 本 pipeline 使用此版本：
+    https://drive.google.com/file/d/1WI8QSsD84wlXIdK1dLp6hPZq4FPozmVZ/view?usp=sharing
+
+  MotionAGFormer-B (H3.6M)：
+    https://drive.google.com/file/d/1Iii5EwsFFm9_9lKBUPfN8bV5LmfkNUMP/view?usp=drive_link
+
+  MotionAGFormer-S (H3.6M)：
+    https://drive.google.com/file/d/1DrF7WZdDvRPsH12gQm5DPXbviZ4waYFf/view?usp=sharing
+
+  MotionAGFormer-XS (H3.6M)：
+    https://drive.google.com/file/d/1Pab7cPvnWG8NOVd0nnL1iqAfYCUY4hDH/view?usp=sharing
+
+下載後將 .pth.tr 檔放入此 checkpoint/ 目錄。
+
+原始 repo：https://github.com/TaatiTeam/MotionAGFormer

@@ -1,7 +1,13 @@
-請下載以下檔案放置於此目錄（HRNet 2D 姿態估計所需）：
-  pose_hrnet_w48_384x288.pth     (244 MB)
-  h36m_sh_conf_cam_source_final.pkl  (1.1 GB)
-  yolov3.weights                 (237 MB)
+請下載以下檔案並放置於此目錄（demo/lib/checkpoint/）
 
-下載來源：
-  https://github.com/TaatiTeam/MotionAGFormer  (demo 說明頁)
+HRNet 2D 姿態估計 + YOLOv3 人物偵測所需：
+
+  [1] YOLOv3 + HRNet 預訓練權重（打包下載）：
+      https://drive.google.com/drive/folders/1_ENAMOsPM7FXmdYRbkwbFHgzQq_B_NQA?usp=sharing
+
+      包含以下檔案，下載後解壓放入此目錄：
+        pose_hrnet_w48_384x288.pth     (244 MB)
+        h36m_sh_conf_cam_source_final.pkl  (1.1 GB)
+        yolov3.weights                 (237 MB)
+
+原始 repo：https://github.com/TaatiTeam/MotionAGFormer（見 Demo 章節）
