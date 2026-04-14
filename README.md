@@ -29,12 +29,16 @@
 
 ## 系統需求
 
-- Python 3.8+
+- Python 3.11
 - CUDA GPU（建議 8GB VRAM 以上）
-- 套件：`torch`、`ultralytics`、`opencv-python`、`numpy`、`pandas`、`matplotlib`、`tqdm`、`pyyaml`、`Pillow`
+- ffmpeg（用於 MOV → MP4 轉換，需另行安裝）
 
 ```bash
-pip install torch torchvision ultralytics opencv-python numpy pandas matplotlib tqdm pyyaml Pillow
+# 安裝 Python 套件
+pip install -r requirements.txt
+
+# 安裝 ffmpeg（Ubuntu/Debian）
+sudo apt install ffmpeg
 ```
 
 ---
@@ -45,6 +49,8 @@ pip install torch torchvision ultralytics opencv-python numpy pandas matplotlib 
 runner-analysis-pipeline/
 ├── run_pipeline.py                  ← 主程式（從這裡執行）
 ├── example_config.yaml              ← 相機設定範例
+├── requirements.txt                 ← Python 套件清單
+├── convert_mov_to_mp4.py            ← iPhone MOV 轉 MP4 工具
 ├── yolo11x.pt                       ← YOLO 權重（見下方下載說明）
 ├── output_cut/                      ← Step 1 輸出目錄（自動建立）
 ├── scripts/
@@ -120,7 +126,20 @@ MotionAGFormer/demo/lib/checkpoint/
 
 ## 使用方式
 
-### 第一步：建立相機設定檔
+### 第一步：（選用）iPhone MOV 轉 MP4
+
+若影片為 iPhone 拍攝的 `.MOV` 格式，先用工具轉換：
+
+```bash
+# 編輯 convert_mov_to_mp4.py，在 video_list 填入你的 MOV 路徑，然後執行：
+python convert_mov_to_mp4.py
+```
+
+轉換後會在同目錄產生同名的 `.mp4` 檔案。
+
+---
+
+### 第二步：建立相機設定檔
 
 複製範例設定並修改影片路徑：
 
@@ -141,18 +160,14 @@ cameras:
     crop: [0, 450, 1920, 800]
     roi_x: [150, 1820]
     switch_x: 1800
+
+# 自動決定裁剪尺寸（建議第一次使用時開啟）
+auto_crop: true
 ```
 
-### 第二步：修改 `run_pipeline.py` 中的路徑
+> 所有路徑設定均以 repo 根目錄為基準自動推算，**clone 後不需修改任何程式碼**。
 
-打開 `run_pipeline.py`，將路徑改為你的實際安裝位置：
-
-```python
-TRACK_SCRIPT  = "/your/path/scripts/tracking/track_crop_roi.py"
-TRACK_OUT_DIR = "/your/path/output_cut"
-VIS_WORKDIR   = "/your/path/MotionAGFormer"
-OVERLAY_SCRIPT = "/your/path/scripts/visualization/add_angle_overlay.py"
-```
+---
 
 ### 第三步：執行 Pipeline
 
