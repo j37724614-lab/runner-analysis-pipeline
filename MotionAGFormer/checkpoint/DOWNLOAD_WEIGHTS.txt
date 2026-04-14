@@ -1,0 +1,5 @@
+請從 MotionAGFormer 官方 repo 下載模型權重後放置於此目錄：
+  motionagformer-l-h36m.pth.tr  ← vis.py 預設載入此檔
+
+下載來源：
+  https://github.com/TaatiTeam/MotionAGFormer

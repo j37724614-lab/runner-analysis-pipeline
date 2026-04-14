@@ -1,0 +1,7 @@
+請下載以下檔案放置於此目錄（HRNet 2D 姿態估計所需）：
+  pose_hrnet_w48_384x288.pth     (244 MB)
+  h36m_sh_conf_cam_source_final.pkl  (1.1 GB)
+  yolov3.weights                 (237 MB)
+
+下載來源：
+  https://github.com/TaatiTeam/MotionAGFormer  (demo 說明頁)

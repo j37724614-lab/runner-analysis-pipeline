@@ -1,0 +1,31 @@
+# ===== 模型權重（太大，手動下載）=====
+*.pt
+*.pth
+*.pth.tr
+*.onnx
+*.weights
+*.pkl
+
+# ===== 影片 / 圖片 =====
+*.mp4
+*.avi
+*.mov
+*.MOV
+*.png
+*.jpg
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ===== 輸出目錄 =====
+output/
+output_cut/*
+!output_cut/.gitkeep
+demo/output/
+demo/video/*
+!demo/video/.gitkeep
+
+# ===== 虛擬環境 =====
+.venv/
