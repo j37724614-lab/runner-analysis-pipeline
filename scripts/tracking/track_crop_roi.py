@@ -52,6 +52,10 @@ from PIL import Image, ImageDraw, ImageFont
 import argparse
 import json
 import yaml
+from pathlib import Path
+
+# 此腳本位於 scripts/tracking/，往上三層為 repo 根目錄
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # =======================================================================
 # 設定區（每次修改只需改這裡）
@@ -62,14 +66,14 @@ CUDA_VISIBLE_DEVICES = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
 DEVICE = 0
 
-# 模型權重路徑
-MODEL_PATH = "/home/jeter/MotionAGFormer/yolo11x.pt"
+# 模型權重路徑（yolo11x.pt 放在 repo 根目錄；下載方式見 README）
+MODEL_PATH = str(BASE_DIR / "yolo11x.pt")
 
 # 中文字型路徑（ROI 標籤使用）
-FONT_PATH = '/home/jeter/MotionAGFormer/MotionAGFormer/ChineseFont.ttf'
+FONT_PATH = str(BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")
 
 # 輸出目錄（檔名依第一台有效相機自動命名：{輸入檔名}_tracked.mp4）
-OUTPUT_DIR = "/home/jeter/MotionAGFormer/output_cut"
+OUTPUT_DIR = str(BASE_DIR / "output_cut")
 
 # 固定裁剪尺寸（以最快人物中心為基準）
 # 建議值：先執行一次看底部「建議 CROP_WIDTH/CROP_HEIGHT」的統計輸出再調整
@@ -129,11 +133,11 @@ def camera(video_path, crop=None,
 # roi_x       (左, 右) ROI 有效範圍（原始影像像素）
 # switch_x    跑者 center_x 超過此值時切換到下一台（最後一台用 bx2 右緣判斷）
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/MotionAGFormer/0331-1.mp4",
+CAM1 = camera("/path/to/your/camera1.mp4",   # 請透過 --config 指定，或直接修改此處
               crop=(0, 450, 1920, 800),
               roi_x=(150, 1820))   # switch_x 自動取 roi_x[1] = 1820
 
-CAM2 = camera("/home/jeter/MotionAGFormer/0331-2.mp4",
+CAM2 = camera("/path/to/your/camera2.mp4",   # 請透過 --config 指定，或直接修改此處
               crop=(0, 450, 1920, 800),
               roi_x=(180, 1820))   # switch_x 自動取 roi_x[1] = 1820
 

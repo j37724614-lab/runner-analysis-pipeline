@@ -21,6 +21,10 @@ add_angle_overlay.py
 import argparse
 import os
 import sys
+from pathlib import Path
+
+# 此腳本位於 scripts/visualization/，往上三層為 repo 根目錄
+_BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 import matplotlib
 matplotlib.use('Agg')
@@ -35,7 +39,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # 中文字型
 # ---------------------------------------------------------------------------
-FONT_PATH = '/home/jeter/MotionAGFormer/MotionAGFormer/ChineseFont.ttf'
+FONT_PATH = str(_BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")
 
 # CSV 欄位 → 圖例簡短標籤（顯示在折線圖右上角）
 COL_ZH = {

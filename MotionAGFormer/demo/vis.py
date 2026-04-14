@@ -1,6 +1,7 @@
 
 import sys
 import argparse
+from pathlib import Path
 import cv2
 from lib.preprocess import h36m_coco_format, revise_kpts
 from lib.hrnet.gen_kpts import gen_video_kpts as hrnet_pose
@@ -318,7 +319,7 @@ def compute_angles(npz_path, output_dir):
 @torch.no_grad()
 def get_pose3D(video_path, output_dir):
     # 讀取 L 版 YAML config
-    config_path = '/home/jeter/MotionAGFormer/MotionAGFormer/configs/h36m/MotionAGFormer-large.yaml'
+    config_path = str(Path(__file__).resolve().parent.parent / "configs" / "h36m" / "MotionAGFormer-large.yaml")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
