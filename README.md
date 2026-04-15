@@ -176,7 +176,7 @@ auto_crop: true
 python run_pipeline.py --config my_config.yaml
 
 # 指定 GPU
-python run_pipeline.py --config my_config.yaml --gpu 1
+python run_pipeline.py --config my_config.yaml --gpu 0
 
 # 只跑 2D（跳過 3D 與角度，速度較快）
 python run_pipeline.py --config my_config.yaml --2d_only
