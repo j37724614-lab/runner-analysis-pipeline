@@ -187,6 +187,83 @@ python run_pipeline.py --config my_config.yaml --skip-track
 
 ---
 
+## track_runners.py — 多相機串接追蹤（含速度圖表）
+
+獨立腳本，不依賴完整 Pipeline。多台相機影片依序串接，以 YOLO 追蹤最快跑者，並在畫面下方繪製「距離 / 速度 / 加速度」折線圖，同時輸出逐幀 CSV。
+
+### 輸出
+
+| 檔案 | 說明 |
+|------|------|
+| `{output_dir}/sequential_tracked.mp4` | 串接後的追蹤影片（含速度圖表） |
+| `{output_dir}/sequential_tracked_metrics.csv` | 逐幀距離、速度、加速度數據 |
+
+### 直接執行（使用檔案內硬編碼設定）
+
+```bash
+python track_runners.py
+```
+
+### 後端 JSON 輸入
+
+透過 `--config-json` 傳入 JSON 字串，覆蓋任何參數，無需修改程式碼：
+
+```bash
+python track_runners.py --config-json '{
+  "gpu": "0",
+  "output_dir": "/path/to/output",
+  "output_name": "result.mp4",
+  "cameras": [
+    {
+      "video_path": "/data/cam1.mp4",
+      "crop": [0, 400, 1920, 800],
+      "start_line": [[208, 715], [123, 725]],
+      "end_line":   [[1760, 710], [1830, 718]],
+      "distance_m": 20
+    },
+    {
+      "video_path": "/data/cam2.mp4",
+      "crop": [0, 400, 1920, 800],
+      "start_line": [[208, 715], [123, 725]],
+      "end_line":   [[1760, 710], [1830, 718]],
+      "distance_m": 20
+    }
+  ]
+}'
+```
+
+### JSON 欄位說明
+
+**全域參數**
+
+| 欄位 | 型別 | 預設值 | 說明 |
+|------|------|--------|------|
+| `gpu` | string | `"0"` | CUDA GPU 編號 |
+| `output_dir` | string | 硬編碼路徑 | 輸出目錄 |
+| `output_name` | string | `"sequential_tracked.mp4"` | 輸出影片檔名 |
+| `target_height` | int | `340` | 每台相機畫面縮放高度（px） |
+| `chart_height` | int | `200` | 底部圖表高度（px）；`0` = 不顯示圖表 |
+| `movement_threshold` | int | `2` | 判定移動的最小像素位移 |
+| `min_movement_frames` | int | `3` | 確認為真實移動所需的連續幀數 |
+| `stationary_decay` | int | `2` | 靜止時每幀遞減 movement_count 的量 |
+| `max_person_memory` | int | `30` | 未偵測到幾幀後清除人物追蹤紀錄 |
+
+**每台相機（`cameras` 陣列，最多 6 台）**
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `video_path` | string | 影片路徑；`null` = 跳過此台 |
+| `crop` | `[x1, y1, x2, y2]` | 前處理裁剪範圍（原始影像座標） |
+| `start_line` | `[[x1,y1],[x2,y2]]` | 起跑線兩端點（原始影像座標） |
+| `end_line` | `[[x3,y3],[x4,y4]]` | 終點線兩端點；與 `start_line` 同時填入時啟用斜線投影模式 |
+| `distance_m` | float | 起終點線間的實際距離（公尺）；填入後才計算速度與圖表 |
+| `roi_x` | `[left, right]` | X 範圍過濾（原始像素） |
+| `roi_y` | `[top, bottom]` | Y 範圍過濾（原始像素） |
+| `switch_x` | int | 跑者 center_x 超過此值時切換到下一台；斜線模式下自動忽略 |
+| `pre_roll_px` | int | 起跑線前的緩衝距離（像素），預設 `200` |
+
+---
+
 ## 輸出檔案
 
 輸出位於 `MotionAGFormer/demo/output/{影片名稱}/`：
