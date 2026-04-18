@@ -10,6 +10,7 @@ import csv
 import json
 import argparse
 import numpy as np
+from pathlib import Path
 import torch
 import matplotlib
 matplotlib.use('Agg')
@@ -24,19 +25,21 @@ from PIL import Image, ImageDraw, ImageFont
 # 設定區（每次修改只需改這裡）
 # =======================================================================
 
+_BASE = Path(__file__).resolve().parent   # repo 根目錄
+
 # 使用哪張實體 GPU（'0' = 第 0 張，'1' = 第 1 張）
 CUDA_VISIBLE_DEVICES = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
 DEVICE = 0
 
 # 模型權重路徑
-MODEL_PATH = "/home/jeter/MotionAGFormer/yolo11x.pt"
+MODEL_PATH = str(_BASE / "yolo11x.pt")
 
 # 中文字型路徑（圖表與影片疊字使用）
-FONT_PATH = '/home/jeter/MotionAGFormer/MotionAGFormer/ChineseFont.ttf'
+FONT_PATH = str(_BASE / "MotionAGFormer" / "ChineseFont.ttf")
 
 # 輸出目錄與檔名
-OUTPUT_DIR  = "/home/jeter/MotionAGFormer/output_cut"
+OUTPUT_DIR  = str(_BASE / "output_cut")
 OUTPUT_NAME = "sequential_tracked.mp4"
 
 # 輸出影片每台相機的顯示高度（統一縮放後輸出）
@@ -261,31 +264,45 @@ def _build_camera_from_json(entry):
 #             ← m_per_pixel 改由兩中點的像素距離換算（取代 roi_x 方式）
 #             ← 距離以「跑者中心點投影到跑道方向」計算，不受高低位置影響
 #
+# ── 影片路徑輸入方式（二選一）────────────────────────────────────────────
+#
+# 方法 A：直接在下方填入絕對路徑（本機快速測試用）
+#   CAM1 = camera("/path/to/cam1.mp4", crop=..., start_line=..., ...)
+#
+# 方法 B：保持 None，改用 --config-json 傳入（推薦，不需修改程式碼）
+#   python track_runners.py --config-json '{
+#     "cameras": [
+#       {"video_path": "/path/to/cam1.mp4",
+#        "crop": [0, 400, 1920, 800],
+#        "start_line": [[208, 715], [123, 725]],
+#        "end_line":   [[1760, 710], [1830, 718]],
+#        "distance_m": 20},
+#       {"video_path": "/path/to/cam2.mp4", ...}
+#     ]
+#   }'
+#
+# ── 斜線模式欄位說明 ──────────────────────────────────────────────────────
 # 範例（斜線模式）：
 # CAM1 = camera("/path/to/vid.mp4",
-#               crop=(0, 400, 1920, 800), # crop (x起, y起, x終, y終) 裁剪範圍
-#               roi_x=(100, 1900),             # 仍可設 roi_x 做粗略範圍過濾
+#               crop=(0, 400, 1920, 800),
 #               start_line=[(150, 420), (150, 780)],  # 起跑線兩端點
 #               end_line  =[(1820, 400), (1820, 760)], # 終點線兩端點
 #               distance_m=20)
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/MotionAGFormer/0331-1.mp4",
-              crop=(0, 400, 1920, 800),  #(x起, y起, x終, y終) 裁剪範圍
-             # roi_x=(150, 1820),            # 人物追蹤的粗略範圍過濾（可保留）
-              start_line=[(208, 715), (123, 725)],   # ← 起跑線兩端點（原始影像座標，y 須在 crop 範圍內）
-              end_line  =[(1760, 710), (1830, 718)],  # ← 終點線兩端點（原始影像座標，y 須在 crop 範圍內）
-              distance_m=20)               # ← 起跑線到終點線的實際距離（公尺）
+CAM1 = camera("/home/jeter/MotionAGFormer/0331-1.mp4",                        # ← 填入影片路徑或改用 --config-json
+              crop=(0, 400, 1920, 800),
+              start_line=[(208, 715), (123, 725)],
+              end_line  =[(1760, 710), (1830, 718)],
+              distance_m=20)
 
 CAM2 = camera("/home/jeter/MotionAGFormer/IMG_5728.mp4",
               crop=(0, 400, 1920, 800),
-             # roi_x=(150, 1820),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)],
               distance_m=20)
 
 CAM3 = camera("/home/jeter/MotionAGFormer/0331-2.mp4",
               crop=(0, 400, 1920, 800),
-             # roi_x=(150, 1820),
               start_line=[(215, 713), (130, 727)],
               end_line  =[(1735, 715), (1820, 722)],
               distance_m=20)

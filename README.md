@@ -198,31 +198,44 @@ python run_pipeline.py --config my_config.yaml --skip-track
 | `{output_dir}/sequential_tracked.mp4` | 串接後的追蹤影片（含速度圖表） |
 | `{output_dir}/sequential_tracked_metrics.csv` | 逐幀距離、速度、加速度數據 |
 
-### 直接執行（使用檔案內硬編碼設定）
+### 影片路徑輸入方式
+
+預設 `CAM1`–`CAM6` 的 `video_path` 均為 `None`（不執行任何相機），需透過以下其中一種方式指定影片：
+
+**方法 A：直接修改程式碼**（本機快速測試）
+
+編輯 `track_runners.py` 設定區，將 `None` 改為你的影片路徑：
+
+```python
+CAM1 = camera("/your/path/cam1.mp4",
+              crop=(0, 400, 1920, 800),
+              start_line=[(208, 715), (123, 725)],
+              end_line  =[(1760, 710), (1830, 718)],
+              distance_m=20)
+```
+
+然後執行：
 
 ```bash
 python track_runners.py
 ```
 
-### 後端 JSON 輸入
-
-透過 `--config-json` 傳入 JSON 字串，覆蓋任何參數，無需修改程式碼：
+**方法 B：`--config-json`**（推薦，不需修改程式碼）
 
 ```bash
 python track_runners.py --config-json '{
   "gpu": "0",
   "output_dir": "/path/to/output",
-  "output_name": "result.mp4",
   "cameras": [
     {
-      "video_path": "/data/cam1.mp4",
+      "video_path": "/your/path/cam1.mp4",
       "crop": [0, 400, 1920, 800],
       "start_line": [[208, 715], [123, 725]],
       "end_line":   [[1760, 710], [1830, 718]],
       "distance_m": 20
     },
     {
-      "video_path": "/data/cam2.mp4",
+      "video_path": "/your/path/cam2.mp4",
       "crop": [0, 400, 1920, 800],
       "start_line": [[208, 715], [123, 725]],
       "end_line":   [[1760, 710], [1830, 718]],
@@ -239,7 +252,7 @@ python track_runners.py --config-json '{
 | 欄位 | 型別 | 預設值 | 說明 |
 |------|------|--------|------|
 | `gpu` | string | `"0"` | CUDA GPU 編號 |
-| `output_dir` | string | 硬編碼路徑 | 輸出目錄 |
+| `output_dir` | string | `output_cut/`（repo 根目錄下） | 輸出目錄 |
 | `output_name` | string | `"sequential_tracked.mp4"` | 輸出影片檔名 |
 | `target_height` | int | `340` | 每台相機畫面縮放高度（px） |
 | `chart_height` | int | `200` | 底部圖表高度（px）；`0` = 不顯示圖表 |
