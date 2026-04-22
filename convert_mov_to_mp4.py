@@ -42,10 +42,12 @@ def convert_mov_to_mp4(input_path, output_path=None):
 if __name__ == "__main__":
     # 批次處理：填入你要轉換的 .MOV 檔案路徑
     video_list = [
-        "/path/to/your/video1.MOV",
-        # "/path/to/your/video2.MOV",
-    ]
+        "/home/jeter/pipeline_release/video/IMG_2526_11.mov",
+        "/home/jeter/pipeline_release/video/0420_10.MOV",
 
+
+    ]
+    
     for video in video_list:
         if os.path.exists(video):
             convert_mov_to_mp4(video)

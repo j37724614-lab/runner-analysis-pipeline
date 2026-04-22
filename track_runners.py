@@ -166,7 +166,9 @@ def camera(video_path, crop=None,
            switch_x=None, roi_zones=None,
            distance_m=None,
            start_line=None, end_line=None,
-           pre_roll_px=200):
+           pre_roll_px=200,
+           start_gate_px=250,
+           start_confirm_move_px=8):
     """
     start_line / end_line（可選）：各由兩個原始影像座標點組成的斜線，
       例如 start_line=[(150, 420), (150, 780)]。
@@ -222,7 +224,9 @@ def camera(video_path, crop=None,
         'pixel_span':  pixel_span,
         'quad_roi':    quad_roi,
         'track_roi':   {'start_mid': start_mid, 'track_dir': track_dir,
-                        'pixel_span': pixel_span, 'pre_roll_px': pre_roll_px}
+                        'pixel_span': pixel_span, 'pre_roll_px': pre_roll_px,
+                        'start_gate_px': start_gate_px,
+                        'start_confirm_move_px': start_confirm_move_px}
                        if start_mid is not None else None,
     }
 
@@ -289,19 +293,19 @@ def _build_camera_from_json(entry):
 #               end_line  =[(1820, 400), (1820, 760)], # 終點線兩端點
 #               distance_m=20)
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/MotionAGFormer/0331-1.mp4",                        # ← 填入影片路徑或改用 --config-json
+CAM1 = camera("/home/jeter/pipeline_release/video/IMG_2526_11.mp4",                        # ← 填入影片路徑或改用 --config-json
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)],
               distance_m=20)
 
-CAM2 = camera("/home/jeter/MotionAGFormer/IMG_5728.mp4",
+CAM2 = camera("/home/jeter/pipeline_release/video/IMG_2538_9.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)],
               distance_m=20)
 
-CAM3 = camera("/home/jeter/MotionAGFormer/0331-2.mp4",
+CAM3 = camera("/home/jeter/pipeline_release/video/0420_10.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(215, 713), (130, 727)],
               end_line  =[(1735, 715), (1820, 722)],
@@ -331,10 +335,12 @@ CAM6 = camera(None,
 # -----------------------------------------------------------------------
 # 移動偵測參數
 # -----------------------------------------------------------------------
-MOVEMENT_THRESHOLD  = 2   # 判定為移動的最小像素位移
-MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「真正移動」
+MOVEMENT_THRESHOLD  = 3   # 判定為移動的最小像素位移
+MIN_MOVEMENT_FRAMES = 3  # 需連續移動至少此幀數才視為「真正移動」
 STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量
 MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄
+CAM_WARMUP_FRAMES   = 5   # 切換相機後前幾幀放寬選取條件
+MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
 
 # =======================================================================
 # 以下為程式邏輯，一般不需修改
@@ -369,6 +375,7 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0):
             for k in range(1, n):
                 if d_smooth[k] < d_smooth[k - 1]:
                     d_smooth[k] = d_smooth[k - 1]
+            d_smooth = np.maximum(d_smooth, d[0])  # 防止 filtfilt 邊界效應把起點壓低
         except Exception:
             d_smooth = d.copy()
     else:
@@ -483,7 +490,9 @@ def _draw_chart(fig, axes, canvas, d_smooth, v_smooth, a, fps, target_w, target_
 def process_frame(img, model, velocity_tracker, device,
                   crop_params, roi_enabled, roi_zones,
                   crop_x_offset, crop_y_offset,
-                  quad_roi=None, track_roi=None, draw_bbox=True):
+                  quad_roi=None, track_roi=None, draw_bbox=True,
+                  bbox_color=(0, 255, 0), prefer_lead_runner=False,
+                  nearest_to_start=False):
     """
     對單幀執行裁剪 → YOLO track → 速度累積 → 選最快人物 → 畫框。
     回傳：(處理後畫面, fastest_id, fastest_center_orig, fastest_bx2_orig)
@@ -507,19 +516,25 @@ def process_frame(img, model, velocity_tracker, device,
 
     # Step 3: 速度累積 + ROI 過濾
     seen_ids = set()
+    lead_candidates = []
 
     if r.boxes is not None and len(r.boxes) > 0:
         boxes = r.boxes.xyxy.cpu().numpy()
         ids   = r.boxes.id.cpu().numpy() if r.boxes.id is not None else None
 
+        # 第一輪：收集所有通過過濾的偵測
+        valid_detections = []  # (dist_to_start, cx, cy, bx1, by1, bx2, by2, tid, proj)
         for i in range(len(boxes)):
             bx1, by1, bx2, by2 = map(int, boxes[i])
+            if (by2 - by1) < MIN_PERSON_HEIGHT:
+                continue
             center_x = (bx1 + bx2) / 2
             center_y = (by1 + by2) / 2
 
             # ROI 過濾（原始影片座標）
             orig_cx = center_x + crop_x_offset
             orig_cy = center_y + crop_y_offset
+            proj = None
             if track_roi is not None:
                 proj = _project_onto_track(
                     (orig_cx, orig_cy),
@@ -537,8 +552,22 @@ def process_frame(img, model, velocity_tracker, device,
             if ids is None:
                 continue
             tid = int(ids[i])
-            seen_ids.add(tid)
+            dist_to_start = (
+                np.sqrt((orig_cx - track_roi['start_mid'][0])**2 +
+                        (orig_cy - track_roi['start_mid'][1])**2)
+                if track_roi is not None else float('inf')
+            )
+            valid_detections.append((dist_to_start, center_x, center_y,
+                                     bx1, by1, bx2, by2, tid, proj))
 
+        # nearest_to_start 模式：只保留距 start_line 最近的一人
+        if nearest_to_start and valid_detections:
+            valid_detections.sort(key=lambda x: x[0])
+            valid_detections = valid_detections[:1]
+
+        # 第二輪：更新 velocity_tracker
+        for (_, center_x, center_y, bx1, by1, bx2, by2, tid, proj) in valid_detections:
+            seen_ids.add(tid)
             if tid in velocity_tracker:
                 d = velocity_tracker[tid]
                 ox, oy = d['center']
@@ -562,6 +591,8 @@ def process_frame(img, model, velocity_tracker, device,
                     'stationary_count': 0,
                     'frames_since_detected': 0,
                 }
+            if track_roi is not None and proj is not None:
+                lead_candidates.append({'tid': tid, 'proj': proj})
 
     # 清除過期追蹤
     for tid in list(velocity_tracker):
@@ -582,6 +613,9 @@ def process_frame(img, model, velocity_tracker, device,
                     max_vel = v
                     fastest_id = tid
 
+    if fastest_id is None and prefer_lead_runner and lead_candidates:
+        fastest_id = max(lead_candidates, key=lambda c: c['proj'])['tid']
+
     # Step 5: 畫框（最快人物）
     fastest_center_orig = None
     fastest_bx2_orig    = None
@@ -591,7 +625,22 @@ def process_frame(img, model, velocity_tracker, device,
         fastest_center_orig = (bx1 + bx2) / 2.0 + crop_x_offset  # 非最後一機的切換基準
         fastest_bx2_orig    = bx2 + crop_x_offset                 # 最後一機的退出 ROI 基準
         if draw_bbox:
-            cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+            cv2.rectangle(img, (bx1, by1), (bx2, by2), bbox_color, 2)
+
+    # Step 5b: 畫其他被追蹤人物的框（橘色，含 ID）
+    for tid, d in velocity_tracker.items():
+        if tid == fastest_id or d['frames_since_detected'] != 0:
+            continue
+        bx1o, by1o, bx2o, by2o = d['bbox']
+        cv2.rectangle(img, (bx1o, by1o), (bx2o, by2o), (0, 165, 255), 1)
+        img = _draw_text_bgr(
+            img,
+            f"ID {tid}",
+            (bx1o, max(by1o - 22, 5)),
+            font=_get_font(size=16),
+            color=(0, 165, 255),
+            thickness=1,
+        )
 
     # Step 6: 畫 ROI 框（藍線）
     if roi_enabled and roi_zones:
@@ -780,8 +829,9 @@ def main():
             if hasattr(model.predictor, 'trackers'):
                 for t in model.predictor.trackers:
                     t.reset()
-        cam_skipped  = 0
-        frame_count  = 0
+        cam_skipped          = 0
+        frame_count          = 0
+        cam_warmup_remaining = CAM_WARMUP_FRAMES
 
         # 第一段緩衝區
         frame_buffer = []   # 縮放後的畫面（含綠框、相機標籤）
@@ -790,7 +840,6 @@ def main():
 
         # pre-roll 狀態（track_roi 模式專用）
         runner_crossed_start = cam.get('track_roi') is None  # 舊模式直接視為已越線
-        pre_roll_buf  = []   # 最多存 5 幀 (strip, dist_value)
         candidate_buf = []   # 起跑候選幀 (strip, dist_val, proj_px, bbox_strip)
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
 
@@ -824,7 +873,10 @@ def main():
                 crop_x_offset, crop_y_offset,
                 quad_roi=cam.get('quad_roi'),
                 track_roi=cam.get('track_roi'),
-                draw_bbox=runner_crossed_start,
+                draw_bbox=True,
+                bbox_color=(0, 255, 0) if runner_crossed_start else (0, 215, 255),
+                prefer_lead_runner=not runner_crossed_start,
+                nearest_to_start=not runner_crossed_start,
             )
 
             # 診斷：前 5 幀 + 每 100 幀
@@ -834,8 +886,22 @@ def main():
                       f"center:{fastest_center_orig} bx2:{fastest_bx2_orig}")
 
             if fastest_id is None:
-                cam_skipped += 1
-                continue
+                if cam_warmup_remaining > 0 and cam['m_per_pixel'] is not None:
+                    # 暖機模式：用瞬時速度選最快人物，略過 movement_count 限制
+                    expected_px = last_kf_v / cam['m_per_pixel'] / fps
+                    warmup_thresh = max(expected_px * 0.3, 3.0)
+                    best_v, best_id = 0.0, None
+                    for tid, d in velocity_tracker.items():
+                        if d['frames_since_detected'] == 0 and d['velocities']:
+                            inst_v = d['velocities'][-1]
+                            if inst_v > warmup_thresh and inst_v > best_v:
+                                best_v, best_id = inst_v, tid
+                    fastest_id = best_id
+                if fastest_id is None:
+                    cam_skipped += 1
+                    continue
+            if cam_warmup_remaining > 0:
+                cam_warmup_remaining -= 1
 
             # 計算原始距離（僅在有校準時）
             dist_raw   = None
@@ -861,6 +927,14 @@ def main():
             h_img, w_img = img.shape[:2]
             new_w = int(w_img * TARGET_HEIGHT / h_img)
             strip = cv2.resize(img, (new_w, TARGET_HEIGHT))
+            # 在 bbox 內部左上角畫追蹤 ID（cv2.putText 直接畫，不受速度標籤遮擋）
+            if fastest_id is not None:
+                sc = TARGET_HEIGHT / h_img
+                d_v = velocity_tracker[fastest_id]
+                _bx = int(d_v['bbox'][0] * sc)
+                _by = int(d_v['bbox'][1] * sc)
+                cv2.putText(strip, f"ID:{fastest_id}", (_bx + 3, _by + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             strip = _draw_text_bgr(
                 strip,
                 f"相機 {cam_idx+1}",
@@ -898,12 +972,17 @@ def main():
                                               cam['start_mid'], cam['track_dir'])
                 dist_val = dist_raw if dist_raw is not None else (d_raw[-1] if d_raw else cumulative_dist_offset)
 
+                if frame_count <= 30:
+                    print(
+                        f"  [debug cam{cam_idx+1} f{frame_count}] "
+                        f"fastest_id={fastest_id} proj_px={proj_px:.1f} "
+                        f"crossed={runner_crossed_start} dist_raw={dist_raw} "
+                        f"cand={len(candidate_buf)}"
+                    )
+
                 if proj_px < 0:
-                    # 起跑線前：放入 pre-roll，並清空 candidate（如有後退）
+                    # 起跑線前：略過，並清空 candidate（如有後退）
                     candidate_buf.clear()
-                    pre_roll_buf.append((strip, dist_val))
-                    if len(pre_roll_buf) > 5:
-                        pre_roll_buf.pop(0)
                     continue  # 不進 frame_buffer，不觸發切換
 
                 else:  # proj_px >= 0：進入候選區
@@ -916,18 +995,16 @@ def main():
                     if len(candidate_buf) >= K_CONFIRM:
                         # 確認起跑！
                         runner_crossed_start = True
-                        # 1. pre-roll 幀（無圖表）
-                        for pre_s, pre_d in pre_roll_buf:
-                            frame_buffer.append(pre_s)
-                            d_raw.append(pre_d)
-                            meta_buffer.append(None)
-                        pre_roll_buf.clear()
-                        # 2. candidate 幀（正式幀，t=0 在第一幀）
                         for c_strip, c_dist, _, c_meta in candidate_buf:
                             frame_buffer.append(c_strip)
                             d_raw.append(c_dist)
                             meta_buffer.append(c_meta)
                         candidate_buf.clear()
+                        print(
+                            f"  [debug cam{cam_idx+1}] confirmed start at frame {frame_count}, "
+                            f"first_dist={d_raw[0] if d_raw else None}, "
+                            f"buffered={len(frame_buffer)}"
+                        )
                     continue  # 不論確認與否，本幀已透過 candidate_buf 處理
 
             frame_buffer.append(strip)
