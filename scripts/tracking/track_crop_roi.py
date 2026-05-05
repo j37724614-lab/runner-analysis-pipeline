@@ -50,6 +50,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 import argparse
+import csv
 import json
 import yaml
 from pathlib import Path
@@ -67,7 +68,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
 DEVICE = 0
 
 # 模型權重路徑（yolo11x.pt 放在 repo 根目錄；下載方式見 README）
-MODEL_PATH = str(BASE_DIR / "yolo11x.pt")
+MODEL_PATH = str(BASE_DIR / "yolo26x.pt")
 
 # 中文字型路徑（ROI 標籤使用）
 FONT_PATH = str(BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")
@@ -185,17 +186,17 @@ def camera(video_path, crop=None,
 # start_line  [(x1,y1),(x2,y2)] 起跑線兩端點；與 end_line 同時填入才啟用斜線模式
 # end_line    [(x3,y3),(x4,y4)] 終點線兩端點
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/MotionAGFormer/0331-1.mp4",
+CAM1 = camera("/home/jeter/pipeline_release/video/0331-1.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)])
 
-CAM2 = camera("/home/jeter/MotionAGFormer/IMG_5728.mp4",
+CAM2 = camera(None, #"/home/jeter/MotionAGFormer/IMG_5728.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)])
 
-CAM3 = camera("/home/jeter/MotionAGFormer/0331-2.mp4",
+CAM3 = camera(None, #"/home/jeter/MotionAGFormer/0331-2.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(215, 713), (130, 727)],
               end_line  =[(1735, 715), (1820, 722)])
@@ -323,13 +324,22 @@ def _point_in_quad(point, quad_pts):
     return cv2.pointPolygonTest(quad_pts, (float(point[0]), float(point[1])), False) >= 0
 
 
+def _bbox_bottom_center(bbox):
+    """回傳 bbox 的底部中心點，較接近跑者落地點。"""
+    bx1, by1, bx2, by2 = bbox
+    return ((bx1 + bx2) / 2.0, float(by2))
+
+
 def process_frame(img, model, velocity_tracker, device,
                   crop_params, roi_enabled, roi_zones,
                   crop_x_offset, crop_y_offset,
                   instant_start=False,
                   track_roi=None,
                   overlay_start_pts=None,
-                  overlay_end_pts=None):
+                  overlay_end_pts=None,
+                  prefer_lead_runner=False,
+                  nearest_to_start=False,
+                  locked_target_id=None):
     """
     對單幀執行：前處理裁剪 → YOLO track → ROI 過濾 + 速度累積 →
                 選最快人物 → 疊加框 → 固定大小裁剪。
@@ -338,10 +348,11 @@ def process_frame(img, model, velocity_tracker, device,
     overlay_start_pts  tuple[2] or None：起跑線兩端點（crop 後座標系），SHOW_OVERLAY 時繪製
     overlay_end_pts    tuple[2] or None：終點線兩端點（crop 後座標系），SHOW_OVERLAY 時繪製
 
-    回傳：(crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig)
+    回傳：(crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop)
       crop_frame=None          → ROI 內無有效人物，上層應跳過此幀
       fastest_center_orig      → 最快人物 center_x（原始座標），非最後一機的切換基準
       fastest_bx2_orig         → 最快人物 bbox 右緣（原始座標），最後一機的退出 ROI 基準
+      bbox_in_crop             → 最終輸出裁切畫面內的 bbox，供 HRNet 限定偵測範圍
     """
     # Step 1: 前處理裁剪
     if crop_params:
@@ -350,7 +361,7 @@ def process_frame(img, model, velocity_tracker, device,
         cx1, cx2 = max(0, cx1), min(w, cx2)
         cy1, cy2 = max(0, cy1), min(h, cy2)
         if cx2 <= cx1 or cy2 <= cy1:
-            return None, None, None, None
+            return None, None, None, None, None
         img = img[cy1:cy2, cx1:cx2]
 
 # =======================================================================
@@ -371,6 +382,7 @@ def process_frame(img, model, velocity_tracker, device,
 # =======================================================================
     
     seen_ids = set()
+    valid_detections = []
 
     if r.boxes is not None and len(r.boxes) > 0:
         boxes = r.boxes.xyxy.cpu().numpy()       # shape (N, 4)，格式 x1 y1 x2 y2
@@ -380,10 +392,12 @@ def process_frame(img, model, velocity_tracker, device,
             bx1, by1, bx2, by2 = map(int, boxes[i])
             center_x = (bx1 + bx2) / 2   # bbox 中心 x（裁剪座標）
             center_y = (by1 + by2) / 2   # bbox 中心 y（裁剪座標）
+            ground_x, ground_y = _bbox_bottom_center((bx1, by1, bx2, by2))
 
             # ROI 過濾（換算回原始影片座標再比對）
-            orig_cx = center_x + crop_x_offset
-            orig_cy = center_y + crop_y_offset
+            orig_cx = ground_x + crop_x_offset
+            orig_cy = ground_y + crop_y_offset
+            proj = None
             if track_roi is not None:
                 # 斜線模式：投影到跑道方向，範圍 [-pre_roll_px, pixel_span]
                 proj = _project_onto_track(
@@ -404,11 +418,18 @@ def process_frame(img, model, velocity_tracker, device,
                 continue
             tid = int(ids[i])
             seen_ids.add(tid)
+            valid_detections.append({
+                'tid': tid,
+                'bbox': (bx1, by1, bx2, by2),
+                'center': (center_x, center_y),
+                'ground_point': (ground_x, ground_y),
+                'proj': proj,
+            })
 
             if tid in velocity_tracker:
                 d = velocity_tracker[tid]
-                ox, oy = d['center']
-                dist = np.sqrt((center_x - ox) ** 2 + (center_y - oy) ** 2)
+                ox, oy = d.get('ground_point', d['center'])
+                dist = np.sqrt((ground_x - ox) ** 2 + (ground_y - oy) ** 2)
                 d['velocities'].append(dist)
                 if dist > MOVEMENT_THRESHOLD:
                     d['movement_count'] += 1
@@ -417,17 +438,30 @@ def process_frame(img, model, velocity_tracker, device,
                     d['movement_count'] = max(0, d['movement_count'] - 1)
                     d['stationary_count'] += STATIONARY_DECAY
                 d['center'] = (center_x, center_y)
+                d['ground_point'] = (ground_x, ground_y)
                 d['bbox']   = (bx1, by1, bx2, by2)
+                d['proj']   = proj
                 d['frames_since_detected'] = 0
             else:
                 velocity_tracker[tid] = {
                     'center':                (center_x, center_y),
+                    'ground_point':          (ground_x, ground_y),
                     'bbox':                  (bx1, by1, bx2, by2),
+                    'proj':                  proj,
                     'velocities':            [0],
                     'movement_count':        MIN_MOVEMENT_FRAMES if instant_start else 1,
                     'stationary_count':      0,
                     'frames_since_detected': 0,
                 }
+
+    if nearest_to_start and valid_detections:
+        valid_detections = sorted(
+            valid_detections,
+            key=lambda det: abs(det['proj']) if det['proj'] is not None else float('inf')
+        )
+        keep_id = valid_detections[0]['tid']
+        valid_detections = [valid_detections[0]]
+        seen_ids = {keep_id}
 
     # 清除過期追蹤
     for tid in list(velocity_tracker):
@@ -437,23 +471,49 @@ def process_frame(img, model, velocity_tracker, device,
                 del velocity_tracker[tid]
 
     # Step 4: 選出最快人物
+    valid_ids = {det['tid'] for det in valid_detections}
     fastest_id = None
-    max_vel = 0
-    for tid, d in velocity_tracker.items():
-        if d['frames_since_detected'] == 0:  # 本幀有偵測到
-            if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and  # 連續移動 ≥ 3 幀
-                    d['stationary_count'] < 10):  # 靜止幀數 < 10
-                v = np.mean(d['velocities']) if d['velocities'] else 0  # 平均移動距離
-                if v > max_vel:
-                    max_vel = v
-                    fastest_id = tid
+    max_vel = -1.0
+
+    if locked_target_id is not None:
+        d = velocity_tracker.get(locked_target_id)
+        if d is not None and d['frames_since_detected'] == 0 and locked_target_id in valid_ids:
+            fastest_id = locked_target_id
 
     if fastest_id is None:
-        return None, None, None, None
+        for tid, d in velocity_tracker.items():
+            if d['frames_since_detected'] == 0 and tid in valid_ids:  # 本幀有偵測到
+                if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and  # 連續移動 ≥ 3 幀
+                        d['stationary_count'] < 10):  # 靜止幀數 < 10
+                    v = np.mean(d['velocities'][-10:]) if d['velocities'] else 0  # 近期平均移動距離
+                    if v > max_vel:
+                        max_vel = v
+                        fastest_id = tid
+
+    if fastest_id is None and prefer_lead_runner and valid_ids:
+        lead_candidates = [
+            (tid, velocity_tracker[tid].get('proj'))
+            for tid in valid_ids
+            if tid in velocity_tracker and velocity_tracker[tid].get('proj') is not None
+        ]
+        if lead_candidates:
+            fastest_id = max(lead_candidates, key=lambda item: item[1])[0]
+
+    if fastest_id is None:
+        for tid, d in velocity_tracker.items():
+            if d['frames_since_detected'] == 0 and tid in valid_ids:
+                if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and  # 連續移動 ≥ 3 幀
+                        d['stationary_count'] < 10):  # 靜止幀數 < 10
+                    fastest_id = tid
+                    break
+
+    if fastest_id is None:
+        return None, None, None, None, None
 
     d = velocity_tracker[fastest_id]
     bx1, by1, bx2, by2 = d['bbox']
-    fastest_center_orig = (bx1 + bx2) / 2.0 + crop_x_offset
+    ground_x, ground_y = d.get('ground_point', _bbox_bottom_center((bx1, by1, bx2, by2)))
+    fastest_center_orig = ground_x + crop_x_offset
     fastest_bx2_orig    = bx2 + crop_x_offset
 
     # Step 5: 疊加框（在前處理裁剪後的畫面上）
@@ -516,6 +576,12 @@ def process_frame(img, model, velocity_tracker, device,
     c2x = min(c2x, w_img); c2y = min(c2y, h_img)
 
     crop_frame = img[c1y:c2y, c1x:c2x]
+    bbox_in_crop = (
+        int(np.clip(bx1 - c1x, 0, CROP_WIDTH - 1)),
+        int(np.clip(by1 - c1y, 0, CROP_HEIGHT - 1)),
+        int(np.clip(bx2 - c1x, 0, CROP_WIDTH - 1)),
+        int(np.clip(by2 - c1y, 0, CROP_HEIGHT - 1)),
+    )
 
     # 若切出尺寸不符（影片本身比 crop 小），強制縮放補齊
     if crop_frame.shape[:2] != (CROP_HEIGHT, CROP_WIDTH):
@@ -525,10 +591,10 @@ def process_frame(img, model, velocity_tracker, device,
         else:
             crop_frame = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
 
-    return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig
+    return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop
 
 
-def _process_cameras(caps, cameras, model, out, dry_run=False):
+def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=None):
     """
     逐台相機執行 YOLO 追蹤並（選擇性）寫入影片。
 
@@ -543,10 +609,22 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
     all_bbox_heights = []
     max_bbox_width   = 0
     max_bbox_height  = 0
+    frame_map_rows = []
+    bbox_map_rows = []
+    output_frame_idx = 0
 
     for cam_idx, (cam, cap) in enumerate(zip(cameras, caps)):
         if not cap.isOpened():
             raise ValueError(f"無法開啟相機 {cam_idx+1}: {cam['video_path']}")
+
+        # 每台相機重置 ByteTrack，避免上一台相機的 track id 與狀態污染下一台。
+        predictor = getattr(model, 'predictor', None)
+        trackers = getattr(predictor, 'trackers', None) if predictor is not None else None
+        if trackers:
+            for tracker in trackers:
+                reset = getattr(tracker, 'reset', None)
+                if callable(reset):
+                    reset()
 
         vid_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -610,12 +688,40 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
         cam_skipped = 0
         cam_written = 0
         frame_count = 0
+        target_runner_id = None
 
         # 起跑確認狀態（track_roi 模式專用）
         runner_crossed_start = (track_roi is None)  # 舊模式直接視為已越線
-        pre_roll_buf  = []   # 已渲染的 crop_frame，最多 5 幀（起跑線前）
-        candidate_buf = []   # (crop_frame, proj_px)，待確認起跑的候選幀
+        pre_roll_buf  = []   # (crop_frame, source_frame, bbox_in_crop)，最多 5 幀（起跑線前）
+        candidate_buf = []   # (crop_frame, proj_px, source_frame, bbox_in_crop)，待確認起跑的候選幀
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
+
+        def _write_output_frame(frame_to_write, source_frame, bbox_for_hrnet=None, track_id=None):
+            nonlocal total_written, cam_written, output_frame_idx
+            if not dry_run:
+                out.write(frame_to_write)
+                frame_map_rows.append({
+                    'output_frame': output_frame_idx,
+                    'cam': cam_idx + 1,
+                    'cam_frame': source_frame,
+                    'source_frame': source_frame,
+                })
+                if bbox_for_hrnet is not None:
+                    x1, y1, x2, y2 = bbox_for_hrnet
+                    bbox_map_rows.append({
+                        'output_frame': output_frame_idx,
+                        'cam': cam_idx + 1,
+                        'cam_frame': source_frame,
+                        'source_frame': source_frame,
+                        'track_id': track_id if track_id is not None else '',
+                        'x1': int(x1),
+                        'y1': int(y1),
+                        'x2': int(x2),
+                        'y2': int(y2),
+                    })
+            cam_written += 1
+            total_written += 1
+            output_frame_idx += 1
 
         if not dry_run:
             print(f"  [處理中...]")
@@ -625,11 +731,12 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
             if not ret:
                 break
             frame_count += 1
+            source_frame = frame_count - 1
 
             _ov_s = overlay_start_pts if SHOW_OVERLAY else None
             _ov_e = overlay_end_pts   if SHOW_OVERLAY else None
             try:
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop = process_frame(
                     frame, model, velocity_tracker, DEVICE,
                     cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
                     crop_x_offset, crop_y_offset,
@@ -637,10 +744,13 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                     track_roi=track_roi,
                     overlay_start_pts=_ov_s,
                     overlay_end_pts=_ov_e,
+                    prefer_lead_runner=not runner_crossed_start,
+                    nearest_to_start=not runner_crossed_start,
+                    locked_target_id=target_runner_id if runner_crossed_start else None,
                 )
             except RuntimeError:
                 torch.cuda.empty_cache()
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop = process_frame(
                     frame, model, velocity_tracker, DEVICE,
                     cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
                     crop_x_offset, crop_y_offset,
@@ -648,6 +758,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                     track_roi=track_roi,
                     overlay_start_pts=_ov_s,
                     overlay_end_pts=_ov_e,
+                    prefer_lead_runner=not runner_crossed_start,
+                    nearest_to_start=not runner_crossed_start,
+                    locked_target_id=target_runner_id if runner_crossed_start else None,
                 )
 
             if crop_frame is None:
@@ -661,9 +774,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                 if d is None:
                     cam_skipped += 1; total_skipped += 1
                     continue
-                bx1_c, by1_c, bx2_c, by2_c = d['bbox']
-                cx_orig = (bx1_c + bx2_c) / 2.0 + crop_x_offset
-                cy_orig = (by1_c + by2_c) / 2.0 + crop_y_offset
+                ground_x, ground_y = d.get('ground_point', _bbox_bottom_center(d['bbox']))
+                cx_orig = ground_x + crop_x_offset
+                cy_orig = ground_y + crop_y_offset
                 proj_px = _project_onto_track(
                     (cx_orig, cy_orig),
                     cam['start_mid'], cam['track_dir']
@@ -672,7 +785,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                 if proj_px < 0:
                     # 在起跑線前：放入 pre-roll buffer，不輸出
                     candidate_buf.clear()
-                    pre_roll_buf.append(crop_frame)
+                    pre_roll_buf.append((crop_frame, source_frame, bbox_in_crop))
                     if len(pre_roll_buf) > 5:
                         pre_roll_buf.pop(0)
                     continue
@@ -682,21 +795,18 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                     if candidate_buf and proj_px <= candidate_buf[-1][1]:
                         candidate_buf.clear()   # 後退或持平，重新收集
 
-                    candidate_buf.append((crop_frame, proj_px))
+                    candidate_buf.append((crop_frame, proj_px, source_frame, bbox_in_crop))
 
                     if len(candidate_buf) >= K_CONFIRM:
                         runner_crossed_start = True
+                        target_runner_id = fastest_id
                         # 寫出 pre-roll 幀
-                        for pre_f in pre_roll_buf:
-                            if not dry_run:
-                                out.write(pre_f)
-                            cam_written += 1; total_written += 1
+                        for pre_f, pre_source, pre_bbox in pre_roll_buf:
+                            _write_output_frame(pre_f, pre_source, pre_bbox, target_runner_id)
                         pre_roll_buf.clear()
                         # 寫出 candidate 幀
-                        for c_frame, _ in candidate_buf:
-                            if not dry_run:
-                                out.write(c_frame)
-                            cam_written += 1; total_written += 1
+                        for c_frame, _, c_source, c_bbox in candidate_buf:
+                            _write_output_frame(c_frame, c_source, c_bbox, target_runner_id)
                         candidate_buf.clear()
                         if not dry_run:
                             print(f"  [幀 {frame_count}] 確認起跑（投影={proj_px:.0f}px）")
@@ -712,15 +822,12 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                 if bh > max_bbox_height: max_bbox_height = bh
 
             if not dry_run:
-                out.write(crop_frame)
-                cam_written  += 1
-                total_written += 1
+                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
                 if frame_count % 100 == 0:
                     print(f"  [幀 {frame_count}/{total}] 追蹤: {len(velocity_tracker)} | "
                           f"寫入: {cam_written} | 捨棄: {cam_skipped}")
             else:
-                cam_written  += 1
-                total_written += 1
+                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
 
             # ── 切換條件（斜線模式優先）──
             if track_roi is not None and cam.get('pixel_span'):
@@ -728,8 +835,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
                 d = velocity_tracker.get(fastest_id)
                 if d is not None:
                     bx1, by1, bx2, by2 = d['bbox']
-                    cy_orig = (by1 + by2) / 2.0 + crop_y_offset
-                    ref_x = bx2 + crop_x_offset if is_last_cam else (bx1 + bx2) / 2.0 + crop_x_offset
+                    ground_x, ground_y = d.get('ground_point', _bbox_bottom_center(d['bbox']))
+                    cy_orig = ground_y + crop_y_offset
+                    ref_x = bx2 + crop_x_offset if is_last_cam else ground_x + crop_x_offset
                     proj_px = _project_onto_track(
                         (ref_x, cy_orig), cam['start_mid'], cam['track_dir']
                     )
@@ -753,6 +861,29 @@ def _process_cameras(caps, cameras, model, out, dry_run=False):
             print(f"  相機 {cam_idx+1} 完成：寫入 {cam_written}，捨棄 {cam_skipped}")
             if track_roi is not None and not runner_crossed_start:
                 print(f"  ⚠️  警告：整段影片跑者從未越過起跑線，本機輸出 0 幀")
+
+    if frame_map_path and not dry_run:
+        frame_dir = os.path.dirname(frame_map_path)
+        if frame_dir:
+            os.makedirs(frame_dir, exist_ok=True)
+        with open(frame_map_path, 'w', newline='') as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=['output_frame', 'cam', 'cam_frame', 'source_frame']
+            )
+            writer.writeheader()
+            writer.writerows(frame_map_rows)
+        bbox_map_path = frame_map_path.replace('_frame_map.csv', '_bbox_map.csv')
+        with open(bbox_map_path, 'w', newline='') as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=['output_frame', 'cam', 'cam_frame', 'source_frame',
+                            'track_id', 'x1', 'y1', 'x2', 'y2']
+            )
+            writer.writeheader()
+            writer.writerows(bbox_map_rows)
+        print(f"  Frame map: {frame_map_path}")
+        print(f"  BBox map:  {bbox_map_path}")
 
     return total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height
 
@@ -838,11 +969,14 @@ def main():
     first_cam_base = os.path.splitext(os.path.basename(CAMERAS[0]['video_path']))[0]
     OUTPUT_NAME    = f"{first_cam_base}_tracked.mp4"
     output_path    = os.path.join(OUTPUT_DIR, OUTPUT_NAME)
+    frame_map_path = os.path.join(OUTPUT_DIR, f"{first_cam_base}_tracked_frame_map.csv")
 
     # 寫入 marker 檔，供 run_pipeline.py 讀取實際輸出名稱
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(os.path.join(OUTPUT_DIR, ".last_output_name"), "w") as _f:
         _f.write(OUTPUT_NAME)
+    with open(os.path.join(OUTPUT_DIR, ".last_input_video"), "w") as _f:
+        _f.write(CAMERAS[0]['video_path'])
 
     first_fps = caps[0].get(cv2.CAP_PROP_FPS) or 60.0
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -885,7 +1019,7 @@ def main():
     # 正式處理：逐台相機串接追蹤 + 寫入影片
     # -----------------------------------------------------------------------
     total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
-        _process_cameras(caps, CAMERAS, model, out)
+        _process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
 
     # -----------------------------------------------------------------------
     # 收尾

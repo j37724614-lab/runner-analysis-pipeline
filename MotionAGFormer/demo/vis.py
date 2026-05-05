@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import glob
+import shutil
 from tqdm import tqdm
 import copy
 import yaml
@@ -18,6 +19,88 @@ import yaml
 sys.path.append(os.getcwd())
 from demo.lib.utils import normalize_screen_coordinates, camera_to_world
 from model.MotionAGFormer import MotionAGFormer
+
+
+def _reset_dir(path):
+    """清掉同名輸出資料夾，避免混到上一次不同尺寸或不同幀數的 PNG。"""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+
+def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
+                          max_jump_px=45.0):
+    """
+    對 HRNet 2D keypoints 做時間 EMA 平滑。
+
+    keypoints: shape (M, T, J, 2)
+    scores:    shape (M, T, J)
+
+    高信心且位移合理的點用 EMA 更新。
+    低信心或單幀跳太遠的點沿用上一幀平滑結果，避免錯點把骨架拉飄。
+    """
+    if keypoints.size == 0 or scores.size == 0:
+        return keypoints
+
+    smoothed = keypoints.astype(np.float32, copy=True)
+    num_person, num_frames, num_joints = scores.shape
+
+    for person_idx in range(num_person):
+        prev = None
+        for frame_idx in range(num_frames):
+            current = smoothed[person_idx, frame_idx]
+            current_scores = scores[person_idx, frame_idx]
+
+            if prev is None:
+                prev = current.copy()
+                continue
+
+            high_conf = current_scores >= conf_threshold
+            jump = np.linalg.norm(current - prev, axis=1)
+            plausible_motion = jump <= max_jump_px
+            update_mask = high_conf & plausible_motion
+
+            if np.any(update_mask):
+                prev[update_mask] = (
+                    alpha * prev[update_mask] +
+                    (1.0 - alpha) * current[update_mask]
+                )
+
+            smoothed[person_idx, frame_idx] = prev
+
+    return smoothed
+
+
+def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
+    """將 HRNet/H36M 17 個關節的 confidence 另存成 CSV，方便檢查飄點來源。"""
+    if scores.size == 0:
+        return
+
+    joint_names = [
+        'Hip',
+        'RHip', 'RKnee', 'RAnkle',
+        'LHip', 'LKnee', 'LAnkle',
+        'Spine', 'Thorax',
+        'Neck_Nose', 'Head',
+        'LShoulder', 'LElbow', 'LWrist',
+        'RShoulder', 'RElbow', 'RWrist',
+    ]
+    rows = []
+    for person_idx in range(scores.shape[0]):
+        frames = valid_frames[person_idx] if person_idx < len(valid_frames) else None
+        for frame_idx in range(scores.shape[1]):
+            source_frame = int(frames[frame_idx]) if frames is not None and frame_idx < len(frames) else frame_idx
+            row = {
+                'person': person_idx,
+                'frame': frame_idx,
+                'source_frame': source_frame,
+            }
+            for joint_idx, joint_name in enumerate(joint_names):
+                row[joint_name] = float(scores[person_idx, frame_idx, joint_idx])
+            rows.append(row)
+
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
+
 
 import matplotlib
 import matplotlib.pyplot as plt 
@@ -85,23 +168,41 @@ def show3Dpose(vals, ax):
     ax.tick_params('z', labelleft = False)
 
 
-def get_pose2D(video_path, output_dir):
+def get_pose2D(video_path, output_dir, bbox_csv=None):
     cap = cv2.VideoCapture(video_path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
     print('\nGenerating 2D pose...')
-    keypoints, scores = hrnet_pose(video_path, det_dim=416, num_peroson=1, gen_output=True)
+    if bbox_csv:
+        print(f'Using external bbox CSV: {bbox_csv}')
+    keypoints, scores = hrnet_pose(
+        video_path,
+        det_dim=416,
+        num_peroson=1,
+        gen_output=True,
+        bbox_csv=bbox_csv,
+    )
     keypoints, scores, valid_frames = h36m_coco_format(keypoints, scores)
+    keypoints = _smooth_keypoints_ema(
+        keypoints,
+        scores,
+        alpha=0.40,
+        conf_threshold=0.50,
+        max_jump_px=45.0,
+    )
     
     # Add conf score to the last dim
     keypoints = np.concatenate((keypoints, scores[..., None]), axis=-1)
 
     output_dir += 'input_2D/'
-    os.makedirs(output_dir, exist_ok=True)
+    _reset_dir(output_dir)
 
     output_npz = output_dir + 'keypoints.npz'
     np.savez_compressed(output_npz, reconstruction=keypoints, valid_frames=valid_frames)
+    confidence_csv = output_dir + 'hrnet_confidence.csv'
+    _save_hrnet_confidence_csv(scores, valid_frames, confidence_csv)
+    print(f'HRNet confidence CSV saved to {confidence_csv}')
 
 
 def img2video(video_path, output_dir):
@@ -123,6 +224,10 @@ def img2video(video_path, output_dir):
         videoWrite = cv2.VideoWriter(output_dir + video_name + '_2D.mp4', fourcc, fps, size)
         for name in names_pose2d:
             img = cv2.imread(name)
+            if img is None:
+                continue
+            if (img.shape[1], img.shape[0]) != size:
+                img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
             videoWrite.write(img)
         videoWrite.release()
         print(f"2D Video saved to {output_dir + video_name + '_2D.mp4'}")
@@ -135,6 +240,10 @@ def img2video(video_path, output_dir):
         videoWrite = cv2.VideoWriter(output_dir + video_name + '.mp4', fourcc, fps, size)
         for name in names_pose:
             img = cv2.imread(name)
+            if img is None:
+                continue
+            if (img.shape[1], img.shape[0]) != size:
+                img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
             videoWrite.write(img)
         videoWrite.release()
         print(f"Pose video saved to {output_dir + video_name + '.mp4'}")
@@ -382,7 +491,7 @@ def get_pose3D(video_path, output_dir):
     ## 3D
     print('\nGenerating 2D pose image...')
     output_dir_2D = os.path.join(output_dir, 'pose2D/')
-    os.makedirs(output_dir_2D, exist_ok=True)
+    _reset_dir(output_dir_2D)
     
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 重置到開頭
     for i in tqdm(range(valid_frame_count)):
@@ -401,6 +510,10 @@ def get_pose3D(video_path, output_dir):
 
     
     print('\nGenerating 3D pose...')
+    output_dir_3D = output_dir +'pose3D/'
+    output_dir_pose = output_dir +'pose/'
+    _reset_dir(output_dir_3D)
+    _reset_dir(output_dir_pose)
     all_poses_all_clips = []
     
     for idx, (clip, d_idx) in enumerate(zip(clips, downsample_indices)):
@@ -447,8 +560,6 @@ def get_pose3D(video_path, output_dir):
         ax = plt.subplot(gs[0], projection='3d')
         show3Dpose(post_out, ax)
 
-        output_dir_3D = output_dir +'pose3D/'
-        os.makedirs(output_dir_3D, exist_ok=True)
         plt.savefig(output_dir_3D + str(('%04d'% j)) + '_3D.png', dpi=200, format='png', bbox_inches='tight')
         plt.close(fig)
         
@@ -487,8 +598,6 @@ def get_pose3D(video_path, output_dir):
         ax.set_title("Reconstruction", fontsize = font_size)
 
         ## save
-        output_dir_pose = output_dir +'pose/'
-        os.makedirs(output_dir_pose, exist_ok=True)
         plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
         plt.margins(0, 0)
         plt.savefig(output_dir_pose + str(('%04d'% i)) + '_pose.png', dpi=200, bbox_inches = 'tight')
@@ -500,6 +609,8 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', type=str, default='0', help='input video')
     parser.add_argument('--2d_only', action='store_true', help='Only generate 2D pose video')
     parser.add_argument('--no_angles', action='store_true', help='Skip angle computation (angles are saved by default)')
+    parser.add_argument('--bbox-csv', type=str, default=None,
+                        help='External bbox CSV generated by track_crop_roi.py')
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -508,7 +619,7 @@ if __name__ == "__main__":
     video_name = video_path.split('/')[-1].split('.')[0]
     output_dir = './demo/output/' + video_name + '/'
 
-    get_pose2D(video_path, output_dir)
+    get_pose2D(video_path, output_dir, bbox_csv=args.bbox_csv)
     if not args.__dict__.get('2d_only', False):
         get_pose3D(video_path, output_dir)   # ← 角度計算已整合在內，自動執行
     img2video(video_path, output_dir)

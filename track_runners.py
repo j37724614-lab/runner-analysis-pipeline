@@ -33,7 +33,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
 DEVICE = 0
 
 # 模型權重路徑
-MODEL_PATH = str(_BASE / "yolo11x.pt")
+MODEL_PATH = str(_BASE / "yolo26x.pt")
 
 # 中文字型路徑（圖表與影片疊字使用）
 FONT_PATH = str(_BASE / "MotionAGFormer" / "ChineseFont.ttf")
@@ -86,6 +86,204 @@ def _project_onto_track(point, start_mid, track_dir):
     dx = point[0] - start_mid[0]
     dy = point[1] - start_mid[1]
     return dx * track_dir[0] + dy * track_dir[1]
+
+
+def _project_point_to_track_line(point, start_mid, track_dir):
+    """將 point 投影到 start_mid + track_dir 定義的跑道中心線上。"""
+    proj = _project_onto_track(point, start_mid, track_dir)
+    return (
+        start_mid[0] + track_dir[0] * proj,
+        start_mid[1] + track_dir[1] * proj,
+    )
+
+
+def _compute_homography(src_points, dst_points_world):
+    """根據對應點計算 Homography，失敗時拋出 ValueError。"""
+    if src_points is None or dst_points_world is None:
+        return None, None
+
+    src = np.asarray(src_points, dtype=np.float32)
+    dst = np.asarray(dst_points_world, dtype=np.float32)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError(
+            "homography_src_points / homography_dst_points_world 必須是 shape=(N,2) 且點數一致"
+        )
+    if len(src) < 4:
+        raise ValueError("Homography 至少需要 4 組對應點")
+
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    if H is None:
+        raise ValueError("Homography 計算失敗，請檢查點位是否共線或順序是否對應")
+    return H, mask
+
+
+def _transform_point_homography(point, H):
+    """把單一影像點轉到世界座標，回傳 (xw, yw)。"""
+    if H is None:
+        return None
+    pts = np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(pts, H)
+    return tuple(mapped[0, 0])
+
+
+def _inverse_transform_points_homography(points_world, H):
+    """把一批世界座標點反投影回影像座標。"""
+    if H is None:
+        return None
+    pts = np.asarray(points_world, dtype=np.float32).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(pts, np.linalg.inv(H))
+    return mapped.reshape(-1, 2)
+
+
+def _draw_cv_label(img, text, xy, color=(255, 255, 255), scale=0.55):
+    """用 OpenCV 畫有黑色外框的短標籤。"""
+    x, y = int(round(xy[0])), int(round(xy[1]))
+    cv2.putText(img, str(text), (x + 4, y - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, str(text), (x + 4, y - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, 1, cv2.LINE_AA)
+
+
+def _homography_point_color(raw_mps):
+    """Homography 可視圖上的速度分類色彩：紅 <9、綠 9~11、藍 >11。"""
+    if raw_mps is None:
+        return (160, 160, 160)
+    if raw_mps < 9.0:
+        return (0, 0, 255)
+    if raw_mps <= 11.0:
+        return (0, 210, 0)
+    return (255, 0, 0)
+
+
+def _write_homography_visualizations(cameras, output_dir, track_data=None):
+    """輸出每台相機的 Homography 線、控制點，以及可選的跑者落點速度分類。"""
+    os.makedirs(output_dir, exist_ok=True)
+    track_by_cam = {}
+    if track_data:
+        prev_dist_by_cam = {}
+        for row in track_data:
+            cam_no = row.get('cam')
+            if cam_no is None:
+                continue
+            raw_mps = None
+            dist_raw = row.get('dist_raw_m')
+            prev_dist = prev_dist_by_cam.get(cam_no)
+            if dist_raw not in ('', None):
+                try:
+                    dist_raw = float(dist_raw)
+                    if prev_dist is not None:
+                        raw_mps = (dist_raw - prev_dist) * 60.0
+                    prev_dist_by_cam[cam_no] = dist_raw
+                except (TypeError, ValueError):
+                    pass
+            enriched = dict(row)
+            enriched['raw_mps_for_viz'] = raw_mps
+            track_by_cam.setdefault(cam_no, []).append(enriched)
+
+    written = []
+    for cam_idx, cam in enumerate(cameras, start=1):
+        H = cam.get('H_matrix')
+        src_points = cam.get('homography_src_points')
+        dst_world = cam.get('homography_dst_world')
+        video_path = cam.get('video_path')
+        if H is None or src_points is None or dst_world is None or not video_path:
+            continue
+
+        cap = cv2.VideoCapture(video_path)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            print(f"Homography 可視圖略過 cam{cam_idx}: 無法讀取第一幀")
+            continue
+
+        img = frame.copy()
+        dst_world = np.asarray(dst_world, dtype=np.float32)
+        src_points = np.asarray(src_points, dtype=np.float32)
+        x_min = float(np.min(dst_world[:, 0]))
+        x_max = float(np.max(dst_world[:, 0]))
+        y_min = float(np.min(dst_world[:, 1]))
+        y_max = float(np.max(dst_world[:, 1]))
+        y_mid = (y_min + y_max) / 2.0
+
+        lane_poly = _inverse_transform_points_homography(
+            [[x_min, y_max], [x_min, y_min], [x_max, y_min], [x_max, y_max]], H)
+        if lane_poly is not None:
+            overlay = img.copy()
+            cv2.fillPoly(overlay, [np.rint(lane_poly).astype(np.int32)], (230, 230, 180))
+            cv2.addWeighted(overlay, 0.18, img, 0.82, 0, img)
+
+        # 每 2m 一條輔助線，每 10m 一條主線。
+        for meter in np.arange(x_min, x_max + 0.001, 2.0):
+            projected = _inverse_transform_points_homography(
+                [[meter, y_min], [meter, y_max]], H)
+            if projected is None:
+                continue
+            p0, p1 = np.rint(projected).astype(np.int32)
+            major = abs((meter - x_min) % 10.0) < 1e-6 or abs(meter - x_max) < 1e-6
+            color = (0, 255, 255) if major else (190, 190, 190)
+            cv2.line(img, tuple(p0), tuple(p1), color, 3 if major else 1, cv2.LINE_AA)
+            if major:
+                _draw_cv_label(img, f"{int(round(meter))}m", (projected[0] + projected[1]) / 2,
+                               color=(0, 255, 255), scale=0.7)
+
+        # 遠側、中心線、近側。
+        for y_val, color, thickness in [
+                (y_min, (255, 120, 60), 2),
+                (y_mid, (255, 255, 255), 1),
+                (y_max, (80, 220, 80), 2)]:
+            world_line = [[x, y_val] for x in np.linspace(x_min, x_max, 41)]
+            projected = _inverse_transform_points_homography(world_line, H)
+            if projected is None:
+                continue
+            projected = np.rint(projected).astype(np.int32)
+            for p0, p1 in zip(projected[:-1], projected[1:]):
+                cv2.line(img, tuple(p0), tuple(p1), color, thickness, cv2.LINE_AA)
+
+        for idx, (src_pt, world_pt) in enumerate(zip(src_points, dst_world), start=1):
+            p = tuple(np.rint(src_pt).astype(np.int32))
+            cv2.circle(img, p, 7, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(img, p, 5, (0, 255, 255), -1, cv2.LINE_AA)
+            _draw_cv_label(img, f"P{idx} {world_pt[0]:.0f}m,{world_pt[1]:.2f}",
+                           p, color=(0, 255, 255), scale=0.5)
+
+        for row in track_by_cam.get(cam_idx, []):
+            x = row.get('image_point_x')
+            y = row.get('image_point_y')
+            if x in ('', None) or y in ('', None):
+                continue
+            try:
+                pt = (int(round(float(x))), int(round(float(y))))
+            except (TypeError, ValueError):
+                continue
+            cv2.circle(img, pt, 3, _homography_point_color(row.get('raw_mps_for_viz')),
+                       -1, cv2.LINE_AA)
+
+        cv2.rectangle(img, (15, 15), (760, 105), (0, 0, 0), -1)
+        cv2.putText(img,
+                    f"CAM{cam_idx} Homography visualization ({int(round(x_min))}-{int(round(x_max))}m, {len(src_points)} points)",
+                    (28, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, "landing points: red raw<9, green 9-11, blue >11 m/s",
+                    (28, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+
+        full_path = os.path.join(output_dir, f"cam{cam_idx}_homography_visualization.jpg")
+        cv2.imwrite(full_path, img)
+        written.append(full_path)
+
+        crop = cam.get('crop_params')
+        if crop:
+            x1, y1, x2, y2 = [int(v) for v in crop]
+            crop_img = img[y1:y2, x1:x2]
+            crop_path = os.path.join(output_dir, f"cam{cam_idx}_homography_visualization_crop.jpg")
+            cv2.imwrite(crop_path, crop_img)
+            written.append(crop_path)
+
+    if written:
+        print("Homography 可視圖輸出：")
+        for path in written:
+            print(f"  {path}")
+    return written
 
 
 def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
@@ -142,6 +340,11 @@ def _draw_text_bgr(img, text, org, font=None, color=(255, 255, 255), thickness=2
     draw.text((x, y), str(text), font=font, fill=color[::-1])
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
+
+def _bbox_bottom_center(bx1, by1, bx2, by2):
+    """回傳 bbox 底邊中心點，作為地面位置的近似點。"""
+    return ((float(bx1) + float(bx2)) / 2.0, float(by2))
+
 # -----------------------------------------------------------------------
 # camera() — 快速建立相機設定的 helper function
 #
@@ -167,8 +370,13 @@ def camera(video_path, crop=None,
            distance_m=None,
            start_line=None, end_line=None,
            pre_roll_px=200,
+           end_roll_px=120,
            start_gate_px=250,
-           start_confirm_move_px=8):
+           start_roi_px=100,
+           start_confirm_move_px=8,
+           H_matrix=None,
+           homography_src_points=None,
+           homography_dst_world=None):
     """
     start_line / end_line（可選）：各由兩個原始影像座標點組成的斜線，
       例如 start_line=[(150, 420), (150, 780)]。
@@ -197,9 +405,25 @@ def camera(video_path, crop=None,
             dtype=np.float32
         )
 
+    # Homography 模式的世界座標起點（取最小 Xw 作為本段 0m）
+    homography_start_x = None
+    if H_matrix is not None:
+        if start_line is not None:
+            start_world = [_transform_point_homography(pt, H_matrix) for pt in start_line]
+            if all(p is not None for p in start_world):
+                homography_start_x = float(np.mean([p[0] for p in start_world]))
+        elif roi_x[0] != 0 or roi_y[0] != 0:
+            start_world = _transform_point_homography((roi_x[0], roi_y[0]), H_matrix)
+            if start_world is not None:
+                homography_start_x = float(start_world[0])
+        else:
+            homography_start_x = 0.0
+
     # 自動推算起跑點像素與公尺/像素換算比例
     start_x = start_mid[0] if start_mid else roi_x[0]
-    if start_line is not None and end_line is not None and pixel_span and distance_m is not None:
+    if H_matrix is not None:
+        m_per_pixel = None
+    elif start_line is not None and end_line is not None and pixel_span and distance_m is not None:
         m_per_pixel = distance_m / pixel_span
     elif distance_m is not None and roi_x[1] > roi_x[0]:
         m_per_pixel = distance_m / (roi_x[1] - roi_x[0])
@@ -225,9 +449,21 @@ def camera(video_path, crop=None,
         'quad_roi':    quad_roi,
         'track_roi':   {'start_mid': start_mid, 'track_dir': track_dir,
                         'pixel_span': pixel_span, 'pre_roll_px': pre_roll_px,
+                        'end_roll_px': end_roll_px,
+                        'start_roi_px': start_roi_px,
                         'start_gate_px': start_gate_px,
                         'start_confirm_move_px': start_confirm_move_px}
                        if start_mid is not None else None,
+        'H_matrix':    H_matrix,
+        'homography_start_x': homography_start_x,
+        'homography_src_points': (
+            np.asarray(homography_src_points, dtype=np.float32)
+            if homography_src_points is not None else None
+        ),
+        'homography_dst_world': (
+            np.asarray(homography_dst_world, dtype=np.float32)
+            if homography_dst_world is not None else None
+        ),
     }
 
 
@@ -235,6 +471,14 @@ def _build_camera_from_json(entry):
     sl = entry.get('start_line')
     el = entry.get('end_line')
     crop_val = entry.get('crop')
+
+    H_matrix = None
+    src_pts = entry.get('homography_src_points')
+    dst_pts = entry.get('homography_dst_world')
+    if src_pts and dst_pts:
+        H_matrix, _ = _compute_homography(
+            np.float32(src_pts), np.float32(dst_pts))
+
     return camera(
         video_path=entry.get('video_path'),
         crop=tuple(crop_val) if crop_val else None,
@@ -246,91 +490,227 @@ def _build_camera_from_json(entry):
         start_line=[tuple(p) for p in sl] if sl else None,
         end_line=[tuple(p) for p in el] if el else None,
         pre_roll_px=int(entry.get('pre_roll_px', 200)),
+        end_roll_px=int(entry.get('end_roll_px', 120)),
+        start_roi_px=int(entry.get('start_roi_px', 100)),
+        H_matrix=H_matrix,
+        homography_src_points=src_pts,
+        homography_dst_world=dst_pts,
+    )
+
+
+LANE_WIDTH_M = 1.22
+
+
+def build_lane_world_points(start_meter, num_points=5, lane_width=LANE_WIDTH_M):
+    """建立單一跑道區段的世界座標；支援 5 點或 6 點 Homography 標定。"""
+    if num_points == 5:
+        return np.float32([
+            [start_meter + 0.0, lane_width],
+            [start_meter + 0.0, 0.0],
+            [start_meter + 10.0, 0.0],
+            [start_meter + 20.0, 0.0],
+            [start_meter + 20.0, lane_width],
+        ])
+
+    if num_points == 6:
+        return np.float32([
+            [start_meter + 0.0, lane_width],
+            [start_meter + 0.0, 0.0],
+            [start_meter + 10.0, 0.0],
+            [start_meter + 10.0, lane_width],
+            [start_meter + 20.0, 0.0],
+            [start_meter + 20.0, lane_width],
+        ])
+
+    raise ValueError("src_points 目前只支援 5 點或 6 點 Homography 標定")
+
+
+def build_camera_with_homography(video_path, crop, start_line, end_line,
+                                 start_meter, src_points=None, distance_m=20,
+                                 roi_x=(0, 9999), roi_y=(0, 9999),
+                                 switch_x=None, roi_zones=None,
+                                 pre_roll_px=200,
+                                 end_roll_px=120,
+                                 start_gate_px=250,
+                                 start_roi_px=100,
+                                 start_confirm_move_px=8):
+    """
+    簡化版相機設定：
+      - 填入 start_meter 與 5/6 個 src_points 時，自動計算 Homography
+      - src_points 未填滿時，自動退回既有 start_line/end_line 或 roi_x 量測模式
+    src_points 固定順序：
+      1. 0m 靠近側
+      2. 0m 遠離側
+      3. 10m 遠離側
+      4. 20m 遠離側
+      5. 20m 靠近側
+    若使用 6 點，順序為：
+      1. 0m 靠近側
+      2. 0m 遠離側
+      3. 10m 遠離側
+      4. 10m 靠近側
+      5. 20m 遠離側
+      6. 20m 靠近側
+    """
+    H_matrix = None
+    dst_points_world = None
+    if src_points is not None and len(src_points) >= 4:
+        dst_points_world = build_lane_world_points(start_meter, num_points=len(src_points))
+        H_matrix, _ = _compute_homography(np.float32(src_points), dst_points_world)
+
+    return camera(
+        video_path=video_path,
+        crop=crop,
+        roi_x=roi_x,
+        roi_y=roi_y,
+        switch_x=switch_x,
+        roi_zones=roi_zones,
+        distance_m=distance_m,
+        start_line=start_line,
+        end_line=end_line,
+        pre_roll_px=pre_roll_px,
+        end_roll_px=end_roll_px,
+        start_gate_px=start_gate_px,
+        start_roi_px=start_roi_px,
+        start_confirm_move_px=start_confirm_move_px,
+        H_matrix=H_matrix,
+        homography_src_points=src_points,
+        homography_dst_world=dst_points_world,
     )
 
 
 # -----------------------------------------------------------------------
 # 相機設定（最多 6 台）
 #
-# video_path  填影片路徑 = 啟用；填 None = 此台不使用
-# crop        (x起, y起, x終, y終) 裁剪範圍
-# roi_x       (左, 右) ROI 有效範圍（原始影像像素）
-# switch_x    跑者 center_x 超過此值時切換到下一台（最後一台自動忽略）
-# distance_m  roi_x 範圍對應的實際跑道距離（公尺）
-#             ← 填入此值才會顯示速度圖表與輸出 CSV
-#             ← 計算方式：實際距離 ÷ (roi_x右 - roi_x左) 像素 = m/px（程式自動算）
-#             ← 填 None = 不計算距離，不顯示圖表
+# 最省事的填法：改用 build_camera_with_homography(...)
+# 你每台只要填：
+#   1. video_path
+#   2. start_line / end_line
+#   3. start_meter（本台相機起始公尺）
+#   4. src_points（固定 5 點；也可用 6 點補上中段近側點）
 #
-# ── 斜線起終點模式（選用，取代 roi_x / switch_x）──
-# start_line  [(x1,y1), (x2,y2)]  起跑線兩端點（原始影像座標）
-# end_line    [(x3,y3), (x4,y4)]  終點線兩端點（原始影像座標）
-#             ← 同時填入時：switch_x 自動忽略，改由越線事件觸發切換
-#             ← m_per_pixel 改由兩中點的像素距離換算（取代 roi_x 方式）
-#             ← 距離以「跑者中心點投影到跑道方向」計算，不受高低位置影響
+# src_points 固定順序：
+#   1. 0m 靠近側
+#   2. 0m 遠離側
+#   3. 10m 遠離側
+#   4. 20m 遠離側
+#   5. 20m 靠近側
 #
-# ── 影片路徑輸入方式（二選一）────────────────────────────────────────────
+# src_points 若使用 6 點，固定順序：
+#   1. 0m 靠近側
+#   2. 0m 遠離側
+#   3. 10m 遠離側
+#   4. 10m 靠近側
+#   5. 20m 遠離側
+#   6. 20m 靠近側
 #
-# 方法 A：直接在下方填入絕對路徑（本機快速測試用）
-#   CAM1 = camera("/path/to/cam1.mp4", crop=..., start_line=..., ...)
-#
-# 方法 B：保持 None，改用 --config-json 傳入（推薦，不需修改程式碼）
-#   python track_runners.py --config-json '{
-#     "cameras": [
-#       {"video_path": "/path/to/cam1.mp4",
-#        "crop": [0, 400, 1920, 800],
-#        "start_line": [[208, 715], [123, 725]],
-#        "end_line":   [[1760, 710], [1830, 718]],
-#        "distance_m": 20},
-#       {"video_path": "/path/to/cam2.mp4", ...}
-#     ]
-#   }'
-#
-# ── 斜線模式欄位說明 ──────────────────────────────────────────────────────
-# 範例（斜線模式）：
-# CAM1 = camera("/path/to/vid.mp4",
-#               crop=(0, 400, 1920, 800),
-#               start_line=[(150, 420), (150, 780)],  # 起跑線兩端點
-#               end_line  =[(1820, 400), (1820, 760)], # 終點線兩端點
-#               distance_m=20)
+# 若 src_points 尚未填滿，會自動退回既有 distance_m + start_line/end_line 模式，
+# 方便你逐台補 Homography，不會影響腳本先跑。
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/pipeline_release/video/IMG_2526_11.mp4",                        # ← 填入影片路徑或改用 --config-json
-              crop=(0, 400, 1920, 800),
-              start_line=[(208, 715), (123, 725)],
-              end_line  =[(1760, 710), (1830, 718)],
-              distance_m=20)
+# 建議公尺區間：
+#   CAM1: 0m~20m
+#   CAM2: 20m~40m
+#   CAM3: 40m~60m
+#   CAM4: 60m~80m
+#   CAM5: 80m~100m
+#   CAM6: 100m~120m
+# -----------------------------------------------------------------------
+CAM1 = build_camera_with_homography(
+    video_path="/home/jeter/pipeline_release/video/IMG_3564_1.mp4",
+    crop=(0, 400, 1920, 800),
+    start_line=[(222, 715), (148, 725)],
+    end_line=[(1700, 710), (1790, 718)],
+    start_meter=0.0,
+    start_roi_px=100,
+    src_points=[
+        [148, 725],   # 0m 靠近側
+        [222, 715],   # 0m 遠離側
+        [961, 714],   # 10m 遠離側
+        [966, 723],   # 10m 靠近側（由跑道透視與 1.22m 寬度推算）
+        [1700, 710],  # 20m 遠離側
+        [1790, 720],  # 20m 靠近側
+    ],
+)
 
-CAM2 = camera("/home/jeter/pipeline_release/video/IMG_2538_9.mp4",
-              crop=(0, 400, 1920, 800),
-              start_line=[(208, 715), (123, 725)],
-              end_line  =[(1760, 710), (1830, 718)],
-              distance_m=20)
+CAM2 = build_camera_with_homography(
+    video_path= "/home/jeter/pipeline_release/video/IMG_2540_2.mp4",
+    crop=(0, 400, 1920, 800),
+    start_line=[(220, 715), (135, 725)],
+    end_line=[(1730, 710), (1825, 725)],
+    start_meter=20.0,
+    src_points=[
+        [135, 725],   # 20m 靠近側
+        [220, 715],   # 20m 遠離側
+        [970, 714],   # 30m 遠離側
+        [970, 721],   # 30m 靠近側（由跑道透視與 1.22m 寬度推算）
+        [1730, 710],  # 40m 遠離側
+        [1825, 725],  # 40m 靠近側
+    ],
+)
 
-CAM3 = camera("/home/jeter/pipeline_release/video/0420_10.mp4",
-              crop=(0, 400, 1920, 800),
-              start_line=[(215, 713), (130, 727)],
-              end_line  =[(1735, 715), (1820, 722)],
-              distance_m=20)
+CAM3 = build_camera_with_homography(
+    video_path="/home/jeter/pipeline_release/video/0504_3.mp4",
+    crop=(0, 400, 1920, 800),
+    start_line=[(212, 715), (127, 725)],
+    end_line=[(1755, 710), (1835, 718)],
+    start_meter=40.0,
+    src_points=[
+        [127, 725],   # 40m 靠近側
+        [212, 715],   # 40m 遠離側
+        [980, 714],   # 50m 遠離側
+        [983, 721],   # 50m 靠近側（由跑道透視與 1.22m 寬度推算）
+        [1755, 710],  # 60m 遠離側
+        [1835, 718],  # 60m 靠近側
+    ],
+)
 
-CAM4 = camera(None,                        # ← 填路徑即可啟用
-              crop=(0, 400, 1920, 800),
-              roi_x=(150, 1820),
-              start_line=[(150, 400), (150, 800)],
-              end_line  =[(1820, 400), (1820, 800)],
-              distance_m=None)
+CAM4 = build_camera_with_homography(
+    video_path="/home/jeter/pipeline_release/video/0504_4.mp4",
+    crop=(0, 400, 1920, 800),
+    start_line=[(227, 713), (140, 727)],
+    end_line=[(1722, 718), (1825, 725)],
+    start_meter=60.0,
+    src_points=[
+        [140, 727],   # 60m 靠近側
+        [227, 713],   # 60m 遠離側
+        [976, 716],   # 70m 遠離側
+        [976, 726],  # 70m 靠近側（由跑道透視與 1.22m 寬度推算）
+        [1722, 718],  # 80m 遠離側
+        [1825, 725],  # 80m 靠近側
+    ],
+)
 
-CAM5 = camera(None,
-              crop=(0, 400, 1920, 800),
-              roi_x=(150, 1820),
-              start_line=[(150, 400), (150, 800)],
-              end_line  =[(1820, 400), (1820, 800)],
-              distance_m=None)
+CAM5 = build_camera_with_homography(
+    video_path=None,
+    crop=(0, 400, 1920, 800),
+    start_line=[(150, 400), (150, 800)],
+    end_line=[(1820, 400), (1820, 800)],
+    start_meter=80.0,
+    src_points=[
+        # [x, y],  # 80m 靠近側
+        # [x, y],  # 80m 遠離側
+        # [x, y],  # 90m 遠離側
+        # [x, y],  # 90m 靠近側
+        # [x, y],  # 100m 遠離側
+        # [x, y],  # 100m 靠近側
+    ],
+)
 
-CAM6 = camera(None,
-              crop=(0, 400, 1920, 800),
-              roi_x=(150, 1820),
-              start_line=[(150, 400), (150, 800)],
-              end_line  =[(1820, 400), (1820, 800)],
-              distance_m=None)
+CAM6 = build_camera_with_homography(
+    video_path=None,
+    crop=(0, 400, 1920, 800),
+    start_line=[(150, 400), (150, 800)],
+    end_line=[(1820, 400), (1820, 800)],
+    start_meter=100.0,
+    src_points=[
+        # [x, y],  # 100m 靠近側
+        # [x, y],  # 100m 遠離側
+        # [x, y],  # 110m 遠離側
+        # [x, y],  # 110m 靠近側
+        # [x, y],  # 120m 遠離側
+        # [x, y],  # 120m 靠近側
+    ],
+)
 
 # -----------------------------------------------------------------------
 # 移動偵測參數
@@ -341,16 +721,140 @@ STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量
 MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄
 CAM_WARMUP_FRAMES   = 5   # 切換相機後前幾幀放寬選取條件
 MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
+GROUND_POINT_EMA_ALPHA = 0.35  # bbox 底部中心點 EMA 平滑係數；越小越穩但延遲越大
+FLAT_INTERP_EPS_M = 0.001      # 距離變化小於此值視為 flat segment
 
 # =======================================================================
 # 以下為程式邏輯，一般不需修改
 # =======================================================================
 
-def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0):
+def _interpolate_flat_segments(d, eps=FLAT_INTERP_EPS_M):
+    """
+    將中間的距離 flat segment 用前後變動點線性插值。
+    只處理前後都有有效變動點的區段；開頭/結尾 flat 不外推。
+    """
+    d = np.asarray(d, dtype=float).copy()
+    n = len(d)
+    if n < 3:
+        return d
+
+    i = 1
+    while i < n:
+        if abs(d[i] - d[i - 1]) >= eps:
+            i += 1
+            continue
+
+        flat_start = i - 1
+        flat_val = d[flat_start]
+        j = i
+        while j < n and abs(d[j] - flat_val) < eps:
+            j += 1
+
+        # 需要前一個變動點與後一個變動點；避免對開頭/尾端憑空外推。
+        prev_idx = flat_start - 1
+        next_idx = j
+        if prev_idx >= 0 and next_idx < n and d[next_idx] > d[prev_idx]:
+            span = next_idx - prev_idx
+            for k in range(flat_start, next_idx):
+                ratio = (k - prev_idx) / span
+                d[k] = d[prev_idx] + ratio * (d[next_idx] - d[prev_idx])
+
+        i = max(j, i + 1)
+
+    return d
+
+
+def _interpolate_missing_numeric(values):
+    """用前後有效值線性補齊 None；端點缺值用最近有效值延伸。"""
+    out = list(values)
+    valid = [i for i, v in enumerate(out) if v is not None]
+    if not valid:
+        return out
+
+    first = valid[0]
+    for i in range(0, first):
+        out[i] = out[first]
+
+    for left, right in zip(valid, valid[1:]):
+        if right == left + 1:
+            continue
+        start = float(out[left])
+        end = float(out[right])
+        span = right - left
+        for i in range(left + 1, right):
+            ratio = (i - left) / span
+            out[i] = start + ratio * (end - start)
+
+    last = valid[-1]
+    for i in range(last + 1, len(out)):
+        out[i] = out[last]
+    return out
+
+
+def _interpolate_missing_bboxes(values):
+    """用前後有效 bbox 線性補齊 None；端點缺值用最近有效 bbox 延伸。"""
+    out = list(values)
+    valid = [i for i, v in enumerate(out) if v is not None]
+    if not valid:
+        return out
+
+    first = valid[0]
+    for i in range(0, first):
+        out[i] = out[first]
+
+    for left, right in zip(valid, valid[1:]):
+        if right == left + 1:
+            continue
+        start = np.asarray(out[left], dtype=float)
+        end = np.asarray(out[right], dtype=float)
+        span = right - left
+        for i in range(left + 1, right):
+            ratio = (i - left) / span
+            out[i] = tuple(np.rint(start + ratio * (end - start)).astype(int))
+
+    last = valid[-1]
+    for i in range(last + 1, len(out)):
+        out[i] = out[last]
+    return out
+
+
+def _interpolation_metadata(interpolated_mask):
+    """回傳每幀插值段長度與速度可信度。"""
+    gap_len = [0] * len(interpolated_mask)
+    confidence = [1.0] * len(interpolated_mask)
+
+    i = 0
+    while i < len(interpolated_mask):
+        if not interpolated_mask[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < len(interpolated_mask) and interpolated_mask[i]:
+            i += 1
+        length = i - start
+
+        if length <= 3:
+            conf = 0.7
+        elif length <= 8:
+            conf = 0.4
+        else:
+            conf = 0.2
+
+        for j in range(start, i):
+            gap_len[j] = length
+            confidence[j] = conf
+
+    return gap_len, confidence
+
+
+def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
+                       measurement_confidence=None):
     """
     移植自 smart_switch_tracker.py _compute_kf_series()。
     輸入：d_raw = list of float（每幀原始距離，公尺），fps = 幀率
           init_v / init_a：跨機傳遞的初始速度/加速度（預設 0，第一機使用）
+          measurement_confidence：每幀量測可信度；插值幀可設較低，降低 Kalman 信任
     輸出：(d_smooth, v_smooth, a) 三個 numpy array，長度與 d_raw 相同
 
     流程（與 smart_switch 完全相同）：
@@ -361,11 +865,21 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0):
     n = len(d_raw)
     dt = 1.0 / fps
     d = np.array(d_raw, dtype=float)
+    if measurement_confidence is None:
+        measurement_confidence = np.ones(n, dtype=float)
+    else:
+        measurement_confidence = np.asarray(measurement_confidence, dtype=float)
+        if len(measurement_confidence) != n:
+            measurement_confidence = np.ones(n, dtype=float)
+        measurement_confidence = np.clip(measurement_confidence, 0.05, 1.0)
 
     # 1. 單調約束
     for k in range(1, n):
         if d[k] < d[k - 1]:
             d[k] = d[k - 1]
+
+    # 1b. 修正「距離卡住幾幀後突然跳動」造成的速度/加速度震盪
+    d = _interpolate_flat_segments(d)
 
     # 2. Butterworth filtfilt（需 n >= 15）
     if n >= 15:
@@ -390,7 +904,8 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0):
                              [0,  0,             1]])
             kf.H = np.array([[1, 0, 0]])
             kf.Q = np.diag([0.001, 0.01, 0.5])
-            kf.R = np.array([[0.05]])
+            base_r = 0.05
+            kf.R = np.array([[base_r]])
             # 跨機傳遞初始速度與加速度，避免切換時從 0 重新爬升
             kf.x = np.array([[d_smooth[0]], [float(init_v)], [float(init_a)]])
             # 若有前機狀態，速度/加速度的初始不確定度可更小
@@ -398,8 +913,9 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0):
             p_a = 100.0 if init_a == 0.0 else 1.0
             kf.P = np.diag([1.0, p_v, p_a])
             velocities, accels = [], []
-            for val in d_smooth:
+            for val, conf in zip(d_smooth, measurement_confidence):
                 kf.predict()
+                kf.R = np.array([[base_r / float(conf)]])
                 kf.update([[val]])
                 velocities.append(float(kf.x[1, 0]))
                 accels.append(float(kf.x[2, 0]))
@@ -492,9 +1008,10 @@ def process_frame(img, model, velocity_tracker, device,
                   crop_x_offset, crop_y_offset,
                   quad_roi=None, track_roi=None, draw_bbox=True,
                   bbox_color=(0, 255, 0), prefer_lead_runner=False,
-                  nearest_to_start=False):
+                  nearest_to_start=False, locked_target_id=None):
     """
-    對單幀執行裁剪 → YOLO track → 速度累積 → 選最快人物 → 畫框。
+    對單幀執行裁剪 → YOLO track/pose → 速度累積 → 選目標人物 → 畫框。
+    locked_target_id 有值時，只追蹤該 ByteTrack ID，避免切到裁判或其他人。
     回傳：(處理後畫面, fastest_id, fastest_center_orig, fastest_bx2_orig)
       fastest_center_orig：最快人物 center_x 在原始影片座標（非最後一機的切換基準）
       fastest_bx2_orig：最快人物 bbox 右緣 bx2 在原始影片座標（最後一機的退出 ROI 基準）
@@ -523,13 +1040,18 @@ def process_frame(img, model, velocity_tracker, device,
         ids   = r.boxes.id.cpu().numpy() if r.boxes.id is not None else None
 
         # 第一輪：收集所有通過過濾的偵測
-        valid_detections = []  # (dist_to_start, cx, cy, bx1, by1, bx2, by2, tid, proj)
+        valid_detections = []  # (dist_to_start_line, cx, cy, bx1, by1, bx2, by2, tid, proj, ground_pt)
         for i in range(len(boxes)):
             bx1, by1, bx2, by2 = map(int, boxes[i])
             if (by2 - by1) < MIN_PERSON_HEIGHT:
                 continue
             center_x = (bx1 + bx2) / 2
             center_y = (by1 + by2) / 2
+            ground_pt = _bbox_bottom_center(bx1, by1, bx2, by2)
+            ground_orig = (
+                ground_pt[0] + crop_x_offset,
+                ground_pt[1] + crop_y_offset,
+            )
 
             # ROI 過濾（原始影片座標）
             orig_cx = center_x + crop_x_offset
@@ -537,12 +1059,17 @@ def process_frame(img, model, velocity_tracker, device,
             proj = None
             if track_roi is not None:
                 proj = _project_onto_track(
-                    (orig_cx, orig_cy),
+                    ground_orig,
                     track_roi['start_mid'], track_roi['track_dir']
                 )
                 pre_roll = track_roi.get('pre_roll_px', 0)
-                if not (-pre_roll <= proj <= track_roi['pixel_span']):
+                end_roll = track_roi.get('end_roll_px', 0)
+                if not (-pre_roll <= proj <= track_roi['pixel_span'] + end_roll):
                     continue
+                if nearest_to_start:
+                    start_roi = track_roi.get('start_roi_px', pre_roll)
+                    if abs(proj) > start_roi:
+                        continue
             elif roi_enabled and roi_zones:
                 if not any(z['x'][0] <= orig_cx <= z['x'][1] and
                            z['y'][0] <= orig_cy <= z['y'][1]
@@ -553,12 +1080,11 @@ def process_frame(img, model, velocity_tracker, device,
                 continue
             tid = int(ids[i])
             dist_to_start = (
-                np.sqrt((orig_cx - track_roi['start_mid'][0])**2 +
-                        (orig_cy - track_roi['start_mid'][1])**2)
+                abs(proj)
                 if track_roi is not None else float('inf')
             )
             valid_detections.append((dist_to_start, center_x, center_y,
-                                     bx1, by1, bx2, by2, tid, proj))
+                                     bx1, by1, bx2, by2, tid, proj, ground_pt))
 
         # nearest_to_start 模式：只保留距 start_line 最近的一人
         if nearest_to_start and valid_detections:
@@ -566,7 +1092,7 @@ def process_frame(img, model, velocity_tracker, device,
             valid_detections = valid_detections[:1]
 
         # 第二輪：更新 velocity_tracker
-        for (_, center_x, center_y, bx1, by1, bx2, by2, tid, proj) in valid_detections:
+        for (_, center_x, center_y, bx1, by1, bx2, by2, tid, proj, ground_pt) in valid_detections:
             seen_ids.add(tid)
             if tid in velocity_tracker:
                 d = velocity_tracker[tid]
@@ -581,11 +1107,20 @@ def process_frame(img, model, velocity_tracker, device,
                     d['stationary_count'] += STATIONARY_DECAY
                 d['center'] = (center_x, center_y)
                 d['bbox']   = (bx1, by1, bx2, by2)
+                d['ground_point'] = ground_pt
+                prev_ground = d.get('smoothed_ground_point', ground_pt)
+                alpha = GROUND_POINT_EMA_ALPHA
+                d['smoothed_ground_point'] = (
+                    alpha * ground_pt[0] + (1.0 - alpha) * prev_ground[0],
+                    alpha * ground_pt[1] + (1.0 - alpha) * prev_ground[1],
+                )
                 d['frames_since_detected'] = 0
             else:
                 velocity_tracker[tid] = {
                     'center': (center_x, center_y),
                     'bbox':   (bx1, by1, bx2, by2),
+                    'ground_point': ground_pt,
+                    'smoothed_ground_point': ground_pt,
                     'velocities': [0],
                     'movement_count': 1,
                     'stationary_count': 0,
@@ -601,20 +1136,26 @@ def process_frame(img, model, velocity_tracker, device,
             if velocity_tracker[tid]['frames_since_detected'] > MAX_PERSON_MEMORY:
                 del velocity_tracker[tid]
 
-    # Step 4: 選出最快人物
+    # Step 4: 選出目標人物
     fastest_id = None
-    max_vel = 0
-    for tid, d in velocity_tracker.items():
-        if d['frames_since_detected'] == 0:
-            if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and
-                    d['stationary_count'] < 10):
-                v = np.mean(d['velocities']) if d['velocities'] else 0
-                if v > max_vel:
-                    max_vel = v
-                    fastest_id = tid
+    if locked_target_id is not None:
+        locked_target_id = int(locked_target_id)
+        d = velocity_tracker.get(locked_target_id)
+        if d is not None and d['frames_since_detected'] == 0:
+            fastest_id = locked_target_id
+    else:
+        max_vel = 0
+        for tid, d in velocity_tracker.items():
+            if d['frames_since_detected'] == 0:
+                if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and
+                        d['stationary_count'] < 10):
+                    v = np.mean(d['velocities']) if d['velocities'] else 0
+                    if v > max_vel:
+                        max_vel = v
+                        fastest_id = tid
 
-    if fastest_id is None and prefer_lead_runner and lead_candidates:
-        fastest_id = max(lead_candidates, key=lambda c: c['proj'])['tid']
+        if fastest_id is None and prefer_lead_runner and lead_candidates:
+            fastest_id = max(lead_candidates, key=lambda c: c['proj'])['tid']
 
     # Step 5: 畫框（最快人物）
     fastest_center_orig = None
@@ -626,6 +1167,10 @@ def process_frame(img, model, velocity_tracker, device,
         fastest_bx2_orig    = bx2 + crop_x_offset                 # 最後一機的退出 ROI 基準
         if draw_bbox:
             cv2.rectangle(img, (bx1, by1), (bx2, by2), bbox_color, 2)
+        ground_pt = d.get('ground_point')
+        if ground_pt is not None:
+            gx, gy = int(ground_pt[0]), int(ground_pt[1])
+            cv2.circle(img, (gx, gy), 4, (255, 255, 0), -1)
 
     # Step 5b: 畫其他被追蹤人物的框（橘色，含 ID）
     for tid, d in velocity_tracker.items():
@@ -814,7 +1359,10 @@ def main():
         else:
             print(f"  切換條件: 跑完整段影片")
 
-        if cam['m_per_pixel']:
+        if cam.get('H_matrix') is not None:
+            print(f"  距離校準: Homography 啟用, start_world_x={cam.get('homography_start_x'):.3f}, "
+                  f"起始累計={cumulative_dist_offset:.1f}m")
+        elif cam['m_per_pixel']:
             print(f"  距離校準: start_x={cam['start_x']}px, "
                   f"m/px={cam['m_per_pixel']:.5f}, "
                   f"起始累計={cumulative_dist_offset:.1f}m")
@@ -837,10 +1385,13 @@ def main():
         frame_buffer = []   # 縮放後的畫面（含綠框、相機標籤）
         d_raw        = []   # 每幀原始距離（公尺）
         meta_buffer  = []   # 每幀 bbox 在 strip 座標（供第二段疊字）；None = pre-roll 幀
+        source_frame_buffer = []  # 對應原始影片 frame_count，供 CSV 對照
+        metric_debug_buffer = []  # 每幀原始量測 debug：world_x / image_point
 
         # pre-roll 狀態（track_roi 模式專用）
         runner_crossed_start = cam.get('track_roi') is None  # 舊模式直接視為已越線
-        candidate_buf = []   # 起跑候選幀 (strip, dist_val, proj_px, bbox_strip)
+        target_runner_id = None  # 起跑確認後固定追蹤同一個 ByteTrack ID
+        candidate_buf = []   # 起跑候選幀 (strip, dist_val, proj_px, bbox_strip, source_frame, debug)
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
 
         # -----------------------------------------------------------------------
@@ -856,6 +1407,46 @@ def main():
                                _to_strip_pt(cam['start_line'][1]))
             strip_end_pts   = (_to_strip_pt(cam['end_line'][0]),
                                _to_strip_pt(cam['end_line'][1]))
+
+        def _make_strip(img, fastest_id_for_label=None):
+            h_img, w_img = img.shape[:2]
+            new_w = int(w_img * TARGET_HEIGHT / h_img)
+            strip = cv2.resize(img, (new_w, TARGET_HEIGHT))
+
+            if fastest_id_for_label is not None and fastest_id_for_label in velocity_tracker:
+                sc = TARGET_HEIGHT / h_img
+                d_v = velocity_tracker[fastest_id_for_label]
+                _bx = int(d_v['bbox'][0] * sc)
+                _by = int(d_v['bbox'][1] * sc)
+                cv2.putText(strip, f"ID:{fastest_id_for_label}", (_bx + 3, _by + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            strip = _draw_text_bgr(
+                strip,
+                f"相機 {cam_idx+1}",
+                (10, 10),
+                font=_get_font(size=28),
+                color=(255, 255, 255),
+                thickness=2,
+            )
+
+            if strip_start_pts and strip_end_pts:
+                p0, p3 = strip_start_pts
+                p1, p2 = strip_end_pts
+                quad = np.array([p0, p1, p2, p3], dtype=np.int32)
+                overlay = strip.copy()
+                cv2.fillPoly(overlay, [quad], (200, 220, 255))
+                cv2.addWeighted(overlay, 0.15, strip, 0.85, 0, strip)
+                for a, b in [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]:
+                    _draw_dashed_line(strip, a, b, (255, 255, 255), thickness=2)
+
+            if strip_start_pts:
+                cv2.line(strip, strip_start_pts[0], strip_start_pts[1], (0, 0, 0), 5)
+                cv2.line(strip, strip_start_pts[0], strip_start_pts[1], (180, 255, 255), 3)
+            if strip_end_pts:
+                cv2.line(strip, strip_end_pts[0], strip_end_pts[1], (0, 0, 0), 5)
+                cv2.line(strip, strip_end_pts[0], strip_end_pts[1], (255, 200, 100), 3)
+            return strip
 
         # -----------------------------------------------------------------------
         # 第一段：YOLO 追蹤，收集幀畫面與原始距離
@@ -877,6 +1468,7 @@ def main():
                 bbox_color=(0, 255, 0) if runner_crossed_start else (0, 215, 255),
                 prefer_lead_runner=not runner_crossed_start,
                 nearest_to_start=not runner_crossed_start,
+                locked_target_id=target_runner_id if runner_crossed_start else None,
             )
 
             # 診斷：前 5 幀 + 每 100 幀
@@ -886,18 +1478,30 @@ def main():
                       f"center:{fastest_center_orig} bx2:{fastest_bx2_orig}")
 
             if fastest_id is None:
-                if cam_warmup_remaining > 0 and cam['m_per_pixel'] is not None:
-                    # 暖機模式：用瞬時速度選最快人物，略過 movement_count 限制
-                    expected_px = last_kf_v / cam['m_per_pixel'] / fps
-                    warmup_thresh = max(expected_px * 0.3, 3.0)
-                    best_v, best_id = 0.0, None
-                    for tid, d in velocity_tracker.items():
-                        if d['frames_since_detected'] == 0 and d['velocities']:
-                            inst_v = d['velocities'][-1]
-                            if inst_v > warmup_thresh and inst_v > best_v:
-                                best_v, best_id = inst_v, tid
-                    fastest_id = best_id
+                if cam_warmup_remaining > 0 and target_runner_id is None:
+                    m_px = cam.get('m_per_pixel')
+                    if m_px is None and cam.get('pixel_span') and cam.get('distance_m'):
+                        m_px = cam['distance_m'] / cam['pixel_span']
+                    if m_px is not None:
+                        # 暖機模式：用瞬時速度選最快人物，略過 movement_count 限制
+                        expected_px = last_kf_v / m_px / fps
+                        warmup_thresh = max(expected_px * 0.3, 3.0)
+                        best_v, best_id = 0.0, None
+                        for tid, d in velocity_tracker.items():
+                            if d['frames_since_detected'] == 0 and d['velocities']:
+                                inst_v = d['velocities'][-1]
+                                if inst_v > warmup_thresh and inst_v > best_v:
+                                    best_v, best_id = inst_v, tid
+                        fastest_id = best_id
                 if fastest_id is None:
+                    if runner_crossed_start and frame_buffer:
+                        strip = _make_strip(img)
+                        frame_buffer.append(strip)
+                        d_raw.append(None)
+                        meta_buffer.append(None)
+                        source_frame_buffer.append(frame_count)
+                        metric_debug_buffer.append(None)
+                        continue
                     cam_skipped += 1
                     continue
             if cam_warmup_remaining > 0:
@@ -906,13 +1510,46 @@ def main():
             # 計算原始距離（僅在有校準時）
             dist_raw   = None
             bbox_strip = None
-            if cam['m_per_pixel'] is not None:
+            homography_local_dist = None
+            metric_debug = None
+            if cam['m_per_pixel'] is not None or cam.get('H_matrix') is not None:
                 d = velocity_tracker[fastest_id]
                 bx1, by1, bx2, by2 = d['bbox']
                 cx_orig = (bx1 + bx2) / 2.0 + crop_x_offset
-                if cam.get('track_dir') and cam.get('start_mid'):
+                cy_orig = (by1 + by2) / 2.0 + crop_y_offset
+                if cam.get('H_matrix') is not None:
+                    ground_pt = d.get('smoothed_ground_point') or d.get('ground_point')
+                    if ground_pt is not None:
+                        image_point = (
+                            float(ground_pt[0]) + crop_x_offset,
+                            float(ground_pt[1]) + crop_y_offset,
+                        )
+                        if cam.get('start_mid') is not None and cam.get('track_dir') is not None:
+                            image_point = _project_point_to_track_line(
+                                image_point, cam['start_mid'], cam['track_dir'])
+                        world_input = (
+                            float(image_point[0]),
+                            float(image_point[1]),
+                        )
+                    else:
+                        world_input = (cx_orig, by2 + crop_y_offset)
+                    world = _transform_point_homography(world_input, cam['H_matrix'])
+                    world_x = float(world[0]) if world is not None else 0.0
+                    metric_debug = {
+                        'image_point_x': float(world_input[0]),
+                        'image_point_y': float(world_input[1]),
+                        'world_x': world_x,
+                    }
+                    start_world_x = cam.get('homography_start_x')
+                    if start_world_x is None:
+                        start_world_x = 0.0
+                    local_dist = world_x - start_world_x
+                    homography_local_dist = max(0.0, local_dist)
+                    if cam.get('distance_m') is not None:
+                        local_dist = min(local_dist, float(cam['distance_m']))
+                    dist_raw = cumulative_dist_offset + max(0.0, local_dist)
+                elif cam.get('track_dir') and cam.get('start_mid'):
                     # 斜線模式：將跑者中心點投影到跑道方向
-                    cy_orig  = (by1 + by2) / 2.0 + crop_y_offset
                     proj_px  = _project_onto_track((cx_orig, cy_orig),
                                                    cam['start_mid'], cam['track_dir'])
                     dist_raw = cumulative_dist_offset + max(0.0, proj_px * cam['m_per_pixel'])
@@ -924,44 +1561,7 @@ def main():
                               int(bx2 * scale), int(by2 * scale))
 
             # 縮放並加相機標籤（不加速度文字，留給第二段）
-            h_img, w_img = img.shape[:2]
-            new_w = int(w_img * TARGET_HEIGHT / h_img)
-            strip = cv2.resize(img, (new_w, TARGET_HEIGHT))
-            # 在 bbox 內部左上角畫追蹤 ID（cv2.putText 直接畫，不受速度標籤遮擋）
-            if fastest_id is not None:
-                sc = TARGET_HEIGHT / h_img
-                d_v = velocity_tracker[fastest_id]
-                _bx = int(d_v['bbox'][0] * sc)
-                _by = int(d_v['bbox'][1] * sc)
-                cv2.putText(strip, f"ID:{fastest_id}", (_bx + 3, _by + 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            strip = _draw_text_bgr(
-                strip,
-                f"相機 {cam_idx+1}",
-                (10, 10),
-                font=_get_font(size=28),
-                color=(255, 255, 255),
-                thickness=2,
-            )
-
-            # 四點連四邊形：半透明填色 + 虛線外框
-            if strip_start_pts and strip_end_pts:
-                p0, p3 = strip_start_pts  # 起跑線兩端
-                p1, p2 = strip_end_pts    # 終點線兩端
-                quad = np.array([p0, p1, p2, p3], dtype=np.int32)
-                overlay = strip.copy()
-                cv2.fillPoly(overlay, [quad], (200, 220, 255))
-                cv2.addWeighted(overlay, 0.15, strip, 0.85, 0, strip)
-                for a, b in [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]:
-                    _draw_dashed_line(strip, a, b, (255, 255, 255), thickness=2)
-
-            # 起跑線（奶黃）與終點線（天空藍）實線
-            if strip_start_pts:
-                cv2.line(strip, strip_start_pts[0], strip_start_pts[1], (0, 0, 0), 5)
-                cv2.line(strip, strip_start_pts[0], strip_start_pts[1], (180, 255, 255), 3)
-            if strip_end_pts:
-                cv2.line(strip, strip_end_pts[0], strip_end_pts[1], (0, 0, 0), 5)
-                cv2.line(strip, strip_end_pts[0], strip_end_pts[1], (255, 200, 100), 3)
+            strip = _make_strip(img, fastest_id)
             # pre-roll / 起跑確認（track_roi 模式才有效）
             if cam.get('track_roi') is not None and not runner_crossed_start:
                 d = velocity_tracker[fastest_id]
@@ -990,18 +1590,23 @@ def main():
                     if candidate_buf and proj_px <= candidate_buf[-1][2]:
                         candidate_buf.clear()
 
-                    candidate_buf.append((strip, dist_val, proj_px, bbox_strip))
+                    candidate_buf.append((strip, dist_val, proj_px, bbox_strip,
+                                          frame_count, metric_debug))
 
                     if len(candidate_buf) >= K_CONFIRM:
                         # 確認起跑！
                         runner_crossed_start = True
-                        for c_strip, c_dist, _, c_meta in candidate_buf:
+                        target_runner_id = fastest_id
+                        for c_strip, c_dist, _, c_meta, c_source_frame, c_debug in candidate_buf:
                             frame_buffer.append(c_strip)
                             d_raw.append(c_dist)
                             meta_buffer.append(c_meta)
+                            source_frame_buffer.append(c_source_frame)
+                            metric_debug_buffer.append(c_debug)
                         candidate_buf.clear()
                         print(
                             f"  [debug cam{cam_idx+1}] confirmed start at frame {frame_count}, "
+                            f"locked_id={target_runner_id}, "
                             f"first_dist={d_raw[0] if d_raw else None}, "
                             f"buffered={len(frame_buffer)}"
                         )
@@ -1011,9 +1616,19 @@ def main():
             d_raw.append(dist_raw if dist_raw is not None
                          else (d_raw[-1] if d_raw else cumulative_dist_offset))
             meta_buffer.append(bbox_strip)
+            source_frame_buffer.append(frame_count)
+            metric_debug_buffer.append(metric_debug)
 
             # 切換條件
-            if cam.get('track_dir') and cam.get('pixel_span'):
+            if (cam.get('H_matrix') is not None and
+                    cam.get('distance_m') is not None and
+                    homography_local_dist is not None):
+                # Homography 模式：距離計算與切換使用同一個世界座標基準。
+                if homography_local_dist >= float(cam['distance_m']):
+                    print(f"  → 觸發{'退出ROI' if is_last_cam else '切換'}："
+                          f"Homography距離={homography_local_dist:.2f}m >= {float(cam['distance_m']):.2f}m")
+                    break
+            elif cam.get('track_dir') and cam.get('pixel_span'):
                 # 斜線模式：投影距離 >= pixel_span 即越過終點線
                 d = velocity_tracker[fastest_id]
                 bx1, by1, bx2, by2 = d['bbox']
@@ -1038,15 +1653,43 @@ def main():
         total_skipped += cam_skipped
         print(f"  [第一段完成] 收集 {len(frame_buffer)} 幀，捨棄 {cam_skipped} 幀")
 
+        valid_metric_indices = [i for i, v in enumerate(d_raw) if v is not None]
+        if valid_metric_indices:
+            first_valid = valid_metric_indices[0]
+            last_valid = valid_metric_indices[-1]
+            if first_valid > 0 or last_valid < len(d_raw) - 1:
+                trimmed = first_valid + (len(d_raw) - 1 - last_valid)
+                frame_buffer = frame_buffer[first_valid:last_valid + 1]
+                d_raw = d_raw[first_valid:last_valid + 1]
+                meta_buffer = meta_buffer[first_valid:last_valid + 1]
+                source_frame_buffer = source_frame_buffer[first_valid:last_valid + 1]
+                metric_debug_buffer = metric_debug_buffer[first_valid:last_valid + 1]
+                print(f"  補值: 裁掉 {trimmed} 幀沒有前後有效 bbox 的端點缺失")
+
+        interpolated_bbox_mask = [False] * len(meta_buffer)
+        missing_metric_frames = sum(v is None for v in d_raw)
+        has_any_metric = any(v is not None for v in d_raw)
+        d_raw_for_csv = list(d_raw)
+        if missing_metric_frames and has_any_metric:
+            interpolated_bbox_mask = [m is None for m in meta_buffer]
+            d_raw = _interpolate_missing_numeric(d_raw)
+            meta_buffer = _interpolate_missing_bboxes(meta_buffer)
+            print(f"  補值: 已用前後有效偵測插值補 {missing_metric_frames} 幀距離/bbox")
+        interp_gap_len, speed_confidence = _interpolation_metadata(interpolated_bbox_mask)
+
         # -----------------------------------------------------------------------
         # 第二段：批次計算速度/加速度，疊加文字 + 圖表，寫入影片
         # -----------------------------------------------------------------------
-        has_metrics = cam['m_per_pixel'] is not None and CHART_HEIGHT > 0 and len(d_raw) > 0
+        has_metrics = (
+            (cam['m_per_pixel'] is not None or cam.get('H_matrix') is not None) and
+            CHART_HEIGHT > 0 and len(d_raw) > 0 and has_any_metric
+        )
         if has_metrics:
             print(f"  [第二段] 計算 Butterworth + Kalman（init_v={last_kf_v:.2f}, init_a={last_kf_a:.2f}）...")
             d_smooth, v_smooth, a_arr = _compute_kf_series(d_raw, fps,
                                                            init_v=last_kf_v,
-                                                           init_a=last_kf_a)
+                                                           init_a=last_kf_a,
+                                                           measurement_confidence=speed_confidence)
             # 更新跨機累計偏移：本機最終距離即為下一機的起點
             cumulative_dist_offset = float(d_smooth[-1]) if len(d_smooth) > 0 else cumulative_dist_offset
             # 保存本機最終 Kalman 狀態，供下一機初始化用
@@ -1071,6 +1714,11 @@ def main():
 
                 # 疊加速度文字
                 bx1s, by1s = meta_buffer[i][0], meta_buffer[i][1]
+                if i < len(interpolated_bbox_mask) and interpolated_bbox_mask[i]:
+                    bx1i, by1i, bx2i, by2i = meta_buffer[i]
+                    cv2.rectangle(strip, (bx1i, by1i), (bx2i, by2i), (255, 0, 255), 2)
+                    cv2.putText(strip, "interp", (bx1i + 3, by1i + 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
                 label = (f"{dist_i:.1f}m  "
                          f"{speed_i:.2f}m/s  "
                          f"{accel_i:+.1f}m/s\u00b2")
@@ -1108,13 +1756,27 @@ def main():
                     font_prop=chart_font_prop)
                 frame_out = np.vstack([strip, chart])
 
+                debug_i = metric_debug_buffer[i] if i < len(metric_debug_buffer) else None
+                dist_raw_i = d_raw_for_csv[i] if i < len(d_raw_for_csv) else None
+                world_x_i = debug_i.get('world_x') if debug_i else None
+                image_point_x_i = debug_i.get('image_point_x') if debug_i else None
+                image_point_y_i = debug_i.get('image_point_y') if debug_i else None
                 all_track_data.append({
                     'cam':            cam_idx + 1,
                     'cam_frame':      i,
+                    'source_frame':   source_frame_buffer[i] if i < len(source_frame_buffer) else '',
                     'absolute_frame': absolute_frame_offset + i,
                     'dist_m':         round(dist_i, 3),
+                    'dist_raw_m':     round(float(dist_raw_i), 3) if dist_raw_i is not None else '',
+                    'dist_smooth_m':  round(dist_i, 3),
+                    'world_x':        round(float(world_x_i), 3) if world_x_i is not None else '',
+                    'image_point_x':  round(float(image_point_x_i), 3) if image_point_x_i is not None else '',
+                    'image_point_y':  round(float(image_point_y_i), 3) if image_point_y_i is not None else '',
                     'speed_mps':      round(speed_i, 3),
                     'accel_mps2':     round(accel_i, 3),
+                    'is_interpolated': int(interpolated_bbox_mask[i]) if i < len(interpolated_bbox_mask) else 0,
+                    'interp_gap_len':  interp_gap_len[i] if i < len(interp_gap_len) else 0,
+                    'speed_confidence': round(speed_confidence[i], 3) if i < len(speed_confidence) else 1.0,
                 })
             elif has_metrics and meta_buffer[i] is None:
                 # pre-roll 幀：保留畫面但圖表區填黑
@@ -1156,11 +1818,17 @@ def main():
         csv_path = os.path.join(OUTPUT_DIR, OUTPUT_NAME.replace('.mp4', '_metrics.csv'))
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(
-                f, fieldnames=['cam', 'cam_frame', 'absolute_frame',
-                               'dist_m', 'speed_mps', 'accel_mps2'])
+                f, fieldnames=['cam', 'cam_frame', 'source_frame', 'absolute_frame',
+                               'dist_m', 'dist_raw_m', 'dist_smooth_m',
+                               'world_x', 'image_point_x', 'image_point_y',
+                               'speed_mps', 'accel_mps2',
+                               'is_interpolated', 'interp_gap_len',
+                               'speed_confidence'])
             writer.writeheader()
             writer.writerows(all_track_data)
         print(f"CSV 輸出：{csv_path}")
+
+    _write_homography_visualizations(CAMERAS, OUTPUT_DIR, track_data=all_track_data)
 
     print(f"\n{'='*60}")
     print(f"全部完成：總寫入 {total_written} 幀，總捨棄 {total_skipped} 幀")

@@ -2,8 +2,8 @@
 add_angle_overlay.py
 
 將 vis.py 輸出的 2D 影片與角度 CSV 合併為單一影片：
-  - 左半：原始 2D 骨架影片
-  - 右半：4 個角度折線圖（2×2 排列）
+  - 上半：原始影片；右下角疊 vis.py 偵測用的追焦 2D 骨架影片
+  - 下半：4 個角度折線圖（2×2 排列）
 
 圖表特性：
   - X 軸：開始即固定為全部幀數範圍，曲線從左向右生長
@@ -15,10 +15,12 @@ add_angle_overlay.py
       --video  .../tracked_cropped_2D.mp4 \
       --csv    .../tracked_cropped_angles.csv \
       --output .../tracked_cropped_2D_angles.mp4 \
-      [--chart_w_ratio 1.5] [--dpi 100]
+      [--main-video .../original.mp4] \
+      [--chart_height 200] [--dpi 100]
 """
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -83,8 +85,63 @@ PANELS = [
 ]
 
 
+def _resize_keep_aspect(frame, target_w=None, target_h=None):
+    h, w = frame.shape[:2]
+    if target_h is not None:
+        new_h = int(target_h)
+        new_w = max(1, int(round(w * new_h / max(h, 1))))
+    elif target_w is not None:
+        new_w = int(target_w)
+        new_h = max(1, int(round(h * new_w / max(w, 1))))
+    else:
+        return frame
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _fit_to_canvas(frame, target_w, target_h):
+    resized = _resize_keep_aspect(frame, target_h=target_h)
+    h, w = resized.shape[:2]
+    if w == target_w:
+        return resized
+    if w < target_w:
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        x0 = (target_w - w) // 2
+        canvas[:, x0:x0 + w] = resized
+        return canvas
+    x0 = (w - target_w) // 2
+    return resized[:, x0:x0 + target_w]
+
+
+def _compose_main_with_inset(main_frame, inset_frame, target_w, target_h,
+                             inset_height_ratio=0.45, inset_margin=10):
+    canvas = _fit_to_canvas(main_frame, target_w, target_h)
+    if inset_frame is None or inset_frame.size == 0:
+        return canvas
+
+    inset_h = max(1, int(round(target_h * inset_height_ratio)))
+    inset = _resize_keep_aspect(inset_frame, target_h=inset_h)
+    ih, iw = inset.shape[:2]
+    max_w = max(1, target_w - inset_margin * 2)
+    if iw > max_w:
+        inset = _resize_keep_aspect(inset, target_w=max_w)
+        ih, iw = inset.shape[:2]
+
+    x1 = target_w - inset_margin - iw
+    y1 = target_h - inset_margin - ih
+    x2 = x1 + iw
+    y2 = y1 + ih
+    cv2.rectangle(canvas, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), (0, 0, 0), -1)
+    canvas[y1:y2, x1:x2] = inset
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+    return canvas
+
+
 def add_angle_overlay(video_path, csv_path, output_path,
-                      chart_w_ratio=1.5, dpi=100):
+                      main_video_path=None,
+                      frame_map_path=None,
+                      chart_height=200, display_height=340,
+                      inset_height_ratio=0.45, inset_margin=10,
+                      dpi=100):
     # ------------------------------------------------------------------
     # 中文字型
     # ------------------------------------------------------------------
@@ -101,19 +158,47 @@ def add_angle_overlay(video_path, csv_path, output_path,
     csv_len = len(df)
     print(f"  CSV 已讀取：{csv_len} 幀")
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"無法開啟 2D 影片: {video_path}")
+    inset_cap = cv2.VideoCapture(video_path)
+    if not inset_cap.isOpened():
+        raise RuntimeError(f"無法開啟 2D 追焦骨架影片: {video_path}")
 
-    video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps     = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    chart_w = int(video_w * chart_w_ratio)
+    main_cap = None
+    if main_video_path:
+        main_cap = cv2.VideoCapture(main_video_path)
+        if not main_cap.isOpened():
+            raise RuntimeError(f"無法開啟原始影片: {main_video_path}")
 
-    print(f"  影片: {video_w}×{video_h}，{total} 幀，{fps:.1f} FPS")
-    print(f"  圖表面板: {chart_w}×{video_h}")
-    print(f"  輸出尺寸: {video_w + chart_w}×{video_h}")
+    frame_map = None
+    if frame_map_path:
+        if not os.path.exists(frame_map_path):
+            raise FileNotFoundError(f"frame map 不存在: {frame_map_path}")
+        frame_map = {}
+        with open(frame_map_path, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                frame_map[int(row['output_frame'])] = int(row['source_frame'])
+
+    inset_w = int(inset_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    inset_h = int(inset_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps     = inset_cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total   = int(inset_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if main_cap is not None:
+        main_w = int(main_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        main_h = int(main_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        video_h = max(1, int(display_height))
+        video_w = max(1, int(round(main_w * video_h / max(main_h, 1))))
+    else:
+        video_w, video_h = inset_w, inset_h
+    chart_h = max(0, int(chart_height))
+
+    print(f"  追焦骨架影片: {inset_w}×{inset_h}，{total} 幀，{fps:.1f} FPS")
+    if main_video_path:
+        print(f"  原始主畫面: {main_video_path}")
+    else:
+        print("  原始主畫面: 未指定，使用追焦骨架影片作為主畫面")
+    if frame_map_path:
+        print(f"  Frame map: {frame_map_path}")
+    print(f"  圖表面板: {video_w}×{chart_h}")
+    print(f"  輸出尺寸: {video_w}×{video_h + chart_h}")
 
     # ------------------------------------------------------------------
     # 預計算各 panel 的全域 Y 軸範圍（整部影片固定）
@@ -151,7 +236,7 @@ def add_angle_overlay(video_path, csv_path, output_path,
 
     fig, axes = plt.subplots(
         2, 2,
-        figsize=(chart_w / dpi, video_h / dpi),
+        figsize=(video_w / dpi, max(chart_h, 1) / dpi),
         dpi=dpi,
     )
     fig.patch.set_facecolor('#ffffff')
@@ -210,19 +295,39 @@ def add_angle_overlay(video_path, csv_path, output_path,
     # ------------------------------------------------------------------
     # 輸出 VideoWriter
     # ------------------------------------------------------------------
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps,
-                          (video_w + chart_w, video_h))
+                          (video_w, video_h + chart_h))
 
     # ------------------------------------------------------------------
     # 主迴圈：逐幀更新折線、渲染圖表、合併影片
     # ------------------------------------------------------------------
     frame_idx = 0
+    last_main_frame = None
     while True:
-        ret, frame = cap.read()
+        ret, inset_frame = inset_cap.read()
         if not ret:
             break
+        if main_cap is not None:
+            if frame_map is not None and frame_idx in frame_map:
+                main_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_map[frame_idx])
+            ret_main, main_frame = main_cap.read()
+            if ret_main:
+                last_main_frame = main_frame
+            elif last_main_frame is not None:
+                main_frame = last_main_frame
+            else:
+                main_frame = inset_frame
+            frame = _compose_main_with_inset(
+                main_frame, inset_frame, video_w, video_h,
+                inset_height_ratio=inset_height_ratio,
+                inset_margin=inset_margin,
+            )
+        else:
+            frame = _fit_to_canvas(inset_frame, video_w, video_h)
 
         # CSV 幀數若少於影片幀數，夾住最後一幀
         csv_idx = min(frame_idx, csv_len - 1)
@@ -243,18 +348,20 @@ def add_angle_overlay(video_path, csv_path, output_path,
         chart_rgb = buf[:, :, :3]
         chart_bgr = cv2.cvtColor(chart_rgb, cv2.COLOR_RGB2BGR)
 
-        # 縮放至精確目標尺寸
-        chart_bgr = cv2.resize(chart_bgr, (chart_w, video_h),
+        # 縮放至精確目標尺寸，接到影片底部
+        chart_bgr = cv2.resize(chart_bgr, (video_w, chart_h),
                                interpolation=cv2.INTER_LANCZOS4)
 
-        combined = np.hstack([frame, chart_bgr])
+        combined = np.vstack([frame, chart_bgr])
         out.write(combined)
 
         frame_idx += 1
         if frame_idx % 50 == 0:
             print(f"  [{frame_idx}/{total}] {frame_idx/total*100:.0f}%")
 
-    cap.release()
+    inset_cap.release()
+    if main_cap is not None:
+        main_cap.release()
     out.release()
     plt.close(fig)
     print(f"\n  輸出完成: {output_path}")
@@ -262,20 +369,37 @@ def add_angle_overlay(video_path, csv_path, output_path,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='在 2D 影片右側加入 4 個角度折線圖（2×2 排列）'
+        description='在 2D 影片底部加入 4 個角度折線圖（2×2 排列）'
     )
     parser.add_argument('--video',          required=True, help='2D 影片路徑')
     parser.add_argument('--csv',            required=True, help='角度 CSV 路徑')
     parser.add_argument('--output',         required=True, help='輸出影片路徑')
+    parser.add_argument('--main-video',     default=None,
+                        help='原始主畫面影片路徑；指定後 2D 追焦骨架影片會疊在右下角')
+    parser.add_argument('--frame-map',      default=None,
+                        help='追焦輸出幀對應原始影片幀的 CSV；欄位需含 output_frame/source_frame')
     parser.add_argument('--chart_w_ratio',  type=float, default=2,
-                        help='圖表面板寬度比例（相對影片寬，預設 1.5）')
+                        help='保留相容舊參數；目前圖表固定接在影片底部，不使用此值')
+    parser.add_argument('--chart_height',   type=int, default=200,
+                        help='底部圖表高度（預設 200）')
+    parser.add_argument('--display_height', type=int, default=340,
+                        help='上方主畫面高度（預設 340）')
+    parser.add_argument('--inset_height_ratio', type=float, default=0.45,
+                        help='右下追焦小窗高度比例（相對上方主畫面，預設 0.45）')
+    parser.add_argument('--inset_margin',   type=int, default=10,
+                        help='右下追焦小窗邊距（預設 10）')
     parser.add_argument('--dpi',            type=int, default=100,
                         help='matplotlib DPI（預設 100）')
     args = parser.parse_args()
 
     add_angle_overlay(
         args.video, args.csv, args.output,
-        chart_w_ratio=args.chart_w_ratio,
+        main_video_path=args.main_video,
+        frame_map_path=args.frame_map,
+        chart_height=args.chart_height,
+        display_height=args.display_height,
+        inset_height_ratio=args.inset_height_ratio,
+        inset_margin=args.inset_margin,
         dpi=args.dpi,
     )
 
