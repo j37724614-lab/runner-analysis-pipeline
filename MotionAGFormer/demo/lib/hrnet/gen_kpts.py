@@ -10,6 +10,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 import json
+import csv
 import torch
 import torch.backends.cudnn as cudnn
 import cv2
@@ -30,7 +31,7 @@ from lib.yolov3.human_detector import yolo_human_det as yolo_det
 from lib.sort.sort import Sort
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Train keypoints network')
     # general
     parser.add_argument('--cfg', type=str, default=cfg_dir + 'w48_384x288_adam_lr1e-3.yaml',
@@ -50,7 +51,7 @@ def parse_args():
     parser.add_argument("-v", "--video", type=str, default='camera',
                         help="input video file name")
     parser.add_argument('--gpu', type=str, default='0', help='input video')
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args(argv)
 
     return args
 
@@ -84,15 +85,34 @@ def model_load(config):
     return model
 
 
-def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False):
+def _load_bbox_map(bbox_csv):
+    if not bbox_csv:
+        return None
+    bbox_map = {}
+    with open(bbox_csv, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            bbox_map[int(row['output_frame'])] = [[
+                float(row['x1']),
+                float(row['y1']),
+                float(row['x2']),
+                float(row['y2']),
+            ]]
+    return bbox_map
+
+
+def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False, bbox_csv=None):
     # Updating configuration
-    args = parse_args()
+    args = parse_args([])
+    args.det_dim = det_dim
+    args.num_person = num_peroson
     reset_config(args)
 
     cap = cv2.VideoCapture(video)
 
+    bbox_map = _load_bbox_map(bbox_csv)
+
     # Loading detector and pose model, initialize sort for track
-    human_model = yolo_model(inp_dim=det_dim)
+    human_model = None if bbox_map is not None else yolo_model(inp_dim=det_dim)
     pose_model = model_load(cfg)
     people_sort = Sort(min_hits=0)
 
@@ -109,34 +129,44 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False):
         if not ret:
             continue
 
-        bboxs, scores = yolo_det(frame, human_model, reso=det_dim, confidence=args.thred_score)
+        if bbox_map is not None:
+            track_bboxs = bbox_map.get(ii)
+            if not track_bboxs:
+                if bboxs_pre is None:
+                    continue
+                track_bboxs = bboxs_pre
+            else:
+                bboxs_pre = copy.deepcopy(track_bboxs)
+        else:
+            bboxs, scores = yolo_det(frame, human_model, reso=det_dim, confidence=args.thred_score)
 
-        if bboxs is None or not bboxs.any():
-            if bboxs_pre is None:
-                # No person detected in the first frame(s)
+            if bboxs is None or not bboxs.any():
+                if bboxs_pre is None:
+                    # No person detected in the first frame(s)
+                    continue
+                bboxs = bboxs_pre
+                scores = scores_pre
+            else:
+                bboxs_pre = copy.deepcopy(bboxs) 
+                scores_pre = copy.deepcopy(scores) 
+
+            # Using Sort to track people
+            people_track = people_sort.update(bboxs)
+
+            # Track the first two people in the video and remove the ID
+            if people_track.shape[0] == 1:
+                people_track_ = people_track[-1, :-1].reshape(1, 4)
+            elif people_track.shape[0] >= 2:
+                people_track_ = people_track[-num_peroson:, :-1].reshape(num_peroson, 4)
+                people_track_ = people_track_[::-1]
+            else:
                 continue
-            bboxs = bboxs_pre
-            scores = scores_pre
-        else:
-            bboxs_pre = copy.deepcopy(bboxs) 
-            scores_pre = copy.deepcopy(scores) 
 
-        # Using Sort to track people
-        people_track = people_sort.update(bboxs)
-
-        # Track the first two people in the video and remove the ID
-        if people_track.shape[0] == 1:
-            people_track_ = people_track[-1, :-1].reshape(1, 4)
-        elif people_track.shape[0] >= 2:
-            people_track_ = people_track[-num_peroson:, :-1].reshape(num_peroson, 4)
-            people_track_ = people_track_[::-1]
-        else:
-            continue
-
-        track_bboxs = []
-        for bbox in people_track_:
-            bbox = [round(i, 2) for i in list(bbox)]
-            track_bboxs.append(bbox)
+            track_bboxs = []
+            for bbox in people_track_:
+                bbox = [round(i, 2) for i in list(bbox)]
+                track_bboxs.append(bbox)
+            bboxs_pre = copy.deepcopy(track_bboxs)
 
         with torch.no_grad():
             # bbox is coordinate location
