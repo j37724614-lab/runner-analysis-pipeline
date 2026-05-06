@@ -87,6 +87,7 @@ AUTO_CROP   = False  # True → 先 dry-run 收集 bbox 統計，自動設定裁
 #   True  = 綠色 bbox（最快跑者）+ 藍色 ROI 框
 #   False = 輸出乾淨畫面（無任何疊加）
 SHOW_OVERLAY = True
+DRAW_BBOX_OVERLAY = False  # False → 輸出追焦影片不畫 bbox；bbox_map.csv 仍會照常輸出給 HRNet
 
 # -----------------------------------------------------------------------
 # 移動偵測參數
@@ -95,6 +96,7 @@ MOVEMENT_THRESHOLD  = 2   # 判定為移動的最小像素位移,連續兩幀中
 MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「真正移動」,必須連續移動 ≥ 3 幀，才被認定為「真的在跑」
 STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量, 靜止一幀就讓 movement_count 減 2（快速重置）
 MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄, 30 幀（約 0.5 秒）沒出現就刪除
+MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（前處理裁剪後像素）視為背景遠景人物，略過
 
 
 # -----------------------------------------------------------------------
@@ -186,17 +188,17 @@ def camera(video_path, crop=None,
 # start_line  [(x1,y1),(x2,y2)] 起跑線兩端點；與 end_line 同時填入才啟用斜線模式
 # end_line    [(x3,y3),(x4,y4)] 終點線兩端點
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/pipeline_release/video/0420_1.mp4",
+CAM1 = camera("/home/jeter/pipeline_release/video/0506_1.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)])
 
-CAM2 = camera(None, #"/home/jeter/MotionAGFormer/IMG_5728.mp4",
+CAM2 = camera("/home/jeter/pipeline_release/video/0506_2.mp4", #"/home/jeter/MotionAGFormer/IMG_5728.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)])
 
-CAM3 = camera(None, #"/home/jeter/MotionAGFormer/0331-2.mp4",
+CAM3 = camera("/home/jeter/pipeline_release/video/0506_3.mp4", #"/home/jeter/MotionAGFormer/0331-2.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(215, 713), (130, 727)],
               end_line  =[(1735, 715), (1820, 722)])
@@ -362,7 +364,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
     if bx2 <= bx1 or by2 <= by1:
         return None, None
 
-    if SHOW_OVERLAY:
+    if SHOW_OVERLAY and DRAW_BBOX_OVERLAY:
         color = (255, 0, 255) if label_interpolated else (0, 255, 0)
         cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
         if label_interpolated:
@@ -467,6 +469,8 @@ def process_frame(img, model, velocity_tracker, device,
 
         for i in range(len(boxes)):
             bx1, by1, bx2, by2 = map(int, boxes[i])
+            if (by2 - by1) < MIN_PERSON_HEIGHT:
+                continue
             center_x = (bx1 + bx2) / 2   # bbox 中心 x（裁剪座標）
             center_y = (by1 + by2) / 2   # bbox 中心 y（裁剪座標）
             ground_x, ground_y = _bbox_bottom_center((bx1, by1, bx2, by2))
@@ -596,7 +600,8 @@ def process_frame(img, model, velocity_tracker, device,
     # Step 5: 疊加框（在前處理裁剪後的畫面上）
     if SHOW_OVERLAY:
         # 綠色框 — 最快跑者 bbox
-        cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+        if DRAW_BBOX_OVERLAY:
+            cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
 
         # 藍色框 — ROI 範圍（舊矩形模式）
         if roi_enabled and roi_zones and track_roi is None:
@@ -1046,16 +1051,18 @@ def main():
 
     # 允許 config 覆蓋全域常數（--config 與 --config-json 共用）
     if _cfg:
-        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, AUTO_CROP, SHOW_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY
+        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, AUTO_CROP, SHOW_OVERLAY, DRAW_BBOX_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY, MIN_PERSON_HEIGHT
         if 'output_dir'          in _cfg: OUTPUT_DIR         = _cfg['output_dir']
         if 'crop_width'          in _cfg: CROP_WIDTH          = int(_cfg['crop_width'])
         if 'crop_height'         in _cfg: CROP_HEIGHT         = int(_cfg['crop_height'])
         if 'auto_crop'           in _cfg: AUTO_CROP           = bool(_cfg['auto_crop'])
         if 'show_overlay'        in _cfg: SHOW_OVERLAY        = bool(_cfg['show_overlay'])
+        if 'draw_bbox_overlay'   in _cfg: DRAW_BBOX_OVERLAY   = bool(_cfg['draw_bbox_overlay'])
         if 'movement_threshold'  in _cfg: MOVEMENT_THRESHOLD  = int(_cfg['movement_threshold'])
         if 'min_movement_frames' in _cfg: MIN_MOVEMENT_FRAMES = int(_cfg['min_movement_frames'])
         if 'stationary_decay'    in _cfg: STATIONARY_DECAY    = int(_cfg['stationary_decay'])
         if 'max_person_memory'   in _cfg: MAX_PERSON_MEMORY   = int(_cfg['max_person_memory'])
+        if 'min_person_height'   in _cfg: MIN_PERSON_HEIGHT   = int(_cfg['min_person_height'])
 
     if not CAMERAS:
         raise ValueError("所有相機的 video_path 均為 None，請至少設定一台。")

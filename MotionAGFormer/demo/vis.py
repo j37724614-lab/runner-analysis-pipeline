@@ -28,22 +28,67 @@ def _reset_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+def _interpolate_low_conf_keypoints(keypoints, scores, conf_threshold=0.50):
+    """
+    用前後高信心幀線性插值補低信心 keypoints。
+
+    這是離線影片後處理，所以可以看見未來幀。只有在低信心片段前後
+    都有高信心錨點時才補，避免影片開頭/結尾缺少一側錨點時硬猜位置。
+    回傳的 interpolated_mask 會告訴 EMA：這些點雖然原始 HRNet confidence 低，
+    但位置已由前後可信點補過，可以跟著更新而不是停在上一幀。
+    """
+    if keypoints.size == 0 or scores.size == 0:
+        return keypoints, np.zeros(scores.shape, dtype=bool)
+
+    filled = keypoints.astype(np.float32, copy=True)
+    interpolated_mask = np.zeros(scores.shape, dtype=bool)
+    num_person, num_frames, num_joints = scores.shape
+
+    for person_idx in range(num_person):
+        for joint_idx in range(num_joints):
+            good = scores[person_idx, :, joint_idx] >= conf_threshold
+            good_idx = np.flatnonzero(good)
+            if good_idx.size < 2:
+                continue
+
+            first_good = int(good_idx[0])
+            last_good = int(good_idx[-1])
+            fill_range = np.arange(first_good, last_good + 1)
+            missing = ~good[first_good:last_good + 1]
+            if not np.any(missing):
+                continue
+
+            for coord_idx in range(2):
+                filled[person_idx, fill_range, joint_idx, coord_idx] = np.interp(
+                    fill_range,
+                    good_idx,
+                    keypoints[person_idx, good_idx, joint_idx, coord_idx],
+                )
+            interpolated_mask[person_idx, fill_range[missing], joint_idx] = True
+
+    return filled, interpolated_mask
+
+
 def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
-                          max_jump_px=45.0):
+                          max_jump_px=45.0, hard_jump_px=90.0,
+                          interpolated_mask=None):
     """
     對 HRNet 2D keypoints 做時間 EMA 平滑。
 
     keypoints: shape (M, T, J, 2)
     scores:    shape (M, T, J)
 
-    高信心且位移合理的點用 EMA 更新。
-    低信心或單幀跳太遠的點沿用上一幀平滑結果，避免錯點把骨架拉飄。
+    高信心或已插值補過、且位移合理的點用 EMA 更新。
+    高信心但位移偏大的點會限制最大步長後更新，避免快速擺動關節卡在上一幀。
+    未插值的低信心或極端跳點才沿用上一幀，避免錯點把骨架拉飄。
     """
     if keypoints.size == 0 or scores.size == 0:
         return keypoints
 
     smoothed = keypoints.astype(np.float32, copy=True)
     num_person, num_frames, num_joints = scores.shape
+    if interpolated_mask is None:
+        interpolated_mask = np.zeros(scores.shape, dtype=bool)
 
     for person_idx in range(num_person):
         prev = None
@@ -55,15 +100,24 @@ def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
                 prev = current.copy()
                 continue
 
-            high_conf = current_scores >= conf_threshold
+            high_conf = (current_scores >= conf_threshold) | interpolated_mask[person_idx, frame_idx]
             jump = np.linalg.norm(current - prev, axis=1)
-            plausible_motion = jump <= max_jump_px
-            update_mask = high_conf & plausible_motion
+            normal_update = high_conf & (jump <= max_jump_px)
 
-            if np.any(update_mask):
-                prev[update_mask] = (
-                    alpha * prev[update_mask] +
-                    (1.0 - alpha) * current[update_mask]
+            if np.any(normal_update):
+                prev[normal_update] = (
+                    alpha * prev[normal_update] +
+                    (1.0 - alpha) * current[normal_update]
+                )
+
+            limited_update = high_conf & (jump > max_jump_px) & (jump <= hard_jump_px)
+            if np.any(limited_update):
+                direction = current[limited_update] - prev[limited_update]
+                distance = jump[limited_update][:, None]
+                capped_current = prev[limited_update] + direction / distance * max_jump_px
+                prev[limited_update] = (
+                    alpha * prev[limited_update] +
+                    (1.0 - alpha) * capped_current
                 )
 
             smoothed[person_idx, frame_idx] = prev
@@ -184,12 +238,19 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         bbox_csv=bbox_csv,
     )
     keypoints, scores, valid_frames = h36m_coco_format(keypoints, scores)
+    keypoints, interpolated_mask = _interpolate_low_conf_keypoints(
+        keypoints,
+        scores,
+        conf_threshold=0.50,
+    )
     keypoints = _smooth_keypoints_ema(
         keypoints,
         scores,
-        alpha=0.40,
+        alpha=0.20,
         conf_threshold=0.50,
         max_jump_px=45.0,
+        hard_jump_px=90.0,
+        interpolated_mask=interpolated_mask,
     )
     
     # Add conf score to the last dim
