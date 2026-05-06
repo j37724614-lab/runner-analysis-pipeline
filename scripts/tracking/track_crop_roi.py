@@ -186,7 +186,7 @@ def camera(video_path, crop=None,
 # start_line  [(x1,y1),(x2,y2)] 起跑線兩端點；與 end_line 同時填入才啟用斜線模式
 # end_line    [(x3,y3),(x4,y4)] 終點線兩端點
 # -----------------------------------------------------------------------
-CAM1 = camera("/home/jeter/pipeline_release/video/0331-1.mp4",
+CAM1 = camera("/home/jeter/pipeline_release/video/0420_1.mp4",
               crop=(0, 400, 1920, 800),
               start_line=[(208, 715), (123, 725)],
               end_line  =[(1760, 710), (1830, 718)])
@@ -328,6 +328,83 @@ def _bbox_bottom_center(bbox):
     """回傳 bbox 的底部中心點，較接近跑者落地點。"""
     bx1, by1, bx2, by2 = bbox
     return ((bx1 + bx2) / 2.0, float(by2))
+
+
+def _interpolate_bbox(left_bbox, right_bbox, ratio):
+    """用左右兩個有效 bbox 線性插值出中間 bbox。"""
+    left = np.asarray(left_bbox, dtype=float)
+    right = np.asarray(right_bbox, dtype=float)
+    return tuple(np.rint(left + ratio * (right - left)).astype(int))
+
+
+def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
+    """
+    使用指定 bbox 重新裁切一幀，供 YOLO 缺失幀的插值補幀使用。
+
+    bbox 座標系與 process_frame() 相同：若有 crop_params，bbox 是前處理裁剪後的座標。
+    回傳 (crop_frame, bbox_in_crop)。
+    """
+    if crop_params:
+        cx1, cy1, cx2, cy2 = crop_params
+        h, w = img.shape[:2]
+        cx1, cx2 = max(0, cx1), min(w, cx2)
+        cy1, cy2 = max(0, cy1), min(h, cy2)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return None, None
+        img = img[cy1:cy2, cx1:cx2]
+
+    bx1, by1, bx2, by2 = map(int, bbox)
+    h_img, w_img = img.shape[:2]
+    bx1 = int(np.clip(bx1, 0, max(w_img - 1, 0)))
+    bx2 = int(np.clip(bx2, 0, max(w_img - 1, 0)))
+    by1 = int(np.clip(by1, 0, max(h_img - 1, 0)))
+    by2 = int(np.clip(by2, 0, max(h_img - 1, 0)))
+    if bx2 <= bx1 or by2 <= by1:
+        return None, None
+
+    if SHOW_OVERLAY:
+        color = (255, 0, 255) if label_interpolated else (0, 255, 0)
+        cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
+        if label_interpolated:
+            cv2.putText(img, "interp", (bx1 + 3, min(by1 + 22, h_img - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+    cx = int((bx1 + bx2) / 2)
+    cy = int((by1 + by2) / 2)
+    c1x = cx - CROP_WIDTH // 2
+    c1y = cy - CROP_HEIGHT // 2
+    c2x = c1x + CROP_WIDTH
+    c2y = c1y + CROP_HEIGHT
+
+    if c1x < 0:
+        c1x, c2x = 0, CROP_WIDTH
+    elif c2x > w_img:
+        c2x, c1x = w_img, w_img - CROP_WIDTH
+    if c1y < 0:
+        c1y, c2y = 0, CROP_HEIGHT
+    elif c2y > h_img:
+        c2y, c1y = h_img, h_img - CROP_HEIGHT
+    c1x = max(0, c1x)
+    c1y = max(0, c1y)
+    c2x = min(c2x, w_img)
+    c2y = min(c2y, h_img)
+
+    crop_frame = img[c1y:c2y, c1x:c2x]
+    bbox_in_crop = (
+        int(np.clip(bx1 - c1x, 0, CROP_WIDTH - 1)),
+        int(np.clip(by1 - c1y, 0, CROP_HEIGHT - 1)),
+        int(np.clip(bx2 - c1x, 0, CROP_WIDTH - 1)),
+        int(np.clip(by2 - c1y, 0, CROP_HEIGHT - 1)),
+    )
+
+    if crop_frame.shape[:2] != (CROP_HEIGHT, CROP_WIDTH):
+        if crop_frame.size > 0:
+            crop_frame = cv2.resize(crop_frame, (CROP_WIDTH, CROP_HEIGHT),
+                                    interpolation=cv2.INTER_LINEAR)
+        else:
+            crop_frame = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
+
+    return crop_frame, bbox_in_crop
 
 
 def process_frame(img, model, velocity_tracker, device,
@@ -689,6 +766,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         cam_written = 0
         frame_count = 0
         target_runner_id = None
+        cam_interpolated = 0
+        pending_missing = []  # YOLO 暫時缺失的幀，等下一個有效 bbox 後線性補回
+        last_valid_bbox = None
 
         # 起跑確認狀態（track_roi 模式專用）
         runner_crossed_start = (track_roi is None)  # 舊模式直接視為已越線
@@ -696,7 +776,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         candidate_buf = []   # (crop_frame, proj_px, source_frame, bbox_in_crop)，待確認起跑的候選幀
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
 
-        def _write_output_frame(frame_to_write, source_frame, bbox_for_hrnet=None, track_id=None):
+        def _write_output_frame(frame_to_write, source_frame, bbox_for_hrnet=None,
+                                track_id=None, is_interpolated=False, interp_gap_len=0):
             nonlocal total_written, cam_written, output_frame_idx
             if not dry_run:
                 out.write(frame_to_write)
@@ -718,10 +799,39 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                         'y1': int(y1),
                         'x2': int(x2),
                         'y2': int(y2),
+                        'is_interpolated': int(is_interpolated),
+                        'interp_gap_len': int(interp_gap_len),
                     })
             cam_written += 1
             total_written += 1
             output_frame_idx += 1
+
+        def _flush_pending_missing(right_bbox, track_id=None):
+            nonlocal cam_interpolated, last_valid_bbox
+            if not pending_missing or last_valid_bbox is None or right_bbox is None:
+                return
+            gap_len = len(pending_missing)
+            for idx, item in enumerate(pending_missing, start=1):
+                ratio = idx / (gap_len + 1)
+                interp_bbox = _interpolate_bbox(last_valid_bbox, right_bbox, ratio)
+                interp_frame, interp_bbox_in_crop = _crop_from_bbox(
+                    item['frame'],
+                    cam['crop_params'],
+                    interp_bbox,
+                    label_interpolated=True,
+                )
+                if interp_frame is None:
+                    continue
+                _write_output_frame(
+                    interp_frame,
+                    item['source_frame'],
+                    interp_bbox_in_crop,
+                    track_id,
+                    is_interpolated=True,
+                    interp_gap_len=gap_len,
+                )
+                cam_interpolated += 1
+            pending_missing.clear()
 
         if not dry_run:
             print(f"  [處理中...]")
@@ -764,8 +874,14 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 )
 
             if crop_frame is None:
-                cam_skipped   += 1
-                total_skipped += 1
+                if runner_crossed_start and last_valid_bbox is not None:
+                    pending_missing.append({
+                        'frame': frame.copy(),
+                        'source_frame': source_frame,
+                    })
+                else:
+                    cam_skipped   += 1
+                    total_skipped += 1
                 continue
 
             # ── 起跑確認邏輯（track_roi 模式且尚未確認越線）──
@@ -808,18 +924,25 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                         for c_frame, _, c_source, c_bbox in candidate_buf:
                             _write_output_frame(c_frame, c_source, c_bbox, target_runner_id)
                         candidate_buf.clear()
+                        if fastest_id is not None and fastest_id in velocity_tracker:
+                            last_valid_bbox = velocity_tracker[fastest_id]['bbox']
                         if not dry_run:
                             print(f"  [幀 {frame_count}] 確認起跑（投影={proj_px:.0f}px）")
                     # 無論確認與否，此幀已透過 buffer 處理，不重複輸出
                     continue
 
             # 正常幀（已越線或舊模式）：收集 bbox 統計
+            current_valid_bbox = None
             if fastest_id is not None and fastest_id in velocity_tracker:
                 bx1, by1, bx2, by2 = velocity_tracker[fastest_id]['bbox']
+                current_valid_bbox = (bx1, by1, bx2, by2)
                 bw = bx2 - bx1; bh = by2 - by1
                 all_bbox_widths.append(bw); all_bbox_heights.append(bh)
                 if bw > max_bbox_width:  max_bbox_width  = bw
                 if bh > max_bbox_height: max_bbox_height = bh
+
+            if pending_missing and current_valid_bbox is not None:
+                _flush_pending_missing(current_valid_bbox, fastest_id)
 
             if not dry_run:
                 _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
@@ -828,6 +951,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                           f"寫入: {cam_written} | 捨棄: {cam_skipped}")
             else:
                 _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
+
+            if current_valid_bbox is not None:
+                last_valid_bbox = current_valid_bbox
 
             # ── 切換條件（斜線模式優先）──
             if track_roi is not None and cam.get('pixel_span'):
@@ -857,8 +983,14 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     break
 
         cap.release()
+        if pending_missing:
+            cam_skipped += len(pending_missing)
+            total_skipped += len(pending_missing)
+            pending_missing.clear()
         if not dry_run:
             print(f"  相機 {cam_idx+1} 完成：寫入 {cam_written}，捨棄 {cam_skipped}")
+            if cam_interpolated:
+                print(f"  補值: 已用前後有效 bbox 線性補回 {cam_interpolated} 幀")
             if track_roi is not None and not runner_crossed_start:
                 print(f"  ⚠️  警告：整段影片跑者從未越過起跑線，本機輸出 0 幀")
 
@@ -878,7 +1010,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             writer = csv.DictWriter(
                 f,
                 fieldnames=['output_frame', 'cam', 'cam_frame', 'source_frame',
-                            'track_id', 'x1', 'y1', 'x2', 'y2']
+                            'track_id', 'x1', 'y1', 'x2', 'y2',
+                            'is_interpolated', 'interp_gap_len']
             )
             writer.writeheader()
             writer.writerows(bbox_map_rows)

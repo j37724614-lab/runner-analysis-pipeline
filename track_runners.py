@@ -616,7 +616,7 @@ def build_camera_with_homography(video_path, crop, start_line, end_line,
 #   CAM6: 100m~120m
 # -----------------------------------------------------------------------
 CAM1 = build_camera_with_homography(
-    video_path="/home/jeter/pipeline_release/video/IMG_3564_1.mp4",
+    video_path="/home/jeter/pipeline_release/video/IMG_3560_1.mp4",
     crop=(0, 400, 1920, 800),
     start_line=[(222, 715), (148, 725)],
     end_line=[(1700, 710), (1790, 718)],
@@ -633,7 +633,7 @@ CAM1 = build_camera_with_homography(
 )
 
 CAM2 = build_camera_with_homography(
-    video_path= "/home/jeter/pipeline_release/video/IMG_2540_2.mp4",
+    video_path=None,# "/home/jeter/pipeline_release/video/IMG_2540_2.mp4",
     crop=(0, 400, 1920, 800),
     start_line=[(220, 715), (135, 725)],
     end_line=[(1730, 710), (1825, 725)],
@@ -649,7 +649,7 @@ CAM2 = build_camera_with_homography(
 )
 
 CAM3 = build_camera_with_homography(
-    video_path="/home/jeter/pipeline_release/video/0504_3.mp4",
+    video_path=None,#"/home/jeter/pipeline_release/video/0504_3.mp4",
     crop=(0, 400, 1920, 800),
     start_line=[(212, 715), (127, 725)],
     end_line=[(1755, 710), (1835, 718)],
@@ -665,7 +665,7 @@ CAM3 = build_camera_with_homography(
 )
 
 CAM4 = build_camera_with_homography(
-    video_path="/home/jeter/pipeline_release/video/0504_4.mp4",
+    video_path=None,#"/home/jeter/pipeline_release/video/0506_4.mp4",
     crop=(0, 400, 1920, 800),
     start_line=[(227, 713), (140, 727)],
     end_line=[(1722, 718), (1825, 725)],
