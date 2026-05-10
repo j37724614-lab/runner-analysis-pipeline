@@ -673,7 +673,7 @@ def process_frame(img, model, velocity_tracker, device,
         else:
             crop_frame = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
 
-    return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop
+    return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop, c1x + crop_x_offset, c1y + crop_y_offset
 
 
 def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=None):
@@ -693,6 +693,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
     max_bbox_height  = 0
     frame_map_rows = []
     bbox_map_rows = []
+    all_offsets = []
+    all_orig_frames = []
     output_frame_idx = 0
 
     for cam_idx, (cam, cap) in enumerate(zip(cameras, caps)):
@@ -782,7 +784,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
 
         def _write_output_frame(frame_to_write, source_frame, bbox_for_hrnet=None,
-                                track_id=None, is_interpolated=False, interp_gap_len=0):
+                                track_id=None, is_interpolated=False, interp_gap_len=0,
+                                off_x=0, off_y=0):
             nonlocal total_written, cam_written, output_frame_idx
             if not dry_run:
                 out.write(frame_to_write)
@@ -807,11 +810,13 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                         'is_interpolated': int(is_interpolated),
                         'interp_gap_len': int(interp_gap_len),
                     })
+                all_offsets.append([off_x, off_y])
+                all_orig_frames.append(source_frame)
             cam_written += 1
             total_written += 1
             output_frame_idx += 1
 
-        def _flush_pending_missing(right_bbox, track_id=None):
+        def _flush_pending_missing(right_bbox, track_id=None, off_x=0, off_y=0):
             nonlocal cam_interpolated, last_valid_bbox
             if not pending_missing or last_valid_bbox is None or right_bbox is None:
                 return
@@ -834,6 +839,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     track_id,
                     is_interpolated=True,
                     interp_gap_len=gap_len,
+                    off_x=off_x,
+                    off_y=off_y,
                 )
                 cam_interpolated += 1
             pending_missing.clear()
@@ -851,7 +858,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             _ov_s = overlay_start_pts if SHOW_OVERLAY else None
             _ov_e = overlay_end_pts   if SHOW_OVERLAY else None
             try:
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop = process_frame(
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop, off_x, off_y = process_frame(
                     frame, model, velocity_tracker, DEVICE,
                     cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
                     crop_x_offset, crop_y_offset,
@@ -865,7 +872,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 )
             except RuntimeError:
                 torch.cuda.empty_cache()
-                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop = process_frame(
+                crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop, off_x, off_y = process_frame(
                     frame, model, velocity_tracker, DEVICE,
                     cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
                     crop_x_offset, crop_y_offset,
@@ -906,7 +913,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 if proj_px < 0:
                     # 在起跑線前：放入 pre-roll buffer，不輸出
                     candidate_buf.clear()
-                    pre_roll_buf.append((crop_frame, source_frame, bbox_in_crop))
+                    pre_roll_buf.append((crop_frame, source_frame, bbox_in_crop, off_x, off_y))
                     if len(pre_roll_buf) > 5:
                         pre_roll_buf.pop(0)
                     continue
@@ -916,18 +923,20 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     if candidate_buf and proj_px <= candidate_buf[-1][1]:
                         candidate_buf.clear()   # 後退或持平，重新收集
 
-                    candidate_buf.append((crop_frame, proj_px, source_frame, bbox_in_crop))
+                    candidate_buf.append((crop_frame, proj_px, source_frame, bbox_in_crop, off_x, off_y))
 
                     if len(candidate_buf) >= K_CONFIRM:
                         runner_crossed_start = True
                         target_runner_id = fastest_id
                         # 寫出 pre-roll 幀
-                        for pre_f, pre_source, pre_bbox in pre_roll_buf:
-                            _write_output_frame(pre_f, pre_source, pre_bbox, target_runner_id)
+                        for pre_f, pre_source, pre_bbox, pre_ox, pre_oy in pre_roll_buf:
+                            _write_output_frame(pre_f, pre_source, pre_bbox, target_runner_id,
+                                                off_x=pre_ox, off_y=pre_oy)
                         pre_roll_buf.clear()
                         # 寫出 candidate 幀
-                        for c_frame, _, c_source, c_bbox in candidate_buf:
-                            _write_output_frame(c_frame, c_source, c_bbox, target_runner_id)
+                        for c_frame, _, c_source, c_bbox, c_ox, c_oy in candidate_buf:
+                            _write_output_frame(c_frame, c_source, c_bbox, target_runner_id,
+                                                off_x=c_ox, off_y=c_oy)
                         candidate_buf.clear()
                         if fastest_id is not None and fastest_id in velocity_tracker:
                             last_valid_bbox = velocity_tracker[fastest_id]['bbox']
@@ -947,15 +956,17 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 if bh > max_bbox_height: max_bbox_height = bh
 
             if pending_missing and current_valid_bbox is not None:
-                _flush_pending_missing(current_valid_bbox, fastest_id)
+                _flush_pending_missing(current_valid_bbox, fastest_id, off_x=off_x, off_y=off_y)
 
             if not dry_run:
-                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
+                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id,
+                                    off_x=off_x, off_y=off_y)
                 if frame_count % 100 == 0:
                     print(f"  [幀 {frame_count}/{total}] 追蹤: {len(velocity_tracker)} | "
                           f"寫入: {cam_written} | 捨棄: {cam_skipped}")
             else:
-                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id)
+                _write_output_frame(crop_frame, source_frame, bbox_in_crop, fastest_id,
+                                    off_x=off_x, off_y=off_y)
 
             if current_valid_bbox is not None:
                 last_valid_bbox = current_valid_bbox
@@ -1022,6 +1033,18 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             writer.writerows(bbox_map_rows)
         print(f"  Frame map: {frame_map_path}")
         print(f"  BBox map:  {bbox_map_path}")
+
+    # 輸出 offsets.npz（每幀的裁剪視窗左上角在原始影片中的絕對像素座標）
+    # 供 overlay_original.py 反查每幀對應的原始影片位置
+    if not dry_run and cameras and cameras[0].get('video_path'):
+        first_cam_base = os.path.splitext(os.path.basename(cameras[0]['video_path']))[0]
+        offsets_path = os.path.join(OUTPUT_DIR, f"{first_cam_base}_offsets.npz")
+        np.savez_compressed(
+            offsets_path,
+            offsets=np.array(all_offsets, dtype=np.int32),
+            orig_frames=np.array(all_orig_frames, dtype=np.int32),
+        )
+        print(f"  Offsets: {offsets_path}")
 
     return total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height
 

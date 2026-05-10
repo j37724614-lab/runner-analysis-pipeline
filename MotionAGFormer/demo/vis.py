@@ -1,11 +1,41 @@
+"""
+vis.py — 2D/3D 姿態估計 + 關節角度計算
+
+可作為模組 import（推薦），也可從命令列直接執行：
+  import 用法：
+    from demo.vis import run_pose_estimation
+    run_pose_estimation(video_path="/path/to/video.mp4",
+                        output_dir="/path/to/output/",
+                        only_2d=False,
+                        gpu="0")
+
+  CLI 用法（向下相容）：
+    python vis.py --video sample_video.mp4 --gpu 0
+    python vis.py --video sample_video.mp4 --2d_only
+
+注意：此腳本以 MotionAGFormer/ 為 repo 根目錄，
+      所有路徑（模型、config）均從 __file__ 推算，不依賴工作目錄。
+"""
 
 import sys
 import argparse
 from pathlib import Path
+import os
+
+# vis.py 位於 MotionAGFormer/demo/vis.py
+# 需要兩個目錄同時在 sys.path：
+#   demo/  → from lib.preprocess / from lib.hrnet（lib/ 在 demo/ 下）
+#   MotionAGFormer/  → from demo.lib.utils / from model.MotionAGFormer
+_DEMO_DIR = Path(__file__).resolve().parent          # MotionAGFormer/demo/
+_REPO_ROOT = _DEMO_DIR.parent                        # MotionAGFormer/
+
+for _p in [str(_REPO_ROOT), str(_DEMO_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import cv2
 from lib.preprocess import h36m_coco_format, revise_kpts
 from lib.hrnet.gen_kpts import gen_video_kpts as hrnet_pose
-import os 
 import numpy as np
 import pandas as pd
 import torch
@@ -16,9 +46,17 @@ from tqdm import tqdm
 import copy
 import yaml
 
-sys.path.append(os.getcwd())
 from demo.lib.utils import normalize_screen_coordinates, camera_to_world
 from model.MotionAGFormer import MotionAGFormer
+
+import matplotlib
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.gridspec as gridspec
+
+plt.switch_backend('agg')
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
 
 
 def _reset_dir(path):
@@ -156,15 +194,6 @@ def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
-import matplotlib
-import matplotlib.pyplot as plt 
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.gridspec as gridspec
-
-plt.switch_backend('agg')
-matplotlib.rcParams['pdf.fonttype'] = 42
-matplotlib.rcParams['ps.fonttype'] = 42
-
 def show2Dpose(kps, img):
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
                    [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
@@ -176,7 +205,7 @@ def show2Dpose(kps, img):
     rcolor = (0, 0, 255)
     thickness = 3
 
-    for j,c in enumerate(connections):
+    for j, c in enumerate(connections):
         start = map(int, kps[c[0]])
         end = map(int, kps[c[1]])
         start = list(start)
@@ -191,41 +220,42 @@ def show2Dpose(kps, img):
 def show3Dpose(vals, ax):
     ax.view_init(elev=15., azim=70)
 
-    lcolor=(0,0,1)
-    rcolor=(1,0,0)
+    lcolor = (0, 0, 1)
+    rcolor = (1, 0, 0)
 
-    I = np.array( [0, 0, 1, 4, 2, 5, 0, 7,  8,  8, 14, 15, 11, 12, 8,  9])
-    J = np.array( [1, 4, 2, 5, 3, 6, 7, 8, 14, 11, 15, 16, 12, 13, 9, 10])
+    I = np.array([0, 0, 1, 4, 2, 5, 0, 7,  8,  8, 14, 15, 11, 12, 8,  9])
+    J = np.array([1, 4, 2, 5, 3, 6, 7, 8, 14, 11, 15, 16, 12, 13, 9, 10])
 
     LR = np.array([0, 1, 0, 1, 0, 1, 0, 0, 0,   1,  0,  0,  1,  1, 0, 0], dtype=bool)
 
-    for i in np.arange( len(I) ):
-        x, y, z = [np.array( [vals[I[i], j], vals[J[i], j]] ) for j in range(3)]
-        ax.plot(x, y, z, lw=2, color = lcolor if LR[i] else rcolor)
+    for i in np.arange(len(I)):
+        x, y, z = [np.array([vals[I[i], j], vals[J[i], j]]) for j in range(3)]
+        ax.plot(x, y, z, lw=2, color=lcolor if LR[i] else rcolor)
 
     RADIUS = 0.72
     RADIUS_Z = 0.7
 
-    xroot, yroot, zroot = vals[0,0], vals[0,1], vals[0,2]
-    ax.set_xlim3d([-RADIUS+xroot, RADIUS+xroot])
-    ax.set_ylim3d([-RADIUS+yroot, RADIUS+yroot])
-    ax.set_zlim3d([-RADIUS_Z+zroot, RADIUS_Z+zroot])
-    ax.set_aspect('auto') # works fine in matplotlib==2.2.2
+    xroot, yroot, zroot = vals[0, 0], vals[0, 1], vals[0, 2]
+    ax.set_xlim3d([-RADIUS + xroot, RADIUS + xroot])
+    ax.set_ylim3d([-RADIUS + yroot, RADIUS + yroot])
+    ax.set_zlim3d([-RADIUS_Z + zroot, RADIUS_Z + zroot])
+    ax.set_aspect('auto')
 
     white = (1.0, 1.0, 1.0, 0.0)
-    ax.xaxis.set_pane_color(white) 
+    ax.xaxis.set_pane_color(white)
     ax.yaxis.set_pane_color(white)
     ax.zaxis.set_pane_color(white)
 
-    ax.tick_params('x', labelbottom = False)
-    ax.tick_params('y', labelleft = False)
-    ax.tick_params('z', labelleft = False)
+    ax.tick_params('x', labelbottom=False)
+    ax.tick_params('y', labelleft=False)
+    ax.tick_params('z', labelleft=False)
 
 
 def get_pose2D(video_path, output_dir, bbox_csv=None):
     cap = cv2.VideoCapture(video_path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    cap.release()
 
     print('\nGenerating 2D pose...')
     if bbox_csv:
@@ -252,37 +282,42 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         hard_jump_px=90.0,
         interpolated_mask=interpolated_mask,
     )
-    
+
     # Add conf score to the last dim
     keypoints = np.concatenate((keypoints, scores[..., None]), axis=-1)
 
-    output_dir += 'input_2D/'
-    _reset_dir(output_dir)
+    output_2d_dir = os.path.join(output_dir, 'input_2D')
+    _reset_dir(output_2d_dir)
 
-    output_npz = output_dir + 'keypoints.npz'
+    output_npz = os.path.join(output_2d_dir, 'keypoints.npz')
     np.savez_compressed(output_npz, reconstruction=keypoints, valid_frames=valid_frames)
-    confidence_csv = output_dir + 'hrnet_confidence.csv'
+    confidence_csv = os.path.join(output_dir, 'hrnet_confidence.csv')
     _save_hrnet_confidence_csv(scores, valid_frames, confidence_csv)
     print(f'HRNet confidence CSV saved to {confidence_csv}')
 
 
 def img2video(video_path, output_dir):
     cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) + 5
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    if fps <= 0:
+        fps = 30
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-    # Support both pose and pose2D
-    pose_dir = 'pose/'
-    pose2d_dir = 'pose2D/'
-    names_pose = sorted(glob.glob(os.path.join(output_dir + pose_dir, '*.png')))
-    names_pose2d = sorted(glob.glob(os.path.join(output_dir + pose2d_dir, '*.png')))
+    pose_dir   = os.path.join(output_dir, 'pose')
+    pose2d_dir = os.path.join(output_dir, 'pose2D')
+    names_pose   = sorted(glob.glob(os.path.join(pose_dir,   '*.png')))
+    names_pose2d = sorted(glob.glob(os.path.join(pose2d_dir, '*.png')))
 
-    # If pose2D images exist, export 2D-only video
+    video_name = os.path.basename(video_path).split('.')[0]
+
+    # 2D-only 影片
     if names_pose2d:
         img = cv2.imread(names_pose2d[0])
-        size = (img.shape[1], img.shape[0])
-        video_name = os.path.basename(video_path).split('.')[0]
-        videoWrite = cv2.VideoWriter(output_dir + video_name + '_2D.mp4', fourcc, fps, size)
+        h, w = img.shape[:2]
+        size = (w // 2 * 2, h // 2 * 2)
+        out_path = os.path.join(output_dir, video_name + '_2D.mp4')
+        videoWrite = cv2.VideoWriter(out_path, fourcc, fps, size)
         for name in names_pose2d:
             img = cv2.imread(name)
             if img is None:
@@ -291,14 +326,15 @@ def img2video(video_path, output_dir):
                 img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
             videoWrite.write(img)
         videoWrite.release()
-        print(f"2D Video saved to {output_dir + video_name + '_2D.mp4'}")
+        print(f"2D Video saved to {out_path}")
 
-    # Standard pose video
+    # 2D + 3D 並排影片
     if names_pose:
         img = cv2.imread(names_pose[0])
-        size = (img.shape[1], img.shape[0])
-        video_name = os.path.basename(video_path).split('.')[0]
-        videoWrite = cv2.VideoWriter(output_dir + video_name + '.mp4', fourcc, fps, size)
+        h, w = img.shape[:2]
+        size = (w // 2 * 2, h // 2 * 2)
+        out_path = os.path.join(output_dir, video_name + '.mp4')
+        videoWrite = cv2.VideoWriter(out_path, fourcc, fps, size)
         for name in names_pose:
             img = cv2.imread(name)
             if img is None:
@@ -307,12 +343,12 @@ def img2video(video_path, output_dir):
                 img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
             videoWrite.write(img)
         videoWrite.release()
-        print(f"Pose video saved to {output_dir + video_name + '.mp4'}")
+        print(f"Pose video saved to {out_path}")
 
 
 def showimage(ax, img):
     ax.set_xticks([])
-    ax.set_yticks([]) 
+    ax.set_yticks([])
     plt.axis('off')
     ax.imshow(img)
 
@@ -328,20 +364,17 @@ def turn_into_clips(keypoints):
     clips = []
     n_frames = keypoints.shape[1]
     downsample_indices = []
-    
+
     if n_frames <= 243:
         new_indices = resample(n_frames)
         clips.append(keypoints[:, new_indices, ...])
-        # 找出哪些 index 是唯一的（解採樣回到原始長度）
         _, unique_idx = np.unique(new_indices, return_index=True)
         downsample_indices.append(unique_idx)
     else:
-        # 分段處理，每段 243 幀
         for start_idx in range(0, n_frames, 243):
             keypoints_clip = keypoints[:, start_idx:start_idx + 243, ...]
             clip_length = keypoints_clip.shape[1]
             if clip_length < 243:
-                # 最後一段不足 243 幀，需要補幀
                 new_indices = resample(clip_length)
                 clips.append(keypoints_clip[:, new_indices, ...])
                 _, unique_idx = np.unique(new_indices, return_index=True)
@@ -349,8 +382,9 @@ def turn_into_clips(keypoints):
             else:
                 clips.append(keypoints_clip)
                 downsample_indices.append(np.arange(243))
-                
+
     return clips, downsample_indices
+
 
 def turn_into_h36m(keypoints):
     new_keypoints = np.zeros_like(keypoints)
@@ -371,7 +405,6 @@ def turn_into_h36m(keypoints):
     new_keypoints[..., 14, :] = keypoints[..., 5, :]
     new_keypoints[..., 15, :] = keypoints[..., 7, :]
     new_keypoints[..., 16, :] = keypoints[..., 9, :]
-
     return new_keypoints
 
 
@@ -380,8 +413,8 @@ def flip_data(data, left_joints=[1, 2, 3, 14, 15, 16], right_joints=[4, 5, 6, 11
     data: [N, F, 17, D] or [F, 17, D]
     """
     flipped_data = copy.deepcopy(data)
-    flipped_data[..., 0] *= -1  # flip x of all joints
-    flipped_data[..., left_joints + right_joints, :] = flipped_data[..., right_joints + left_joints, :]  # Change orders
+    flipped_data[..., 0] *= -1
+    flipped_data[..., left_joints + right_joints, :] = flipped_data[..., right_joints + left_joints, :]
     return flipped_data
 
 
@@ -420,40 +453,19 @@ def compute_angles(npz_path, output_dir):
     for i in range(num_frames):
         pose = poses[i]
 
-        # Left knee
-        left_knee = _angle_between(pose[4] - pose[5], pose[6] - pose[5])
-
-        # Left hip
-        left_hip = _angle_between(pose[11] - pose[4], pose[5] - pose[4])
-
-        # Right knee
-        right_knee = _angle_between(pose[1] - pose[2], pose[3] - pose[2])
-
-        # Right hip
-        right_hip = _angle_between(pose[14] - pose[1], pose[2] - pose[1])
-
-        # Left arm-torso
-        left_arm_torso = _angle_between(pose[4] - pose[11], pose[12] - pose[11])
-
-        # Left elbow flexion
-        left_elbow_flexion = _angle_between(pose[13] - pose[12], pose[11] - pose[12])
-
-        # Right arm-torso
-        right_arm_torso = _angle_between(pose[1] - pose[14], pose[15] - pose[14])
-
-        # Right elbow flexion
+        left_knee           = _angle_between(pose[4] - pose[5], pose[6] - pose[5])
+        left_hip            = _angle_between(pose[11] - pose[4], pose[5] - pose[4])
+        right_knee          = _angle_between(pose[1] - pose[2], pose[3] - pose[2])
+        right_hip           = _angle_between(pose[14] - pose[1], pose[2] - pose[1])
+        left_arm_torso      = _angle_between(pose[4] - pose[11], pose[12] - pose[11])
+        left_elbow_flexion  = _angle_between(pose[13] - pose[12], pose[11] - pose[12])
+        right_arm_torso     = _angle_between(pose[1] - pose[14], pose[15] - pose[14])
         right_elbow_flexion = _angle_between(pose[16] - pose[15], pose[14] - pose[15])
-
-        # Left shoulder flexion
-        left_shoulder_flexion = _angle_between(pose[0] - pose[8], pose[12] - pose[8])
-
-        # Right shoulder flexion
-        right_shoulder_flexion = _angle_between(pose[0] - pose[8], pose[15] - pose[8])
-
-        # Pelvis-torso angle (vs vertical, Y axis points down)
-        vertical = np.array([0, -1, 0])
-        torso_vec = pose[8] - pose[0]
-        pelvis_torso_angle = _angle_between(vertical, torso_vec)
+        left_shoulder_flex  = _angle_between(pose[0] - pose[8], pose[12] - pose[8])
+        right_shoulder_flex = _angle_between(pose[0] - pose[8], pose[15] - pose[8])
+        vertical            = np.array([0, -1, 0])
+        torso_vec           = pose[8] - pose[0]
+        pelvis_torso_angle  = _angle_between(vertical, torso_vec)
 
         results.append([
             i,
@@ -461,8 +473,8 @@ def compute_angles(npz_path, output_dir):
             right_knee, right_hip,
             left_arm_torso, left_elbow_flexion,
             right_arm_torso, right_elbow_flexion,
-            left_shoulder_flexion, right_shoulder_flexion,
-            pelvis_torso_angle
+            left_shoulder_flex, right_shoulder_flex,
+            pelvis_torso_angle,
         ])
 
     columns = [
@@ -472,7 +484,7 @@ def compute_angles(npz_path, output_dir):
         'left_arm_torso_angle', 'left_elbow_flexion_angle',
         'right_arm_torso_angle', 'right_elbow_flexion_angle',
         'left_shoulder_flexion', 'right_shoulder_flexion',
-        'pelvis_torso_angle'
+        'pelvis_torso_angle',
     ]
 
     df = pd.DataFrame(results, columns=columns)
@@ -487,22 +499,19 @@ def compute_angles(npz_path, output_dir):
 
 
 @torch.no_grad()
-def get_pose3D(video_path, output_dir):
-    # 讀取 L 版 YAML config
-    config_path = str(Path(__file__).resolve().parent.parent / "configs" / "h36m" / "MotionAGFormer-large.yaml")
+def get_pose3D(video_path, output_dir, skip_video=False):
+    # 從此腳本所在位置推算 config 絕對路徑，不受工作目錄影響
+    config_path = str(_REPO_ROOT / "configs" / "h36m" / "MotionAGFormer-large.yaml")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-
-    # 處理 config 參數型態（如 GELU 激活函數）
+    # 處理 config 參數型態
     if 'act_layer' in config and isinstance(config['act_layer'], str):
         if config['act_layer'].lower() == 'gelu':
             config['act_layer'] = nn.GELU
         elif config['act_layer'].lower() == 'relu':
             config['act_layer'] = nn.ReLU
-        # 可擴充其他激活函數
 
-    # 其餘參數型態處理（如 True/False 字串）
     for k, v in config.items():
         if isinstance(v, str):
             if v.lower() == 'true':
@@ -512,29 +521,24 @@ def get_pose3D(video_path, output_dir):
 
     # 過濾掉非模型 __init__ 參數
     import inspect
-    model_keys = inspect.signature(MotionAGFormer.__init__).parameters.keys()
-    model_keys = set(model_keys) - {'self'}
+    model_keys = set(inspect.signature(MotionAGFormer.__init__).parameters.keys()) - {'self'}
     model_config = {k: v for k, v in config.items() if k in model_keys}
 
     model = nn.DataParallel(MotionAGFormer(**model_config)).cuda()
 
-    # Put the pretrained model of MotionAGFormer in 'checkpoint/'
-    model_path = sorted(glob.glob(os.path.join('checkpoint', 'motionagformer-l-h36m.pth.tr')))[0]
+    # 從此腳本所在位置推算 checkpoint 絕對路徑
+    checkpoint_dir = str(_REPO_ROOT / "checkpoint")
+    model_path = sorted(glob.glob(os.path.join(checkpoint_dir, 'motionagformer-l-h36m.pth.tr')))[0]
 
     pre_dict = torch.load(model_path, weights_only=False)
     model.load_state_dict(pre_dict['model'], strict=True)
-
     model.eval()
 
     ## input
-    data = np.load(output_dir + 'input_2D/keypoints.npz', allow_pickle=True)
-    keypoints = data['reconstruction']
-    valid_frames = np.asarray(data['valid_frames']).flatten().astype(int)  # 轉換為一維整數數組
-    # keypoints = np.load('demo/lakeside3.npy')
-    # keypoints = keypoints[:240]
-    # keypoints = keypoints[None, ...]
-    # keypoints = turn_into_h36m(keypoints)
-    
+    input_2d_dir = os.path.join(output_dir, 'input_2D')
+    data = np.load(os.path.join(input_2d_dir, 'keypoints.npz'), allow_pickle=True)
+    keypoints   = data['reconstruction']
+    valid_frames = np.asarray(data['valid_frames']).flatten().astype(int)
 
     clips, downsample_indices = turn_into_clips(keypoints)
 
@@ -542,162 +546,178 @@ def get_pose3D(video_path, output_dir):
     video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     ret, first_img = cap.read()
     if not ret:
+        cap.release()
         print("Error: Could not read video file.")
         return
     img_size = first_img.shape
-    
-    # 使用實際檢測到的關鍵點幀數，避免HRNet無法檢測所有幀的問題
+
     valid_frame_count = keypoints.shape[1]
 
-    ## 3D
-    print('\nGenerating 2D pose image...')
-    output_dir_2D = os.path.join(output_dir, 'pose2D/')
-    _reset_dir(output_dir_2D)
-    
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 重置到開頭
-    for i in tqdm(range(valid_frame_count)):
-        # 根據 valid_frames 跳到正確的視頻幀位置
-        frame_idx = valid_frames[i] if i < len(valid_frames) else i
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        
-        ret, img = cap.read()
-        if img is None:
-            continue
-        # image = show2Dpose(input_2D, copy.deepcopy(img)) # 這裡原本有錯，修正一下
-        input_2D_raw = keypoints[0][i]
-        image = show2Dpose(input_2D_raw, copy.deepcopy(img))
+    ## 2D pose image
+    if not skip_video:
+        print('\nGenerating 2D pose image...')
+        output_dir_2D = os.path.join(output_dir, 'pose2D')
+        os.makedirs(output_dir_2D, exist_ok=True)
 
-        cv2.imwrite(os.path.join(output_dir_2D, str(('%04d'% i)) + '_2D.png'), image)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        for i in tqdm(range(valid_frame_count)):
+            frame_idx = valid_frames[i] if i < len(valid_frames) else i
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, img = cap.read()
+            if img is None:
+                continue
+            input_2D_raw = keypoints[0][i]
+            image = show2Dpose(input_2D_raw, copy.deepcopy(img))
+            cv2.imwrite(os.path.join(output_dir_2D, str(('%04d' % i)) + '_2D.png'), image)
 
-    
+    cap.release()
+
+    ## 3D pose
     print('\nGenerating 3D pose...')
-    output_dir_3D = output_dir +'pose3D/'
-    output_dir_pose = output_dir +'pose/'
-    _reset_dir(output_dir_3D)
-    _reset_dir(output_dir_pose)
     all_poses_all_clips = []
-    
+
     for idx, (clip, d_idx) in enumerate(zip(clips, downsample_indices)):
-        input_2D = normalize_screen_coordinates(clip, w=img_size[1], h=img_size[0]) 
+        input_2D = normalize_screen_coordinates(clip, w=img_size[1], h=img_size[0])
         input_2D_aug = flip_data(input_2D)
-        
-        input_2D = torch.from_numpy(input_2D.astype('float32')).cuda()
+
+        input_2D     = torch.from_numpy(input_2D.astype('float32')).cuda()
         input_2D_aug = torch.from_numpy(input_2D_aug.astype('float32')).cuda()
 
-        output_3D_non_flip = model(input_2D) 
-        output_3D_flip = flip_data(model(input_2D_aug))
-        output_3D = (output_3D_non_flip + output_3D_flip) / 2
-
-        # 根據保存的索引進行解採樣，恢復原始長度（例如最後一段從 243 變回 84）
-        output_3D = output_3D[:, d_idx]
+        output_3D_non_flip = model(input_2D)
+        output_3D_flip     = flip_data(model(input_2D_aug))
+        output_3D          = (output_3D_non_flip + output_3D_flip) / 2
+        output_3D          = output_3D[:, d_idx]
 
         post_out_clip = output_3D[0].cpu().detach().numpy()
         all_poses_all_clips.append(post_out_clip)
 
-    # 合併所有片段
     post_out_all = np.concatenate(all_poses_all_clips, axis=0)
-    
     print(f"Total processed frames: {post_out_all.shape[0]}")
-    
-    output_dir_3D_npz = output_dir + 'pred_3D/'
+
+    output_dir_3D_npz = os.path.join(output_dir, 'pred_3D')
     os.makedirs(output_dir_3D_npz, exist_ok=True)
     npz_out_path = os.path.join(output_dir_3D_npz, '3Dkeypoints.npz')
     np.savez_compressed(npz_out_path, pred_3d=post_out_all)
 
-    # 角度計算
+    # 角度計算（整合在此，不需外部再呼叫）
     compute_angles(npz_out_path, output_dir)
 
-    for j, post_out in enumerate(tqdm(post_out_all, desc="Saving 3D images")):
-        rot = [0.1407056450843811, -0.1500701755285263, -0.755240797996521, 0.6223280429840088]
-        rot = np.array(rot, dtype='float32')
-        post_out = camera_to_world(post_out, R=rot, t=0)
-        post_out[:, 2] -= np.min(post_out[:, 2])
-        max_value = np.max(post_out)
-        post_out /= max_value
+    ## 3D pose images
+    if not skip_video:
+        output_dir_3D = os.path.join(output_dir, 'pose3D')
+        os.makedirs(output_dir_3D, exist_ok=True)
 
-        fig = plt.figure(figsize=(9.6, 5.4))
-        gs = gridspec.GridSpec(1, 1)
-        gs.update(wspace=-0.00, hspace=0.05) 
-        ax = plt.subplot(gs[0], projection='3d')
-        show3Dpose(post_out, ax)
+        for j, post_out in enumerate(tqdm(post_out_all, desc="Saving 3D images")):
+            rot = [0.1407056450843811, -0.1500701755285263, -0.755240797996521, 0.6223280429840088]
+            rot = np.array(rot, dtype='float32')
+            post_out = camera_to_world(post_out, R=rot, t=0)
+            post_out[:, 2] -= np.min(post_out[:, 2])
+            max_value = np.max(post_out)
+            post_out /= max_value
 
-        plt.savefig(output_dir_3D + str(('%04d'% j)) + '_3D.png', dpi=200, format='png', bbox_inches='tight')
-        plt.close(fig)
-        
+            fig = plt.figure(figsize=(9.6, 5.4))
+            gs = gridspec.GridSpec(1, 1)
+            gs.update(wspace=-0.00, hspace=0.05)
+            ax = plt.subplot(gs[0], projection='3d')
+            show3Dpose(post_out, ax)
 
-        
+            plt.savefig(os.path.join(output_dir_3D, str(('%04d' % j)) + '_3D.png'),
+                        dpi=200, format='png', bbox_inches='tight')
+            plt.close(fig)
+
     print('Generating 3D pose successful!')
 
-    ## all
-    image_2d_dir = sorted(glob.glob(os.path.join(output_dir_2D, '*.png')))
-    image_3d_dir = sorted(glob.glob(os.path.join(output_dir_3D, '*.png')))
+    if not skip_video:
+        ## 2D + 3D 並排
+        image_2d_dir = sorted(glob.glob(os.path.join(output_dir_2D, '*.png')))
+        image_3d_dir = sorted(glob.glob(os.path.join(output_dir_3D, '*.png')))
 
-    print('\nGenerating demo...')
-    for i in tqdm(range(len(image_2d_dir))):
-        image_2d = plt.imread(image_2d_dir[i])
-        image_3d = plt.imread(image_3d_dir[i])
+        print('\nGenerating demo...')
+        output_dir_pose = os.path.join(output_dir, 'pose')
+        os.makedirs(output_dir_pose, exist_ok=True)
 
-        ## crop
-        # 2D影像：完全不裁剪或只裁剪很小的邊界
-        edge_2d = 10  # 只裁剪10像素（白邊）
-        if image_2d.shape[1] > edge_2d * 2:
-            image_2d = image_2d[:, edge_2d:image_2d.shape[1] - edge_2d]
-        
-        # 3D影像：裁剪較多（去除matplotlib邊框）
-        edge = 60
-        image_3d = image_3d[edge:image_3d.shape[0] - edge, edge:image_3d.shape[1] - edge]
+        for i in tqdm(range(len(image_2d_dir))):
+            image_2d = plt.imread(image_2d_dir[i])
+            image_3d = plt.imread(image_3d_dir[i])
 
-        ## show
-        font_size = 12
-        fig = plt.figure(figsize=(15.0, 5.4))
-        ax = plt.subplot(121)
-        showimage(ax, image_2d)
-        ax.set_title("Input", fontsize = font_size)
+            edge_2d = 10
+            if image_2d.shape[1] > edge_2d * 2:
+                image_2d = image_2d[:, edge_2d:image_2d.shape[1] - edge_2d]
 
-        ax = plt.subplot(122)
-        showimage(ax, image_3d)
-        ax.set_title("Reconstruction", fontsize = font_size)
+            edge = 60
+            image_3d = image_3d[edge:image_3d.shape[0] - edge, edge:image_3d.shape[1] - edge]
 
-        ## save
-        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
-        plt.margins(0, 0)
-        plt.savefig(output_dir_pose + str(('%04d'% i)) + '_pose.png', dpi=200, bbox_inches = 'tight')
-        plt.close(fig)
+            font_size = 12
+            fig = plt.figure(figsize=(15.0, 5.4))
+            ax = plt.subplot(121)
+            showimage(ax, image_2d)
+            ax.set_title("Input", fontsize=font_size)
 
+            ax = plt.subplot(122)
+            showimage(ax, image_3d)
+            ax.set_title("Reconstruction", fontsize=font_size)
+
+            plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+            plt.margins(0, 0)
+            plt.savefig(os.path.join(output_dir_pose, str(('%04d' % i)) + '_pose.png'),
+                        dpi=200, bbox_inches='tight')
+            plt.close(fig)
+
+
+def run_pose_estimation(video_path: str, output_dir: str,
+                        only_2d: bool = False, gpu: str = "0",
+                        bbox_csv: str = None,
+                        skip_video: bool = False) -> str:
+    """
+    執行完整的 2D/3D 姿態估計流程。
+
+    參數：
+        video_path  str        輸入影片的絕對路徑
+        output_dir  str        輸出目錄（若不存在將自動建立）
+        only_2d     bool       True → 只執行 2D 姿態，跳過 3D 與角度計算
+        gpu         str        CUDA_VISIBLE_DEVICES 值，例如 "0" 或 "1"
+        bbox_csv    str | None track_crop_roi 輸出的 bbox_map.csv 路徑，
+                               限定 HRNet 只在跑者 bbox 範圍內偵測
+        skip_video  bool       True → 跳過 PNG 渲染與 mp4 合成（只輸出 CSV）
+
+    回傳：
+        output_dir  str   結果存放目錄（與傳入一致）
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    os.makedirs(output_dir, exist_ok=True)
+
+    get_pose2D(video_path, output_dir, bbox_csv=bbox_csv)
+    if not only_2d:
+        get_pose3D(video_path, output_dir, skip_video=skip_video)
+
+    if not skip_video:
+        img2video(video_path, output_dir)
+        print('Generating demo successful!')
+
+    return output_dir
+
+
+# -----------------------------------------------------------------------
+# CLI 入口（向下相容）
+# -----------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, default='sample_video.mp4', help='input video')
-    parser.add_argument('--gpu', type=str, default='0', help='input video')
+    parser.add_argument('--video', type=str, default='sample_video.mp4', help='input video filename')
+    parser.add_argument('--gpu',   type=str, default='0', help='CUDA device index')
     parser.add_argument('--2d_only', action='store_true', help='Only generate 2D pose video')
-    parser.add_argument('--no_angles', action='store_true', help='Skip angle computation (angles are saved by default)')
     parser.add_argument('--bbox-csv', type=str, default=None,
                         help='External bbox CSV generated by track_crop_roi.py')
     args = parser.parse_args()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # CLI 模式：影片放在 demo/video/，輸出到 demo/output/{video_name}/
+    _video_path  = str(_REPO_ROOT / "demo" / "video" / args.video)
+    _video_name  = Path(args.video).stem
+    _output_dir  = str(_REPO_ROOT / "demo" / "output" / _video_name) + "/"
 
-    video_path = './demo/video/' + args.video
-    video_name = video_path.split('/')[-1].split('.')[0]
-    output_dir = './demo/output/' + video_name + '/'
-
-    get_pose2D(video_path, output_dir, bbox_csv=args.bbox_csv)
-    if not args.__dict__.get('2d_only', False):
-        get_pose3D(video_path, output_dir)   # ← 角度計算已整合在內，自動執行
-    img2video(video_path, output_dir)
-    print('Generating demo successful!')
-
-
-# 檢查 NPZ 文件
-output_dir = "./demo/output/second_original_IMG_2534_runner_tracked/"  # 改成你的影片名稱
-npz_path = output_dir + "input_2D/keypoints.npz"
-
-if os.path.exists(npz_path):
-    data = np.load(npz_path, allow_pickle=True)
-    keypoints = data['reconstruction']
-    valid_frames = data['valid_frames']
-    
-    print(f"關鍵點檢測數量: {keypoints.shape[1]}")  # 第1維是幀數
-    print(f"有效幀索引數量: {len(valid_frames)}")
-    print(f"有效幀索引: {valid_frames.flatten()}")
-    
-    # 檢查生成的 2D 圖片
+    run_pose_estimation(
+        video_path=_video_path,
+        output_dir=_output_dir,
+        only_2d=args.__dict__.get('2d_only', False),
+        gpu=args.gpu,
+        bbox_csv=args.bbox_csv,
+    )

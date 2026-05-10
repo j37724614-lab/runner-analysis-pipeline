@@ -42,7 +42,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # 中文字型
 # ---------------------------------------------------------------------------
-FONT_PATH = str(_BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")
+FONT_PATH = str(_BASE_DIR / "ChineseFont.ttf")
 
 # CSV 欄位 → 圖例簡短標籤（顯示在折線圖右上角）
 COL_ZH = {
@@ -392,8 +392,11 @@ def add_angle_overlay(video_path, csv_path, output_path,
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps,
-                          (video_w, video_h + chart_h))
+    
+    # Ensure even dimensions for compatibility
+    total_w = video_w // 2 * 2
+    total_h = (video_h + chart_h) // 2 * 2
+    out = cv2.VideoWriter(output_path, fourcc, fps, (total_w, total_h))
 
     # ------------------------------------------------------------------
     # 主迴圈：逐幀更新折線、渲染圖表、合併影片
@@ -457,6 +460,8 @@ def add_angle_overlay(video_path, csv_path, output_path,
                                interpolation=cv2.INTER_LANCZOS4)
 
         combined = np.vstack([frame, chart_bgr])
+        if (combined.shape[1], combined.shape[0]) != (total_w, total_h):
+            combined = cv2.resize(combined, (total_w, total_h))
         out.write(combined)
 
         frame_idx += 1
