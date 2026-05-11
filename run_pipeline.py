@@ -50,6 +50,7 @@ TRACK_OUT_DIR = BASE_DIR / "output_cut"
 # 寫入此 marker 檔；step2_copy() 讀取它以取得動態命名的結果。
 TRACK_MARKER  = TRACK_OUT_DIR / ".last_output_name"
 TRACK_INPUT_MARKER = TRACK_OUT_DIR / ".last_input_video"
+TRACK_INPUTS_MARKER = TRACK_OUT_DIR / ".last_input_videos"
 
 # Step 3：vis.py 的相關路徑
 # vis.py 使用相對路徑載入模型權重，因此必須以 VIS_WORKDIR 作為工作目錄執行。
@@ -194,8 +195,8 @@ def step3_vis(gpu: str, only_2d: bool, video_name: str, video_name_base: str):
     print(f"\nStep 3 完成，輸出目錄: {output_dir}")
 
 
-def _resolve_main_video_path(config: str = None, config_json: str = None):
-    """從 pipeline config 取得第一台有效相機的原始影片路徑，供最終呈現使用。"""
+def _resolve_main_video_paths(config: str = None, config_json: str = None):
+    """從 pipeline config 取得所有有效相機的原始影片路徑，供最終呈現使用。"""
     cfg = None
     if config_json:
         import json as _json
@@ -206,19 +207,30 @@ def _resolve_main_video_path(config: str = None, config_json: str = None):
             cfg = _yaml.safe_load(_f)
 
     if not cfg:
+        if os.path.exists(TRACK_INPUTS_MARKER):
+            with open(TRACK_INPUTS_MARKER) as f:
+                paths = [line.strip() for line in f if line.strip()]
+            if paths:
+                return paths
         if os.path.exists(TRACK_INPUT_MARKER):
             with open(TRACK_INPUT_MARKER) as f:
                 marker_path = f.read().strip()
-            return marker_path or None
-        return None
-    for cam in cfg.get('cameras') or []:
-        video_path = cam.get('video_path')
-        if video_path:
-            return video_path
-    return None
+            return [marker_path] if marker_path else []
+        return []
+    return [
+        cam.get('video_path')
+        for cam in (cfg.get('cameras') or [])
+        if cam.get('video_path')
+    ]
 
 
-def step4_overlay(gpu: str, video_name_base: str, main_video_path: str = None):
+def _resolve_main_video_path(config: str = None, config_json: str = None):
+    """相容舊呼叫：回傳第一台有效相機的原始影片路徑。"""
+    paths = _resolve_main_video_paths(config, config_json)
+    return paths[0] if paths else None
+
+
+def step4_overlay(gpu: str, video_name_base: str, main_video_paths=None):
     """
     Step 4：將 2D 骨架影片與 4 個角度折線圖合併為單一影片。
 
@@ -251,8 +263,14 @@ def step4_overlay(gpu: str, video_name_base: str, main_video_path: str = None):
         return
 
     print(f"  2D 影片: {video_2d}")
-    if main_video_path:
-        print(f"  原始主畫面: {main_video_path}")
+    if main_video_paths:
+        if isinstance(main_video_paths, (str, os.PathLike)):
+            main_video_paths = [str(main_video_paths)]
+        print(f"  原始主畫面: {len(main_video_paths)} 支")
+        for idx, path in enumerate(main_video_paths, start=1):
+            print(f"    CAM{idx}: {path}")
+    else:
+        main_video_paths = []
     if os.path.exists(frame_map_path):
         print(f"  Frame map: {frame_map_path}")
     print(f"  角度 CSV: {csv_path}")
@@ -264,8 +282,8 @@ def step4_overlay(gpu: str, video_name_base: str, main_video_path: str = None):
         "--csv",    csv_path,
         "--output", output,
     ]
-    if main_video_path:
-        cmd += ["--main-video", main_video_path]
+    if main_video_paths:
+        cmd += ["--main-videos", *[str(p) for p in main_video_paths]]
     if os.path.exists(frame_map_path):
         cmd += ["--frame-map", frame_map_path]
 
@@ -352,13 +370,13 @@ def main():
 
     # 預先初始化，確保即使在 try 區塊外使用也不會出現 NameError
     video_name = video_name_base = ""
-    main_video_path = None
+    main_video_paths = []
 
     try:
         # Step 1：可選略過（--skip-track），適合影片已追蹤完的重跑情境
         if not args.skip_track:
             step1_track(args.gpu, args.config, args.config_json)
-        main_video_path = _resolve_main_video_path(args.config, args.config_json)
+        main_video_paths = _resolve_main_video_paths(args.config, args.config_json)
 
         # Step 2：從 marker 取得實際檔名後複製；回傳值供 Step 3 使用
         video_name, video_name_base = step2_copy()
@@ -367,7 +385,7 @@ def main():
         step3_vis(args.gpu, args.two_d_only, video_name, video_name_base)
 
         # Step 4：2D 影片 + 角度折線圖合併（若 --2d_only 則自動略過）
-        step4_overlay(args.gpu, video_name_base, main_video_path)
+        step4_overlay(args.gpu, video_name_base, main_video_paths)
 
     except subprocess.CalledProcessError as e:
         # 子程序（track_crop_roi.py 或 vis.py）返回非零結束碼

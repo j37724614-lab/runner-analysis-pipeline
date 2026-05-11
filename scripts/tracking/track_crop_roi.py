@@ -1117,6 +1117,8 @@ def main():
         _f.write(OUTPUT_NAME)
     with open(os.path.join(OUTPUT_DIR, ".last_input_video"), "w") as _f:
         _f.write(CAMERAS[0]['video_path'])
+    with open(os.path.join(OUTPUT_DIR, ".last_input_videos"), "w") as _f:
+        _f.write("\n".join(cam['video_path'] for cam in CAMERAS))
 
     first_fps = caps[0].get(cv2.CAP_PROP_FPS) or 60.0
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
