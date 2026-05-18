@@ -247,19 +247,21 @@ if __name__ == "__main__":
     config_dict = {
         "cameras": [
             {
-                "video_path": "test/test/cam1.mov", # 請替換為實際的影片路徑
+                "video_path": "test/test/cam1.mov",
+                "crop": [0, 400, 1920, 800],
+                "start_line": [[222, 715], [148, 725]],
+                "end_line": [[1700, 710], [1790, 718]],
+                "distance_m": 20.0
             },
             {
-                "video_path": "test/test/cam2.mov", # 請替換為實際的影片路徑
+                "video_path": "test/test/cam2.mov",
+                "crop": [0, 400, 1920, 800],
+                "start_line": [[220, 715], [135, 725]],
+                "end_line": [[1730, 710], [1825, 725]],
+                "distance_m": 20.0
             }
         ]
-        # 若有其他全域設定參數可加在此處
     } 
-
-    # config_dict = {'cameras': [{'video_path': '/home/hsuanya/workspace/running_analysis/backend/data/run_sessions/00399f18-1d1b-40b6-a247-5b44847fa579/c43dcfd1-01fa-4bbc-b11b-71c5a65d696c/cam1.mov',
-    #  'start_line': [[177, 710], [77, 725]],
-    #   'end_line': [[1752, 698], [1866, 717]],
-    #    'distance_m': 20.0}]}
 
     run_analysis(
         config_dict=config_dict,

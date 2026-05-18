@@ -234,6 +234,10 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
     
     abs_video_path = os.path.abspath(tracked_video_path)
     abs_output_dir = os.path.abspath(output_dir)
+    
+    bbox_csv_path = abs_video_path.replace('.mp4', '_bbox_map.csv')
+    if not os.path.exists(bbox_csv_path):
+        bbox_csv_path = None
 
     print("=" * 60)
     print(f"Step 2 — 姿態估計（{'2D only' if only_2d else '2D + 3D + 角度'}）")
@@ -255,6 +259,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
             output_dir=abs_output_dir,
             only_2d=only_2d,
             gpu=gpu,
+            bbox_csv=bbox_csv_path,
             skip_video=skip_video,
         )
     finally:
@@ -553,12 +558,13 @@ if __name__ == "__main__":
             "end_line": [[1760, 710], [1830, 718]],
             "distance_m": 20
         },
-        # {
-        #     "video_path": "test/test/cam2.mov",
-        #     "crop": [0, 400, 1920, 800],
-        #     "start_line": [[208, 715], [123, 725]],
-        #     "end_line": [[1760, 710], [1830, 718]],
-        #     "distance_m": 20
-        # }
+        {
+            "video_path": "test/test/cam2.mov",
+            "crop": [0, 400, 1920, 800],
+            "start_line": [[208, 715], [123, 725]],
+            "end_line": [[1760, 710], [1830, 718]],
+            "distance_m": 20
+        }
+        # ...（可繼續新增相機設定）
     ]
     main(default_cameras=default_cameras)

@@ -440,7 +440,7 @@ def process_frame(img, model, velocity_tracker, device,
         cx1, cx2 = max(0, cx1), min(w, cx2)
         cy1, cy2 = max(0, cy1), min(h, cy2)
         if cx2 <= cx1 or cy2 <= cy1:
-            return None, None, None, None, None
+            return None, None, None, None, None, None, None
         img = img[cy1:cy2, cx1:cx2]
 
 # =======================================================================
@@ -589,7 +589,7 @@ def process_frame(img, model, velocity_tracker, device,
                     break
 
     if fastest_id is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     d = velocity_tracker[fastest_id]
     bx1, by1, bx2, by2 = d['bbox']

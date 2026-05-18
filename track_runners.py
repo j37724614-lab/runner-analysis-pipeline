@@ -22,34 +22,31 @@ from scipy.signal import butter, filtfilt
 from PIL import Image, ImageDraw, ImageFont
 
 # =======================================================================
-# 設定區（每次修改只需改這裡）
+# 預設參數與常數（供模組化 import，外部亦可傳參覆蓋）
 # =======================================================================
 
 _BASE = Path(__file__).resolve().parent   # repo 根目錄
 
-# 使用哪張實體 GPU（'0' = 第 0 張，'1' = 第 1 張）
-CUDA_VISIBLE_DEVICES = '0'
-os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
-DEVICE = 0
+DEFAULT_CUDA_VISIBLE_DEVICES = '0'
+DEFAULT_DEVICE = 0
+DEFAULT_MODEL_PATH = str(_BASE / "yolo26x.pt")
+DEFAULT_FONT_PATH = str(_BASE / "ChineseFont.ttf")
+DEFAULT_OUTPUT_DIR  = str(_BASE / "output_cut")
+DEFAULT_OUTPUT_NAME = "sequential_tracked.mp4"
+DEFAULT_TARGET_HEIGHT = 340
+DEFAULT_CHART_HEIGHT = 200
 
-# 模型權重路徑
-MODEL_PATH = str(_BASE / "yolo26x.pt")
-
-# 中文字型路徑（圖表與影片疊字使用）
-FONT_PATH = str(_BASE / "MotionAGFormer" / "ChineseFont.ttf")
-
-# 輸出目錄與檔名
-OUTPUT_DIR  = str(_BASE / "output_cut")
-OUTPUT_NAME = "sequential_tracked.mp4"
-
-# 輸出影片每台相機的顯示高度（統一縮放後輸出）
-TARGET_HEIGHT = 340
-
-# 底部圖表高度（像素）；設為 0 = 不顯示圖表（distance_m 也需設定才會顯示）
-CHART_HEIGHT = 200
+DEFAULT_MOVEMENT_THRESHOLD  = 3   # 判定為移動的最小像素位移
+DEFAULT_MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「真正移動」
+DEFAULT_STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量
+DEFAULT_MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄
+DEFAULT_CAM_WARMUP_FRAMES   = 5   # 切換相機後前幾幀放寬選取條件
+DEFAULT_MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
+DEFAULT_GROUND_POINT_EMA_ALPHA = 0.35  # bbox 底部中心點 EMA 平滑係數；越小越穩但延遲越大
+DEFAULT_FLAT_INTERP_EPS_M = 0.001      # 距離變化小於此值視為 flat segment
 
 
-def _get_font(size=28, font_path=FONT_PATH):
+def _get_font(size=28, font_path=DEFAULT_FONT_PATH):
     """載入字型；失敗時回傳 None 以便安全降級。"""
     if font_path and os.path.exists(font_path):
         try:
@@ -59,7 +56,7 @@ def _get_font(size=28, font_path=FONT_PATH):
     return None
 
 
-def _configure_matplotlib_font(font_path=FONT_PATH):
+def _configure_matplotlib_font(font_path=DEFAULT_FONT_PATH):
     """設定 Matplotlib 使用中文字型。"""
     if font_path and os.path.exists(font_path):
         try:
@@ -581,154 +578,98 @@ def build_camera_with_homography(video_path, crop, start_line, end_line,
 
 # -----------------------------------------------------------------------
 # 相機設定（最多 6 台）
-#
-# 最省事的填法：改用 build_camera_with_homography(...)
-# 你每台只要填：
-#   1. video_path
-#   2. start_line / end_line
-#   3. start_meter（本台相機起始公尺）
-#   4. src_points（固定 5 點；也可用 6 點補上中段近側點）
-#
-# src_points 固定順序：
-#   1. 0m 靠近側
-#   2. 0m 遠離側
-#   3. 10m 遠離側
-#   4. 20m 遠離側
-#   5. 20m 靠近側
-#
-# src_points 若使用 6 點，固定順序：
-#   1. 0m 靠近側
-#   2. 0m 遠離側
-#   3. 10m 遠離側
-#   4. 10m 靠近側
-#   5. 20m 遠離側
-#   6. 20m 靠近側
-#
-# 若 src_points 尚未填滿，會自動退回既有 distance_m + start_line/end_line 模式，
-# 方便你逐台補 Homography，不會影響腳本先跑。
 # -----------------------------------------------------------------------
-# 建議公尺區間：
-#   CAM1: 0m~20m
-#   CAM2: 20m~40m
-#   CAM3: 40m~60m
-#   CAM4: 60m~80m
-#   CAM5: 80m~100m
-#   CAM6: 100m~120m
-# -----------------------------------------------------------------------
-CAM1 = build_camera_with_homography(
-    video_path="/home/jeter/pipeline_release/video/IMG_3560_1.mp4",
-    crop=(0, 400, 1920, 800),
-    start_line=[(222, 715), (148, 725)],
-    end_line=[(1700, 710), (1790, 718)],
-    start_meter=0.0,
-    start_roi_px=100,
-    src_points=[
-        [148, 725],   # 0m 靠近側
-        [222, 715],   # 0m 遠離側
-        [961, 714],   # 10m 遠離側
-        [966, 723],   # 10m 靠近側（由跑道透視與 1.22m 寬度推算）
-        [1700, 710],  # 20m 遠離側
-        [1790, 720],  # 20m 靠近側
-    ],
-)
+def get_default_cameras():
+    """建立並回傳預設的 6 台相機設定清單。"""
+    cam1 = build_camera_with_homography(
+        video_path="test/test/cam1.mov",
+        crop=(0, 400, 1920, 800),
+        start_line=[(222, 715), (148, 725)],
+        end_line=[(1700, 710), (1790, 718)],
+        start_meter=0.0,
+        start_roi_px=100,
+        src_points=[
+            [148, 725],   # 0m 靠近側
+            [222, 715],   # 0m 遠離側
+            [961, 714],   # 10m 遠離側
+            [966, 723],   # 10m 靠近側（由跑道透視與 1.22m 寬度推算）
+            [1700, 710],  # 20m 遠離側
+            [1790, 720],  # 20m 靠近側
+        ],
+    )
 
-CAM2 = build_camera_with_homography(
-    video_path=None,# "/home/jeter/pipeline_release/video/IMG_2540_2.mp4",
-    crop=(0, 400, 1920, 800),
-    start_line=[(220, 715), (135, 725)],
-    end_line=[(1730, 710), (1825, 725)],
-    start_meter=20.0,
-    src_points=[
-        [135, 725],   # 20m 靠近側
-        [220, 715],   # 20m 遠離側
-        [970, 714],   # 30m 遠離側
-        [970, 721],   # 30m 靠近側（由跑道透視與 1.22m 寬度推算）
-        [1730, 710],  # 40m 遠離側
-        [1825, 725],  # 40m 靠近側
-    ],
-)
+    cam2 = build_camera_with_homography(
+        video_path="test/test/cam2.mov",
+        crop=(0, 400, 1920, 800),
+        start_line=[(220, 715), (135, 725)],
+        end_line=[(1730, 710), (1825, 725)],
+        start_meter=20.0,
+        src_points=[
+            [135, 725],   # 20m 靠近側
+            [220, 715],   # 20m 遠離側
+            [970, 714],   # 30m 遠離側
+            [970, 721],   # 30m 靠近側（由跑道透視與 1.22m 寬度推算）
+            [1730, 710],  # 40m 遠離側
+            [1825, 725],  # 40m 靠近側
+        ],
+    )
 
-CAM3 = build_camera_with_homography(
-    video_path=None,#"/home/jeter/pipeline_release/video/0504_3.mp4",
-    crop=(0, 400, 1920, 800),
-    start_line=[(212, 715), (127, 725)],
-    end_line=[(1755, 710), (1835, 718)],
-    start_meter=40.0,
-    src_points=[
-        [127, 725],   # 40m 靠近側
-        [212, 715],   # 40m 遠離側
-        [980, 714],   # 50m 遠離側
-        [983, 721],   # 50m 靠近側（由跑道透視與 1.22m 寬度推算）
-        [1755, 710],  # 60m 遠離側
-        [1835, 718],  # 60m 靠近側
-    ],
-)
+    cam3 = build_camera_with_homography(
+        video_path=None,
+        crop=(0, 400, 1920, 800),
+        start_line=[(212, 715), (127, 725)],
+        end_line=[(1755, 710), (1835, 718)],
+        start_meter=40.0,
+        src_points=[
+            [127, 725],   # 40m 靠近側
+            [212, 715],   # 40m 遠離側
+            [980, 714],   # 50m 遠離側
+            [983, 721],   # 50m 靠近側（由跑道透視與 1.22m 寬度推算）
+            [1755, 710],  # 60m 遠離側
+            [1835, 718],  # 60m 靠近側
+        ],
+    )
 
-CAM4 = build_camera_with_homography(
-    video_path=None,#"/home/jeter/pipeline_release/video/0506_4.mp4",
-    crop=(0, 400, 1920, 800),
-    start_line=[(227, 713), (140, 727)],
-    end_line=[(1722, 718), (1825, 725)],
-    start_meter=60.0,
-    src_points=[
-        [140, 727],   # 60m 靠近側
-        [227, 713],   # 60m 遠離側
-        [976, 716],   # 70m 遠離側
-        [976, 726],  # 70m 靠近側（由跑道透視與 1.22m 寬度推算）
-        [1722, 718],  # 80m 遠離側
-        [1825, 725],  # 80m 靠近側
-    ],
-)
+    cam4 = build_camera_with_homography(
+        video_path=None,
+        crop=(0, 400, 1920, 800),
+        start_line=[(227, 713), (140, 727)],
+        end_line=[(1722, 718), (1825, 725)],
+        start_meter=60.0,
+        src_points=[
+            [140, 727],   # 60m 靠近側
+            [227, 713],   # 60m 遠離側
+            [976, 716],   # 70m 遠離側
+            [976, 726],   # 70m 靠近側（由跑道透視與 1.22m 寬度推算）
+            [1722, 718],  # 80m 遠離側
+            [1825, 725],  # 80m 靠近側
+        ],
+    )
 
-CAM5 = build_camera_with_homography(
-    video_path=None,
-    crop=(0, 400, 1920, 800),
-    start_line=[(150, 400), (150, 800)],
-    end_line=[(1820, 400), (1820, 800)],
-    start_meter=80.0,
-    src_points=[
-        # [x, y],  # 80m 靠近側
-        # [x, y],  # 80m 遠離側
-        # [x, y],  # 90m 遠離側
-        # [x, y],  # 90m 靠近側
-        # [x, y],  # 100m 遠離側
-        # [x, y],  # 100m 靠近側
-    ],
-)
+    cam5 = build_camera_with_homography(
+        video_path=None,
+        crop=(0, 400, 1920, 800),
+        start_line=[(150, 400), (150, 800)],
+        end_line=[(1820, 400), (1820, 800)],
+        start_meter=80.0,
+        src_points=[],
+    )
 
-CAM6 = build_camera_with_homography(
-    video_path=None,
-    crop=(0, 400, 1920, 800),
-    start_line=[(150, 400), (150, 800)],
-    end_line=[(1820, 400), (1820, 800)],
-    start_meter=100.0,
-    src_points=[
-        # [x, y],  # 100m 靠近側
-        # [x, y],  # 100m 遠離側
-        # [x, y],  # 110m 遠離側
-        # [x, y],  # 110m 靠近側
-        # [x, y],  # 120m 遠離側
-        # [x, y],  # 120m 靠近側
-    ],
-)
-
-# -----------------------------------------------------------------------
-# 移動偵測參數
-# -----------------------------------------------------------------------
-MOVEMENT_THRESHOLD  = 3   # 判定為移動的最小像素位移
-MIN_MOVEMENT_FRAMES = 3  # 需連續移動至少此幀數才視為「真正移動」
-STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量
-MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄
-CAM_WARMUP_FRAMES   = 5   # 切換相機後前幾幀放寬選取條件
-MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
-GROUND_POINT_EMA_ALPHA = 0.35  # bbox 底部中心點 EMA 平滑係數；越小越穩但延遲越大
-FLAT_INTERP_EPS_M = 0.001      # 距離變化小於此值視為 flat segment
+    cam6 = build_camera_with_homography(
+        video_path=None,
+        crop=(0, 400, 1920, 800),
+        start_line=[(150, 400), (150, 800)],
+        end_line=[(1820, 400), (1820, 800)],
+        start_meter=100.0,
+        src_points=[],
+    )
+    return [cam1, cam2, cam3, cam4, cam5, cam6]
 
 # =======================================================================
 # 以下為程式邏輯，一般不需修改
 # =======================================================================
 
-def _interpolate_flat_segments(d, eps=FLAT_INTERP_EPS_M):
+def _interpolate_flat_segments(d, eps=DEFAULT_FLAT_INTERP_EPS_M):
     """
     將中間的距離 flat segment 用前後變動點線性插值。
     只處理前後都有有效變動點的區段；開頭/結尾 flat 不外推。
@@ -849,7 +790,8 @@ def _interpolation_metadata(interpolated_mask):
 
 
 def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
-                       measurement_confidence=None):
+                       measurement_confidence=None,
+                       flat_interp_eps_m=DEFAULT_FLAT_INTERP_EPS_M):
     """
     移植自 smart_switch_tracker.py _compute_kf_series()。
     輸入：d_raw = list of float（每幀原始距離，公尺），fps = 幀率
@@ -879,7 +821,7 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
             d[k] = d[k - 1]
 
     # 1b. 修正「距離卡住幾幀後突然跳動」造成的速度/加速度震盪
-    d = _interpolate_flat_segments(d)
+    d = _interpolate_flat_segments(d, eps=flat_interp_eps_m)
 
     # 2. Butterworth filtfilt（需 n >= 15）
     if n >= 15:
@@ -1008,13 +950,16 @@ def process_frame(img, model, velocity_tracker, device,
                   crop_x_offset, crop_y_offset,
                   quad_roi=None, track_roi=None, draw_bbox=True,
                   bbox_color=(0, 255, 0), prefer_lead_runner=False,
-                  nearest_to_start=False, locked_target_id=None):
+                  nearest_to_start=False, locked_target_id=None,
+                  movement_threshold=DEFAULT_MOVEMENT_THRESHOLD,
+                  stationary_decay=DEFAULT_STATIONARY_DECAY,
+                  ground_point_ema_alpha=DEFAULT_GROUND_POINT_EMA_ALPHA,
+                  min_person_height=DEFAULT_MIN_PERSON_HEIGHT,
+                  min_movement_frames=DEFAULT_MIN_MOVEMENT_FRAMES,
+                  max_person_memory=DEFAULT_MAX_PERSON_MEMORY):
     """
     對單幀執行裁剪 → YOLO track/pose → 速度累積 → 選目標人物 → 畫框。
-    locked_target_id 有值時，只追蹤該 ByteTrack ID，避免切到裁判或其他人。
-    回傳：(處理後畫面, fastest_id, fastest_center_orig, fastest_bx2_orig)
-      fastest_center_orig：最快人物 center_x 在原始影片座標（非最後一機的切換基準）
-      fastest_bx2_orig：最快人物 bbox 右緣 bx2 在原始影片座標（最後一機的退出 ROI 基準）
+    locked_target_id 有值時，只追蹤該 ByteTrack ID，避免切到裁判 or 其他人。
     """
     # Step 1: 裁剪
     if crop_params:
@@ -1043,7 +988,7 @@ def process_frame(img, model, velocity_tracker, device,
         valid_detections = []  # (dist_to_start_line, cx, cy, bx1, by1, bx2, by2, tid, proj, ground_pt)
         for i in range(len(boxes)):
             bx1, by1, bx2, by2 = map(int, boxes[i])
-            if (by2 - by1) < MIN_PERSON_HEIGHT:
+            if (by2 - by1) < min_person_height:
                 continue
             center_x = (bx1 + bx2) / 2
             center_y = (by1 + by2) / 2
@@ -1099,17 +1044,17 @@ def process_frame(img, model, velocity_tracker, device,
                 ox, oy = d['center']
                 dist = np.sqrt((center_x - ox)**2 + (center_y - oy)**2)
                 d['velocities'].append(dist)
-                if dist > MOVEMENT_THRESHOLD:
+                if dist > movement_threshold:
                     d['movement_count'] += 1
                     d['stationary_count'] = 0
                 else:
                     d['movement_count'] = max(0, d['movement_count'] - 1)
-                    d['stationary_count'] += STATIONARY_DECAY
+                    d['stationary_count'] += stationary_decay
                 d['center'] = (center_x, center_y)
                 d['bbox']   = (bx1, by1, bx2, by2)
                 d['ground_point'] = ground_pt
                 prev_ground = d.get('smoothed_ground_point', ground_pt)
-                alpha = GROUND_POINT_EMA_ALPHA
+                alpha = ground_point_ema_alpha
                 d['smoothed_ground_point'] = (
                     alpha * ground_pt[0] + (1.0 - alpha) * prev_ground[0],
                     alpha * ground_pt[1] + (1.0 - alpha) * prev_ground[1],
@@ -1133,7 +1078,7 @@ def process_frame(img, model, velocity_tracker, device,
     for tid in list(velocity_tracker):
         if tid not in seen_ids:
             velocity_tracker[tid]['frames_since_detected'] += 1
-            if velocity_tracker[tid]['frames_since_detected'] > MAX_PERSON_MEMORY:
+            if velocity_tracker[tid]['frames_since_detected'] > max_person_memory:
                 del velocity_tracker[tid]
 
     # Step 4: 選出目標人物
@@ -1147,7 +1092,7 @@ def process_frame(img, model, velocity_tracker, device,
         max_vel = 0
         for tid, d in velocity_tracker.items():
             if d['frames_since_detected'] == 0:
-                if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and
+                if (d['movement_count'] >= min_movement_frames and
                         d['stationary_count'] < 10):
                     v = np.mean(d['velocities']) if d['velocities'] else 0
                     if v > max_vel:
@@ -1218,63 +1163,87 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main(config_dict=None):
     args = parse_args()
 
-    global CUDA_VISIBLE_DEVICES, DEVICE, OUTPUT_DIR, OUTPUT_NAME
-    global TARGET_HEIGHT, CHART_HEIGHT
-    global MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY
+    # 1. 載入預設設定
+    config = {
+        "gpu": DEFAULT_CUDA_VISIBLE_DEVICES,
+        "device": DEFAULT_DEVICE,
+        "model_path": DEFAULT_MODEL_PATH,
+        "font_path": DEFAULT_FONT_PATH,
+        "output_dir": DEFAULT_OUTPUT_DIR,
+        "output_name": DEFAULT_OUTPUT_NAME,
+        "target_height": DEFAULT_TARGET_HEIGHT,
+        "chart_height": DEFAULT_CHART_HEIGHT,
+        "movement_threshold": DEFAULT_MOVEMENT_THRESHOLD,
+        "min_movement_frames": DEFAULT_MIN_MOVEMENT_FRAMES,
+        "stationary_decay": DEFAULT_STATIONARY_DECAY,
+        "max_person_memory": DEFAULT_MAX_PERSON_MEMORY,
+        "cam_warmup_frames": DEFAULT_CAM_WARMUP_FRAMES,
+        "min_person_height": DEFAULT_MIN_PERSON_HEIGHT,
+        "ground_point_ema_alpha": DEFAULT_GROUND_POINT_EMA_ALPHA,
+        "flat_interp_eps_m": DEFAULT_FLAT_INTERP_EPS_M,
+    }
 
-    cameras_override = None
-    if args.config_json:
+    # 2. 如果是從 CLI 傳入 --config-json，或是從函式傳入 config_dict，進行覆蓋
+    cfg = {}
+    if config_dict is not None:
+        cfg = config_dict
+    elif args.config_json:
         try:
             cfg = json.loads(args.config_json)
         except json.JSONDecodeError as e:
             print(f"\n錯誤：--config-json 格式錯誤：{e}")
             sys.exit(1)
-        if 'gpu' in cfg:
-            CUDA_VISIBLE_DEVICES = str(cfg['gpu'])
-            DEVICE = int(cfg['gpu'])
-            os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
-        if 'output_dir'          in cfg: OUTPUT_DIR          = cfg['output_dir']
-        if 'output_name'         in cfg: OUTPUT_NAME         = cfg['output_name']
-        if 'target_height'       in cfg: TARGET_HEIGHT       = int(cfg['target_height'])
-        if 'chart_height'        in cfg: CHART_HEIGHT        = int(cfg['chart_height'])
-        if 'movement_threshold'  in cfg: MOVEMENT_THRESHOLD  = int(cfg['movement_threshold'])
-        if 'min_movement_frames' in cfg: MIN_MOVEMENT_FRAMES = int(cfg['min_movement_frames'])
-        if 'stationary_decay'    in cfg: STATIONARY_DECAY    = int(cfg['stationary_decay'])
-        if 'max_person_memory'   in cfg: MAX_PERSON_MEMORY   = int(cfg['max_person_memory'])
-        if 'cameras' in cfg:
-            cams = [_build_camera_from_json(e) for e in (cfg['cameras'] or [])[:6]]
-            cameras_override = [c for c in cams if c['video_path'] is not None]
 
-    chart_font_prop = _configure_matplotlib_font()
+    if 'gpu' in cfg:
+        config['gpu'] = str(cfg['gpu'])
+        config['device'] = int(cfg['gpu'])
+    if 'output_dir'          in cfg: config['output_dir']          = cfg['output_dir']
+    if 'output_name'         in cfg: config['output_name']         = cfg['output_name']
+    if 'target_height'       in cfg: config['target_height']       = int(cfg['target_height'])
+    if 'chart_height'        in cfg: config['chart_height']        = int(cfg['chart_height'])
+    if 'movement_threshold'  in cfg: config['movement_threshold']  = int(cfg['movement_threshold'])
+    if 'min_movement_frames' in cfg: config['min_movement_frames'] = int(cfg['min_movement_frames'])
+    if 'stationary_decay'    in cfg: config['stationary_decay']    = int(cfg['stationary_decay'])
+    if 'max_person_memory'   in cfg: config['max_person_memory']   = int(cfg['max_person_memory'])
+    if 'cam_warmup_frames'   in cfg: config['cam_warmup_frames']   = int(cfg['cam_warmup_frames'])
+    if 'min_person_height'   in cfg: config['min_person_height']   = int(cfg['min_person_height'])
+    if 'ground_point_ema_alpha' in cfg: config['ground_point_ema_alpha'] = float(cfg['ground_point_ema_alpha'])
+    if 'flat_interp_eps_m'   in cfg: config['flat_interp_eps_m']   = float(cfg['flat_interp_eps_m'])
+
+    # 設定 GPU 環境變數
+    os.environ['CUDA_VISIBLE_DEVICES'] = config['gpu']
+
+    cameras_override = None
+    if 'cameras' in cfg:
+        cams = [_build_camera_from_json(e) for e in (cfg['cameras'] or [])[:6]]
+        cameras_override = [c for c in cams if c['video_path'] is not None]
+
+    chart_font_prop = _configure_matplotlib_font(config['font_path'])
 
     # 過濾 video_path=None 的槽位，組出有效相機清單
+    default_cameras = get_default_cameras()
     CAMERAS = cameras_override if cameras_override is not None else \
-              [c for c in [CAM1, CAM2, CAM3, CAM4, CAM5, CAM6]
-               if c['video_path'] is not None]
+              [c for c in default_cameras if c['video_path'] is not None]
     if not CAMERAS:
         raise ValueError("所有相機的 video_path 均為 None，請至少設定一台。")
-    # 切換策略：
-    #   非最後一機 → 用 center_x，超過 switch_x 時切到下一台
-    #   最後一機   → 用 bx2（右緣），超過 switch_x 時視為「退出 ROI」而停止收集
-    #               switch_x=None 時最後一機仍跑完整支影片
 
     # CUDA 環境檢查
     print(f"CUDA 可用: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print(f"GPU 名稱: {torch.cuda.get_device_name(0)}")
-    print(f"使用設備: cuda:{DEVICE}")
+    print(f"使用設備: cuda:{config['device']}")
 
     # 載入模型並預熱
-    model = YOLO(MODEL_PATH)
-    model.predict(np.zeros((480, 640, 3), dtype=np.uint8), device=DEVICE, verbose=False)
+    model = YOLO(config['model_path'])
+    model.predict(np.zeros((480, 640, 3), dtype=np.uint8), device=config['device'], verbose=False)
     print(f"模型預熱完成，共 {len(CAMERAS)} 台相機（串接模式）\n")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, OUTPUT_NAME)
+    os.makedirs(config['output_dir'], exist_ok=True)
+    output_path = os.path.join(config['output_dir'], config['output_name'])
 
     out           = None   # 所有相機共用同一個 VideoWriter
     total_written = 0
@@ -1379,7 +1348,7 @@ def main():
                     t.reset()
         cam_skipped          = 0
         frame_count          = 0
-        cam_warmup_remaining = CAM_WARMUP_FRAMES
+        cam_warmup_remaining = config['cam_warmup_frames']
 
         # 第一段緩衝區
         frame_buffer = []   # 縮放後的畫面（含綠框、相機標籤）
@@ -1400,7 +1369,7 @@ def main():
         strip_start_pts = strip_end_pts = None
         if cam.get('start_line') and cam.get('end_line') and cam.get('crop_params'):
             cp_l = cam['crop_params']
-            ls = TARGET_HEIGHT / (cp_l[3] - cp_l[1])
+            ls = config['target_height'] / (cp_l[3] - cp_l[1])
             def _to_strip_pt(pt):
                 return (int((pt[0] - cp_l[0]) * ls), int((pt[1] - cp_l[1]) * ls))
             strip_start_pts = (_to_strip_pt(cam['start_line'][0]),
@@ -1410,11 +1379,11 @@ def main():
 
         def _make_strip(img, fastest_id_for_label=None):
             h_img, w_img = img.shape[:2]
-            new_w = int(w_img * TARGET_HEIGHT / h_img)
-            strip = cv2.resize(img, (new_w, TARGET_HEIGHT))
+            new_w = int(w_img * config['target_height'] / h_img)
+            strip = cv2.resize(img, (new_w, config['target_height']))
 
             if fastest_id_for_label is not None and fastest_id_for_label in velocity_tracker:
-                sc = TARGET_HEIGHT / h_img
+                sc = config['target_height'] / h_img
                 d_v = velocity_tracker[fastest_id_for_label]
                 _bx = int(d_v['bbox'][0] * sc)
                 _by = int(d_v['bbox'][1] * sc)
@@ -1425,7 +1394,7 @@ def main():
                 strip,
                 f"相機 {cam_idx+1}",
                 (10, 10),
-                font=_get_font(size=28),
+                font=_get_font(size=28, font_path=config['font_path']),
                 color=(255, 255, 255),
                 thickness=2,
             )
@@ -1459,7 +1428,7 @@ def main():
             frame_count += 1
 
             img, fastest_id, fastest_center_orig, fastest_bx2_orig = process_frame(
-                frame, model, velocity_tracker, DEVICE,
+                frame, model, velocity_tracker, config['device'],
                 cam['crop_params'], cam['roi_enabled'], cam['roi_zones'],
                 crop_x_offset, crop_y_offset,
                 quad_roi=cam.get('quad_roi'),
@@ -1469,6 +1438,12 @@ def main():
                 prefer_lead_runner=not runner_crossed_start,
                 nearest_to_start=not runner_crossed_start,
                 locked_target_id=target_runner_id if runner_crossed_start else None,
+                movement_threshold=config['movement_threshold'],
+                stationary_decay=config['stationary_decay'],
+                ground_point_ema_alpha=config['ground_point_ema_alpha'],
+                min_person_height=config['min_person_height'],
+                min_movement_frames=config['min_movement_frames'],
+                max_person_memory=config['max_person_memory'],
             )
 
             # 診斷：前 5 幀 + 每 100 幀
@@ -1556,7 +1531,7 @@ def main():
                 else:
                     # 舊模式：x 位移
                     dist_raw = cumulative_dist_offset + max(0.0, (cx_orig - cam['start_x']) * cam['m_per_pixel'])
-                scale    = TARGET_HEIGHT / img.shape[0]
+                scale    = config['target_height'] / img.shape[0]
                 bbox_strip = (int(bx1 * scale), int(by1 * scale),
                               int(bx2 * scale), int(by2 * scale))
 
@@ -1682,14 +1657,15 @@ def main():
         # -----------------------------------------------------------------------
         has_metrics = (
             (cam['m_per_pixel'] is not None or cam.get('H_matrix') is not None) and
-            CHART_HEIGHT > 0 and len(d_raw) > 0 and has_any_metric
+            config['chart_height'] > 0 and len(d_raw) > 0 and has_any_metric
         )
         if has_metrics:
             print(f"  [第二段] 計算 Butterworth + Kalman（init_v={last_kf_v:.2f}, init_a={last_kf_a:.2f}）...")
             d_smooth, v_smooth, a_arr = _compute_kf_series(d_raw, fps,
                                                            init_v=last_kf_v,
                                                            init_a=last_kf_a,
-                                                           measurement_confidence=speed_confidence)
+                                                           measurement_confidence=speed_confidence,
+                                                           flat_interp_eps_m=config['flat_interp_eps_m'])
             # 更新跨機累計偏移：本機最終距離即為下一機的起點
             cumulative_dist_offset = float(d_smooth[-1]) if len(d_smooth) > 0 else cumulative_dist_offset
             # 保存本機最終 Kalman 狀態，供下一機初始化用
@@ -1735,7 +1711,7 @@ def main():
                 if chart_fig is None:
                     _cw = strip.shape[1]
                     chart_fig, chart_axes = plt.subplots(
-                        1, 3, figsize=(_cw / 100, CHART_HEIGHT / 100), dpi=100)
+                        1, 3, figsize=(_cw / 100, config['chart_height'] / 100), dpi=100)
                     chart_canvas = FigureCanvas(chart_fig)
 
                 # 前機完整 + 本機到第 i 幀（absolute_frame 概念：跨機連續）
@@ -1751,7 +1727,7 @@ def main():
                 chart = _draw_chart(
                     chart_fig, chart_axes, chart_canvas,
                     d_cur, v_cur, a_cur,
-                    fps, strip.shape[1], CHART_HEIGHT,
+                    fps, strip.shape[1], config['chart_height'],
                     global_d_max, global_t_max,
                     font_prop=chart_font_prop)
                 frame_out = np.vstack([strip, chart])
@@ -1779,8 +1755,8 @@ def main():
                     'speed_confidence': round(speed_confidence[i], 3) if i < len(speed_confidence) else 1.0,
                 })
             elif has_metrics and meta_buffer[i] is None:
-                # pre-roll 幀：保留畫面但圖表區填黑
-                empty = np.zeros((CHART_HEIGHT, strip.shape[1], 3), dtype=np.uint8)
+                # pre-roll 幀：保留畫面 but 圖表區填黑
+                empty = np.zeros((config['chart_height'], strip.shape[1], 3), dtype=np.uint8)
                 frame_out = np.vstack([strip, empty])
             else:
                 frame_out = strip
@@ -1815,7 +1791,7 @@ def main():
 
     # CSV 輸出
     if all_track_data:
-        csv_path = os.path.join(OUTPUT_DIR, OUTPUT_NAME.replace('.mp4', '_metrics.csv'))
+        csv_path = os.path.join(config['output_dir'], config['output_name'].replace('.mp4', '_metrics.csv'))
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(
                 f, fieldnames=['cam', 'cam_frame', 'source_frame', 'absolute_frame',
@@ -1828,7 +1804,7 @@ def main():
             writer.writerows(all_track_data)
         print(f"CSV 輸出：{csv_path}")
 
-    _write_homography_visualizations(CAMERAS, OUTPUT_DIR, track_data=all_track_data)
+    _write_homography_visualizations(CAMERAS, config['output_dir'], track_data=all_track_data)
 
     print(f"\n{'='*60}")
     print(f"全部完成：總寫入 {total_written} 幀，總捨棄 {total_skipped} 幀")

@@ -144,7 +144,7 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False, bbox_csv
                 if bboxs_pre is None:
                     # No person detected in the first frame(s)
                     continue
-                bboxs = bboxs_pre
+                bboxs = np.array(bboxs_pre)
                 scores = scores_pre
             else:
                 bboxs_pre = copy.deepcopy(bboxs) 
