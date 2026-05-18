@@ -697,6 +697,11 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
     all_orig_frames = []
     output_frame_idx = 0
 
+    # 跨所有相機累積，每幀記錄 (off_x, off_y)、原始幀號、所屬相機 index
+    all_offsets     = []
+    all_orig_frames = []
+    all_cam_indices = []
+
     for cam_idx, (cam, cap) in enumerate(zip(cameras, caps)):
         if not cap.isOpened():
             raise ValueError(f"無法開啟相機 {cam_idx+1}: {cam['video_path']}")
@@ -812,6 +817,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     })
                 all_offsets.append([off_x, off_y])
                 all_orig_frames.append(source_frame)
+                all_cam_indices.append(cam_idx)
             cam_written += 1
             total_written += 1
             output_frame_idx += 1
@@ -844,7 +850,6 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 )
                 cam_interpolated += 1
             pending_missing.clear()
-
         if not dry_run:
             print(f"  [處理中...]")
 
@@ -1043,6 +1048,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             offsets_path,
             offsets=np.array(all_offsets, dtype=np.int32),
             orig_frames=np.array(all_orig_frames, dtype=np.int32),
+            cam_indices=np.array(all_cam_indices, dtype=np.int32),
         )
         print(f"  Offsets: {offsets_path}")
 

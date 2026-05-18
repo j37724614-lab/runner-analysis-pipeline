@@ -51,50 +51,13 @@ try:
 except Exception:
     pass
 
-# -----------------------------------------------------------------------
-# 執行緒限制環境變數（在 import cv2/torch 之前設定）
-# NumPy / PyTorch / OpenCV 底層的 BLAS/OpenMP/MKL 預設啟動多執行緒，
-# 在 RLIMIT_NPROC 受限環境下容易觸發 segfault，統一限制為 1。
-# -----------------------------------------------------------------------
-_THREAD_ENV = {
-    "OPENBLAS_NUM_THREADS":          "1",
-    "OMP_NUM_THREADS":               "1",
-    "MKL_NUM_THREADS":               "1",
-    "NUMEXPR_NUM_THREADS":           "1",
-    "GOMP_SPINCOUNT":                "0",
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS": "threads;1",
-}
-for _k, _v in _THREAD_ENV.items():
-    os.environ.setdefault(_k, _v)
-
-# =======================================================================
-# 路徑設定（以此腳本所在目錄為 repo 根目錄）
-# =======================================================================
-BASE_DIR = Path(__file__).resolve().parent       # repo 根目錄
-
-# Step 1：追蹤腳本路徑與輸出目錄
-TRACK_SCRIPT  = BASE_DIR / "scripts" / "tracking" / "track_crop_roi.py"
-TRACK_OUT_DIR = BASE_DIR / "output_cut"
-TRACK_MARKER  = TRACK_OUT_DIR / ".last_output_name"
-
-# Step 2：vis.py 所在的 MotionAGFormer 目錄（使用 sys.path 插入後 import）
-MOTION_AG_DIR = BASE_DIR / "MotionAGFormer"
-
-# Step 3：角度疊加腳本
-OVERLAY_SCRIPT = BASE_DIR / "scripts" / "visualization" / "add_angle_overlay.py"
-
-# =======================================================================
-# 確保 MotionAGFormer 加入 sys.path，以便直接 import
-# （vis.py 本身會再插一次，這裡做防呆）
-# =======================================================================
-if str(MOTION_AG_DIR) not in sys.path:
-    sys.path.insert(0, str(MOTION_AG_DIR))
+# Configuration will be determined dynamically in run_pipeline()
 
 
 # -----------------------------------------------------------------------
 # 延遲 import：只在真正需要時才載入 GPU-heavy 的函式庫
 # -----------------------------------------------------------------------
-def _import_vis():
+def _import_vis(motion_ag_dir: Path):
     """Import run_pose_estimation from vis.py（延遲載入）。
 
     vis.py 的 module-level import 需要兩個目錄同時在 sys.path：
@@ -104,8 +67,11 @@ def _import_vis():
     """
     import importlib.util
 
-    demo_dir = str(MOTION_AG_DIR / "demo")
-    mag_dir  = str(MOTION_AG_DIR)
+    demo_dir = str(motion_ag_dir / "demo")
+    mag_dir  = str(motion_ag_dir)
+
+    if mag_dir not in sys.path:
+        sys.path.insert(0, mag_dir)
 
     # 確保兩個路徑都在 sys.path 最前面（移除舊的再重插）
     for p in [mag_dir, demo_dir]:
@@ -115,18 +81,18 @@ def _import_vis():
     sys.path.insert(0, demo_dir)  # position 0: MotionAGFormer/demo/ (優先，讓 lib/ 被找到)
 
     spec = importlib.util.spec_from_file_location(
-        "vis", str(MOTION_AG_DIR / "demo" / "vis.py")
+        "vis", str(motion_ag_dir / "demo" / "vis.py")
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.run_pose_estimation
 
 
-def _import_overlay():
+def _import_overlay(overlay_script: Path):
     """Import add_angle_overlay function（延遲載入）。"""
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "add_angle_overlay", str(OVERLAY_SCRIPT)
+        "add_angle_overlay", str(overlay_script)
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -137,7 +103,7 @@ def _import_overlay():
 # 各步驟 Python 函式
 # =======================================================================
 
-def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str) -> str:
+def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, track_script: Path, output_dir: str) -> str:
     """
     Step 1：執行 YOLO 多相機追蹤與人物置中裁剪。
 
@@ -165,7 +131,7 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str) -> str:
 
     # 動態載入 track_crop_roi 模組
     spec = importlib.util.spec_from_file_location(
-        "track_crop_roi", str(TRACK_SCRIPT)
+        "track_crop_roi", str(track_script)
     )
     tcr = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tcr)
@@ -188,6 +154,7 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str) -> str:
     if not CAMERAS:
         raise ValueError("所有相機的 video_path 均為 None，請至少設定一台。")
 
+    tcr.OUTPUT_DIR = output_dir
     OUTPUT_DIR = tcr.OUTPUT_DIR
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -243,13 +210,13 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str) -> str:
 
 
 def step2_pose(tracked_video_path: str, output_base_dir: str,
-               only_2d: bool, gpu: str, skip_video: bool = False) -> str:
+               only_2d: bool, gpu: str, motion_ag_dir: Path, skip_video: bool = False) -> str:
     """
     Step 2：執行 2D/3D 姿態估計 + 關節角度計算。
 
     直接 import vis.run_pose_estimation 呼叫，不再透過 subprocess。
 
-    参數：
+    參數：
         tracked_video_path  str   Step 1 輸出的影片路徑
         output_base_dir     str   輸出根目錄；結果放在 {output_base_dir}/{video_stem}/
         only_2d             bool  True → 只跑 2D
@@ -259,11 +226,14 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
         output_dir  str   此次結果目錄
     """
     # 延遲載入，避免 import 時就吃 GPU 記憶體
-    run_pose_estimation = _import_vis()
+    run_pose_estimation = _import_vis(motion_ag_dir)
 
     video_stem = Path(tracked_video_path).stem
     output_dir = os.path.join(output_base_dir, video_stem) + "/"
     os.makedirs(output_dir, exist_ok=True)
+    
+    abs_video_path = os.path.abspath(tracked_video_path)
+    abs_output_dir = os.path.abspath(output_dir)
 
     print("=" * 60)
     print(f"Step 2 — 姿態估計（{'2D only' if only_2d else '2D + 3D + 角度'}）")
@@ -278,11 +248,11 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
     _saved_argv = sys.argv[:]
     _saved_cwd  = os.getcwd()
     sys.argv = [sys.argv[0]]
-    os.chdir(str(MOTION_AG_DIR))
+    os.chdir(str(motion_ag_dir))
     try:
         run_pose_estimation(
-            video_path=tracked_video_path,
-            output_dir=output_dir,
+            video_path=abs_video_path,
+            output_dir=abs_output_dir,
             only_2d=only_2d,
             gpu=gpu,
             skip_video=skip_video,
@@ -295,7 +265,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
     return output_dir
 
 
-def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None:
+def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str, overlay_script: Path) -> str | None:
     """
     Step 3：將 2D 骨架影片與 4 個角度折線圖合併為單一影片。
 
@@ -330,7 +300,7 @@ def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None
     print(f"  角度 CSV: {csv_path}")
     print(f"  輸出: {output}")
 
-    add_angle_overlay = _import_overlay()
+    add_angle_overlay = _import_overlay(overlay_script)
     add_angle_overlay(video_path=video_2d, csv_path=csv_path, output_path=output)
 
     print(f"\nStep 3 完成：{output}\n")
@@ -349,6 +319,11 @@ def run_pipeline(
     only_2d: bool = False,
     skip_track: bool = False,
     skip_video: bool = False,
+    base_dir: str = None,
+    track_script: str = None,
+    motion_ag_dir: str = None,
+    overlay_script: str = None,
+    limit_threads: bool = True
 ) -> dict:
     """
     執行完整的跑者分析流程。
@@ -388,6 +363,44 @@ def run_pipeline(
     if extra_cfg is None:
         extra_cfg = {}
 
+    if limit_threads:
+        _THREAD_ENV = {
+            "OPENBLAS_NUM_THREADS":          "1",
+            "OMP_NUM_THREADS":               "1",
+            "MKL_NUM_THREADS":               "1",
+            "NUMEXPR_NUM_THREADS":           "1",
+            "GOMP_SPINCOUNT":                "0",
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS": "threads;1",
+        }
+        for _k, _v in _THREAD_ENV.items():
+            os.environ.setdefault(_k, _v)
+
+    if base_dir is None:
+        base_dir_path = Path(__file__).resolve().parent
+    else:
+        base_dir_path = Path(base_dir)
+
+    if track_script is None:
+        track_script_path = base_dir_path / "scripts" / "tracking" / "track_crop_roi.py"
+    else:
+        track_script_path = Path(track_script)
+        
+    if motion_ag_dir is None:
+        motion_ag_dir_path = base_dir_path / "MotionAGFormer"
+    else:
+        motion_ag_dir_path = Path(motion_ag_dir)
+        
+    if overlay_script is None:
+        overlay_script_path = base_dir_path / "scripts" / "visualization" / "add_angle_overlay.py"
+    else:
+        overlay_script_path = Path(overlay_script)
+
+    if not output_dir:
+        if cameras and len(cameras) > 0 and cameras[0].get("video_path"):
+            output_dir = str(Path(cameras[0]["video_path"]).parent)
+        else:
+            output_dir = str(base_dir_path / "output_cut")
+
     print("\n" + "=" * 60)
     print(f"run_pipeline — 跑者分析完整流程")
     print(f"  GPU: {gpu}")
@@ -402,7 +415,7 @@ def run_pipeline(
     # ------------------------------------------------------------------
     if skip_track:
         # 從 marker 取得已存在的追蹤影片
-        marker_dir = Path(output_dir) if output_dir else TRACK_OUT_DIR
+        marker_dir = Path(output_dir)
         marker_path = marker_dir / ".last_output_name"
         if not marker_path.exists():
             raise FileNotFoundError(
@@ -419,37 +432,34 @@ def run_pipeline(
     else:
         if cameras:
             # 從傳入的 cameras 清單執行
-            tracked_video = step1_track(cameras, extra_cfg, gpu)
+            tracked_video = step1_track(cameras, extra_cfg, gpu, track_script_path, output_dir)
         else:
             # 沿用硬編碼設定：以 subprocess 呼叫（保留 track_crop_roi 原有行為）
             import subprocess
-            cmd = [sys.executable, str(TRACK_SCRIPT)]
+            cmd = [sys.executable, str(track_script_path)]
             subprocess.run(
                 cmd,
                 env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu},
                 check=True,
             )
-            video_name    = TRACK_MARKER.read_text().strip()
-            tracked_video = str(TRACK_OUT_DIR / video_name)
+            marker_path = Path(output_dir) / ".last_output_name"
+            video_name    = marker_path.read_text().strip()
+            tracked_video = str(Path(output_dir) / video_name)
 
     video_stem = Path(tracked_video).stem
 
     # ------------------------------------------------------------------
     # Step 2：姿態估計
     # ------------------------------------------------------------------
-    if output_dir:
-        # 如果有指定 output_dir，直接把 pose estimation 結果存在這
-        pose_base = output_dir
-    else:
-        pose_base = str(MOTION_AG_DIR / "demo" / "output")
+    pose_base = output_dir
         
-    pose_out_dir  = step2_pose(tracked_video, pose_base, only_2d, gpu, skip_video=skip_video)
+    pose_out_dir  = step2_pose(tracked_video, pose_base, only_2d, gpu, motion_ag_dir_path, skip_video=skip_video)
 
     # ------------------------------------------------------------------
     # Step 3：角度疊加
     # ------------------------------------------------------------------
     if not skip_video:
-        overlay_video = step3_overlay(pose_out_dir, video_stem, gpu)
+        overlay_video = step3_overlay(pose_out_dir, video_stem, gpu, overlay_script_path)
     else:
         overlay_video = None
 
@@ -496,11 +506,11 @@ def _parse_args():
     return parser.parse_args()
 
 
-def main():
+def main(default_cameras=None, default_extra_cfg=None):
     args = _parse_args()
 
-    cameras   = []
-    extra_cfg = {}
+    cameras   = default_cameras if default_cameras is not None else []
+    extra_cfg = default_extra_cfg if default_extra_cfg is not None else {}
 
     # 解析相機設定
     if args.config_json:
@@ -534,4 +544,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 您可以在這裡直接設定預設的相機參數供單獨執行時使用
+    default_cameras = [
+        {
+            "video_path": "test/test/cam1.mov",
+            "crop": [0, 400, 1920, 800],
+            "start_line": [[208, 715], [123, 725]],
+            "end_line": [[1760, 710], [1830, 718]],
+            "distance_m": 20
+        },
+        # {
+        #     "video_path": "test/test/cam2.mov",
+        #     "crop": [0, 400, 1920, 800],
+        #     "start_line": [[208, 715], [123, 725]],
+        #     "end_line": [[1760, 710], [1830, 718]],
+        #     "distance_m": 20
+        # }
+    ]
+    main(default_cameras=default_cameras)

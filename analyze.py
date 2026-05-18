@@ -20,7 +20,14 @@ except ImportError:
     print("找不到 run_pipeline.py，請確保 analyze.py 與其在同一目錄下。")
     sys.exit(1)
 
-def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_dest=None):
+# 載入 overlay_original 的主要函數
+try:
+    from overlay_original import overlay_videos
+except ImportError:
+    print("找不到 overlay_original.py，請確保 analyze.py 與其在同一目錄下。")
+    sys.exit(1)
+
+def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_dest=None, progress_callback=None):
     """
     執行完整分析流程：運動表現分析 (Phase 1) + 生物力學分析 (Phase 2) + 原影片疊加 (Phase 3)。
     
@@ -53,8 +60,11 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     print("【階段一】運動表現分析 (track_runners.py) — 速度與加速度")
     print("=" * 60)
     
+    if progress_callback: progress_callback(5)
+    
     if not skip_track:
-        track_cmd = [sys.executable, "track_runners.py"]
+        track_script = os.path.join(os.path.dirname(__file__), "track_runners.py")
+        track_cmd = [sys.executable, track_script]
         track_config = config_dict.copy()
         track_config["gpu"] = gpu
         track_config["skip_video"] = True  # 階段一不產生影片
@@ -70,9 +80,13 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     else:
         print("使用者指定 skip_track，略過運動表現分析影片生成。")
 
+    if progress_callback: progress_callback(30)
+
     print("\n" + "=" * 60)
     print("【階段二】生物力學分析 (run_pipeline.py) — 姿態與關節角度")
     print("=" * 60)
+    
+    if progress_callback: progress_callback(40)
     
     result = run_pipeline(
         cameras=cameras,
@@ -83,6 +97,8 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         skip_track=skip_track,
         skip_video=True, # 階段二不產生中間過程影片
     )
+    
+    if progress_callback: progress_callback(80)
     
     import shutil
     
@@ -126,7 +142,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     if tracked_video:
         video_stem = Path(tracked_video).stem
         angle_csv_orig = os.path.join(final_pose_dir, "pred_3D", "angles", f"{video_stem}_angles.csv")
-        
+
         if os.path.exists(angle_csv_orig) and output_dest:
             angle_csv_dest = os.path.join(output_dest, "angles.csv")
             try:
@@ -137,92 +153,118 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         elif os.path.exists(angle_csv_orig):
             angle_csv_dest = angle_csv_orig
             print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig}")
-            
+
     # 【階段三】產出原比例骨架與標線影片
     output_uncropped = None
     if cameras:
-        orig_video = cameras[0].get('video_path')
-        if orig_video:
-            orig_stem = Path(orig_video).stem
-            offsets_npz = os.path.join(output_dest, f"{orig_stem}_offsets.npz")
-            kps_npz = os.path.join(final_pose_dir, "input_2D", "keypoints.npz")
-            output_uncropped = os.path.join(output_dest, f"{orig_stem}_uncropped_2D.mp4")
-            
-            if os.path.exists(offsets_npz) and os.path.exists(kps_npz):
-                print("\n" + "=" * 60)
-                print("【階段三】匯出未裁切之原比例骨架影片")
-                print("=" * 60)
-                overlay_cmd = [
-                    sys.executable, "overlay_original.py",
-                    "--orig_video", orig_video,
-                    "--offsets_npz", offsets_npz,
-                    "--kps_npz", kps_npz,
-                    "--config_json", json.dumps(config_dict),
-                    "--output_video", output_uncropped
+        orig_stem = Path(cameras[0]['video_path']).stem
+        offsets_npz = os.path.join(output_dest, f"{orig_stem}_offsets.npz")
+        kps_npz = os.path.join(final_pose_dir, "input_2D", "keypoints.npz")
+        output_uncropped = os.path.join(output_dest, f"{orig_stem}_uncropped_2D.mp4")
+
+        if os.path.exists(offsets_npz) and os.path.exists(kps_npz):
+            if progress_callback: progress_callback(90)
+            print("\n" + "=" * 60)
+            print("【階段三】匯出未裁切之原比例骨架影片")
+            print("=" * 60)
+            try:
+                overlay_videos(
+                    cameras=cameras,
+                    offsets_npz=offsets_npz,
+                    kps_npz=kps_npz,
+                    output_video=output_uncropped,
+                    config=config_dict,
+                )
+                print(f"\n  ▶ 原尺寸未裁切骨架疊加影片: {output_uncropped}")
+
+                # 轉換為網頁相容格式 (加入 metadata / faststart)
+                print("\n  ▶ 正在轉換影片格式以支援網頁播放...")
+                web_output = os.path.join(output_dest, f"{orig_stem}_uncropped_2D_web.mp4")
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-i", output_uncropped,
+                    "-c:v", "libx264", "-preset", "fast",
+                    "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p",
+                    web_output
                 ]
                 try:
-                    subprocess.run(overlay_cmd, check=True)
-                    print(f"\n  ▶ 原尺寸未裁切骨架疊加影片: {output_uncropped}")
-                    
-                    # 清理中間過程產生的影片檔案
-                    print("\n  ▶ 正在清理中間過程影片...")
-                    if os.path.exists(tracked_video):
-                        os.remove(tracked_video)
-                        print(f"    - 已移除追蹤影片: {tracked_video}")
-                    
+                    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    os.replace(web_output, output_uncropped)
+                    print(f"  ▶ 影片已成功轉換為網頁相容格式")
                 except subprocess.CalledProcessError as e:
-                    print(f"匯出未裁切影片失敗: {e}")
+                    print(f"  ▶ 影片轉換失敗: {e}")
+
+                # 清理中間過程產生的影片檔案
+                print("\n  ▶ 正在清理中間過程影片...")
+                if tracked_video and os.path.exists(tracked_video):
+                    os.remove(tracked_video)
+                    print(f"    - 已移除追蹤影片: {tracked_video}")
+
+            except Exception as e:
+                print(f"匯出未裁切影片失敗: {e}")
+
 
     print("\n" + "=" * 60)
+    
+    if progress_callback: progress_callback(100)
+    
+    total_time = None
+    avg_velocity = None
+    avg_acceleration = None
+    avg_step_length = None ## TODO: add step length
+
+    if os.path.exists(metrics_csv_dest):
+        import pandas as pd
+        import cv2
+        try:
+            df = pd.read_csv(metrics_csv_dest)
+            if not df.empty:
+                fps_val = 60.0
+                if cameras and cameras[0].get('video_path'):
+                    cap = cv2.VideoCapture(cameras[0]['video_path'])
+                    if cap.isOpened():
+                        fps_val = cap.get(cv2.CAP_PROP_FPS) or 60.0
+                        cap.release()
+                
+                total_time = float((df["absolute_frame"].max() + 1) / fps_val)
+                avg_velocity = float(df["speed_mps"].mean())
+                avg_acceleration = float(df["accel_mps2"].mean())
+        except Exception as e:
+            print(f"Failed to calculate metrics: {e}")
+
     return {
         "metrics_csv": metrics_csv_dest,
         "angles_csv": angle_csv_dest,
-        "uncropped_video": output_uncropped
+        "uncropped_video": output_uncropped,
+        "total_time": total_time,
+        "avg_velocity": avg_velocity,
+        "avg_acceleration": avg_acceleration,
+        "avg_step_length": avg_step_length
     }
 
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="一鍵執行速度分析與姿態角度分析"
-    )
-    parser.add_argument("--gpu",         type=str, default="0",
-                        help="CUDA GPU 編號（預設: 0）")
-    parser.add_argument("--2d_only",     dest="two_d_only", action="store_true",
-                        help="只跑 2D 骨架，跳過 3D 與角度計算")
-    parser.add_argument("--skip-track",  dest="skip_track", action="store_true",
-                        help="略過 Step 1 追蹤（當追蹤影片已存在時使用）")
-    parser.add_argument("--config",      type=str, default=None,
-                        help="相機設定 YAML 路徑")
-    parser.add_argument("--config-json", dest="config_json", type=str, default=None,
-                        help="相機設定 JSON 字串")
-    parser.add_argument("--output-dest", dest="output_dest", type=str, default=None,
-                        help="最終姿態分析輸出目錄")
-    return parser.parse_args()
+if __name__ == "__main__":
+    # 在此處直接定義設定參數 (config_dict)，取代原本的 --config / --config-json 命令列輸入
+    config_dict = {
+        "cameras": [
+            {
+                "video_path": "test/test/cam1.mov", # 請替換為實際的影片路徑
+            },
+            {
+                "video_path": "test/test/cam2.mov", # 請替換為實際的影片路徑
+            }
+        ]
+        # 若有其他全域設定參數可加在此處
+    } 
 
-def main():
-    args = _parse_args()
-    
-    config_dict = {}
-    if args.config_json:
-        try:
-            config_dict = json.loads(args.config_json)
-        except json.JSONDecodeError as e:
-            print(f"錯誤：--config-json 格式錯誤：{e}")
-            sys.exit(1)
-    elif args.config:
-        with open(args.config, encoding="utf-8") as f:
-            config_dict = yaml.safe_load(f)
-    
-    if not config_dict and not args.skip_track:
-        print("請提供 --config 或 --config-json")
-        sys.exit(1)
+    # config_dict = {'cameras': [{'video_path': '/home/hsuanya/workspace/running_analysis/backend/data/run_sessions/00399f18-1d1b-40b6-a247-5b44847fa579/c43dcfd1-01fa-4bbc-b11b-71c5a65d696c/cam1.mov',
+    #  'start_line': [[177, 710], [77, 725]],
+    #   'end_line': [[1752, 698], [1866, 717]],
+    #    'distance_m': 20.0}]}
 
     run_analysis(
         config_dict=config_dict,
-        gpu=args.gpu,
-        only_2d=args.two_d_only,
-        skip_track=args.skip_track,
-        output_dest=args.output_dest
+        gpu="0",              # CUDA GPU 編號
+        only_2d=False,        # 是否只跑 2D 骨架
+        skip_track=False,     # 是否略過 Step 1 追蹤
+        output_dest=None      # 最終輸出目錄 (設為 None 則預設為第一支影片所在目錄)
     )
-
-if __name__ == "__main__":
-    main()
