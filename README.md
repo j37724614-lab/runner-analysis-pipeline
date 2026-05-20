@@ -9,29 +9,26 @@
 ```
 輸入影片（多台相機）
     │
-    ▼ Step 1 track_crop_roi.py
-  YOLO 追蹤最快跑者，裁剪並合併成單一影片
+    ▼ Step 1 [Phase 1] (core.tracking / track_runners.py)
+  YOLO 追蹤最快跑者，分析速度與加速度，裁剪並合併影片
     │
-    ▼ Step 2
-  自動複製影片到 vis.py 輸入目錄
-    │
-    ▼ Step 3 vis.py
+    ▼ Step 2 [Phase 2] (core.pipeline / run_pipeline.py)
   HRNet 2D 姿態估計 + MotionAGFormer 3D 重建 + 關節角度計算
     │
-    ▼ Step 4 add_angle_overlay.py
-  2D 骨架影片 + 4 個角度折線圖合併輸出
+    ▼ Step 3 [Phase 3] (core.visualization / core.overlay)
+  將 2D 骨架影片與 4 個角度折線圖合併輸出，並於原影片還原原比例骨架疊加
     │
-    ▼ 輸出
-  _2D.mp4 / .mp4 / _2D_angles.mp4 / _angles.csv
+    ▼ 輸出 (網頁播放相容格式)
+  cam1_uncropped_2D.mp4 / metrics.csv / angles.csv
 ```
 
 ---
 
 ## 系統需求
 
-- Python 3.11
+- Python 3.10 / 3.11
 - CUDA GPU（建議 8GB VRAM 以上）
-- ffmpeg（用於 MOV → MP4 轉換，需另行安裝）
+- ffmpeg（用於影片網頁轉碼與 MOV 轉檔，需另行安裝）
 
 ```bash
 # 安裝 Python 套件
@@ -43,49 +40,67 @@ sudo apt install ffmpeg
 
 ---
 
-## 目錄結構
+## 新目錄結構 (重構後)
 
 ```
 runner-analysis-pipeline/
-├── run_pipeline.py                  ← 主程式（從這裡執行）
-├── example_config.yaml              ← 相機設定範例
+├── analyze.py                       ← [入口] 綜合一鍵分析 CLI (調用 core.pipeline)
+├── run_pipeline.py                  ← [入口] 跑者分析生物力學 CLI (調用 core.pipeline)
+├── track_runners.py                 ← [入口] 速度與加速度追蹤 CLI (調用 core.tracker)
+├── example_config.yaml              ← 相機設定範例 (YAML 格式)
 ├── requirements.txt                 ← Python 套件清單
-├── convert_mov_to_mp4.py            ← iPhone MOV 轉 MP4 工具
-├── yolo11x.pt                       ← YOLO 權重（見下方下載說明）
-├── output_cut/                      ← Step 1 輸出目錄（自動建立）
-├── scripts/
+│
+├── core/                            ← [新增] 核心實作模組套件
+│   ├── __init__.py                  ← 暴露主要 Package API 介面
+│   ├── pipeline.py                  ← 整合生物力學分析與一鍵分析之核心排程引擎
+│   ├── tracker.py                   ← 提取自 track_runners 的 Kalman 濾波與速度追蹤
+│   ├── overlay.py                   ← 提取自 overlay_original 的原比例骨架疊加核心
+│   ├── visualization.py             ← 提取自 add_angle_overlay 的角度折線圖合併模組
+│   └── utils.py                     ← 共享基礎函式 (動態資源定位、中文字型配置、FFmpeg 網頁轉碼)
+│
+├── assets/                          ← [新增] 靜態資源目錄
+│   └── fonts/
+│       └── ChineseFont.ttf          ← 移入此處 (中文字型檔)
+│
+├── models/                          ← [新增] 模型權重目錄
+│   ├── yolo11x.pt                   ← YOLOv11 權重
+│   └── yolo26x.pt                   ← YOLO26x 權重 (由根目錄移入)
+│
+├── scripts/                         ← 輔助腳本目錄
 │   ├── tracking/
-│   │   └── track_crop_roi.py
-│   └── visualization/
-│       └── add_angle_overlay.py
-└── MotionAGFormer/
-    ├── checkpoint/                  ← AGFormer 權重（見下方下載說明）
-    │   └── motionagformer-l-h36m.pth.tr
-    ├── demo/
-    │   ├── vis.py
-    │   ├── video/                   ← Step 2 自動放置輸入影片
-    │   └── lib/
-    │       └── checkpoint/          ← HRNet + YOLOv3 權重（見下方下載說明）
-    │           ├── pose_hrnet_w48_384x288.pth
-    │           ├── h36m_sh_conf_cam_source_final.pkl
-    │           └── yolov3.weights
-    ├── model/
-    └── configs/
+│   │   └── track_crop_roi.py        ← YOLO 追蹤與裁剪
+│   ├── visualization/
+│   │   └── add_angle_overlay.py     ← 角度圖表合併
+│   └── utilities/                   ← [新增] 獨立實用工具目錄
+│       ├── convert_mov_to_mp4.py    ← iPhone MOV 轉 MP4 工具 (由根目錄移入)
+│       └── extract_frames.py        ← 影片提取影格工具 (由根目錄移入)
+│
+└── MotionAGFormer/                  ← 第三方 3D 重建套件目錄 (完全保留未修改)
+    ├── checkpoint/                  ← MotionAGFormer-L 權重 (motionagformer-l-h36m.pth.tr)
+    └── demo/
+        ├── vis.py                   ← 姿態預測入口
+        └── lib/
+            └── checkpoint/          ← HRNet + YOLOv3 權重 (pose_hrnet_w48_384x288.pth 等)
 ```
 
 ---
 
-## 模型權重下載
+## 模型權重下載與放置
 
 執行前必須手動下載以下權重檔並放置於對應目錄。
 
-### 1. `yolo11x.pt` → 放在根目錄
+### 1. YOLO 權重 → 放在 `models/` 目錄下
 
 從本 repo 的 [Releases](https://github.com/j37724614-lab/runner-analysis-pipeline/releases) 頁面下載：
+- `yolo11x.pt`
+- `yolo26x.pt`
 
+下載後放置：
 ```
 runner-analysis-pipeline/
-└── yolo11x.pt   ← 放這裡
+└── models/
+    ├── yolo11x.pt   ← 放這裡
+    └── yolo26x.pt   ← 放這裡
 ```
 
 ---
@@ -128,14 +143,12 @@ MotionAGFormer/demo/lib/checkpoint/
 
 ### 第一步：（選用）iPhone MOV 轉 MP4
 
-若影片為 iPhone 拍攝的 `.MOV` 格式，先用工具轉換：
+若影片為 iPhone 拍攝的 `.MOV` 格式，可利用 `scripts/utilities/` 中的工具轉換：
 
 ```bash
-# 編輯 convert_mov_to_mp4.py，在 video_list 填入你的 MOV 路徑，然後執行：
-python convert_mov_to_mp4.py
+# 執行轉換指令 (請先編輯 convert_mov_to_mp4.py 修改輸入檔案清單)
+python scripts/utilities/convert_mov_to_mp4.py
 ```
-
-轉換後會在同目錄產生同名的 `.mp4` 檔案。
 
 ---
 
@@ -151,156 +164,66 @@ cp example_config.yaml my_config.yaml
 
 ```yaml
 cameras:
-  - video_path: /path/to/camera1.mp4
-    crop: [0, 450, 1920, 800]   # [x起, y起, x終, y終]
-    roi_x: [150, 1820]
-    switch_x: 1800
+  - video_path: test/test/cam1.mov
+    crop: [0, 400, 1920, 800]
+    start_line: [[222, 715], [148, 725]]
+    end_line: [[1700, 710], [1790, 718]]
+    distance_m: 20.0
 
-  - video_path: /path/to/camera2.mp4
-    crop: [0, 450, 1920, 800]
-    roi_x: [150, 1820]
-    switch_x: 1800
-
-# 自動決定裁剪尺寸（建議第一次使用時開啟）
-auto_crop: true
+  - video_path: test/test/cam2.mov
+    crop: [0, 400, 1920, 800]
+    start_line: [[220, 715], [135, 725]]
+    end_line: [[1730, 710], [1825, 725]]
+    distance_m: 20.0
 ```
 
-> 所有路徑設定均以 repo 根目錄為基準自動推算，**clone 後不需修改任何程式碼**。
+> **注意：** 所有相機與模型資源路徑現在皆已在 `core/utils.py` 中進行「動態根目錄定位 (PathManager)」，因此在任何路徑執行程式皆不會發生路徑找不到的 `FileNotFoundError`。
 
 ---
 
-### 第三步：執行 Pipeline
+### 第三步：執行一鍵分析 (Preferred)
+
+一鍵分析會執行：【運動表現追蹤 (Phase 1)】 + 【姿態與角度估計 (Phase 2)】 + 【原比例原影片骨架疊加 (Phase 3)】，並轉碼為**瀏覽器直接預覽播放之 Web 相容 MP4 影片**：
 
 ```bash
-# 完整流程（GPU 0）
+python analyze.py
+```
+
+您也可以單獨執行姿態與生物力學管線：
+
+```bash
+# 完整姿態流程（GPU 0）
 python run_pipeline.py --config my_config.yaml
 
-# 指定 GPU
-python run_pipeline.py --config my_config.yaml --gpu 0
-
-# 只跑 2D（跳過 3D 與角度，速度較快）
+# 只跑 2D（跳過 3D 與角度以求加速）
 python run_pipeline.py --config my_config.yaml --2d_only
 
-# 略過追蹤（追蹤影片已存在時使用）
+# 略過追蹤（若追蹤影片已存在）
 python run_pipeline.py --config my_config.yaml --skip-track
 ```
 
----
-
-## track_runners.py — 多相機串接追蹤（含速度圖表）
-
-獨立腳本，不依賴完整 Pipeline。多台相機影片依序串接，以 YOLO 追蹤最快跑者，並在畫面下方繪製「距離 / 速度 / 加速度」折線圖，同時輸出逐幀 CSV。
-
-### 輸出
-
-| 檔案 | 說明 |
-|------|------|
-| `{output_dir}/sequential_tracked.mp4` | 串接後的追蹤影片（含速度圖表） |
-| `{output_dir}/sequential_tracked_metrics.csv` | 逐幀距離、速度、加速度數據 |
-
-### 影片路徑輸入方式
-
-預設 `CAM1`–`CAM6` 的 `video_path` 均為 `None`（不執行任何相機），需透過以下其中一種方式指定影片：
-
-**方法 A：直接修改程式碼**（本機快速測試）
-
-編輯 `track_runners.py` 設定區，將 `None` 改為你的影片路徑：
-
-```python
-CAM1 = camera("/your/path/cam1.mp4",
-              crop=(0, 400, 1920, 800),
-              start_line=[(208, 715), (123, 725)],
-              end_line  =[(1760, 710), (1830, 718)],
-              distance_m=20)
-```
-
-然後執行：
+或是單獨執行跑者速度追蹤：
 
 ```bash
 python track_runners.py
 ```
 
-**方法 B：`--config-json`**（推薦，不需修改程式碼）
-
-```bash
-python track_runners.py --config-json '{
-  "gpu": "0",
-  "output_dir": "/path/to/output",
-  "cameras": [
-    {
-      "video_path": "/your/path/cam1.mp4",
-      "crop": [0, 400, 1920, 800],
-      "start_line": [[208, 715], [123, 725]],
-      "end_line":   [[1760, 710], [1830, 718]],
-      "distance_m": 20
-    },
-    {
-      "video_path": "/your/path/cam2.mp4",
-      "crop": [0, 400, 1920, 800],
-      "start_line": [[208, 715], [123, 725]],
-      "end_line":   [[1760, 710], [1830, 718]],
-      "distance_m": 20
-    }
-  ]
-}'
-```
-
-### JSON 欄位說明
-
-**全域參數**
-
-| 欄位 | 型別 | 預設值 | 說明 |
-|------|------|--------|------|
-| `gpu` | string | `"0"` | CUDA GPU 編號 |
-| `output_dir` | string | `output_cut/`（repo 根目錄下） | 輸出目錄 |
-| `output_name` | string | `"sequential_tracked.mp4"` | 輸出影片檔名 |
-| `target_height` | int | `340` | 每台相機畫面縮放高度（px） |
-| `chart_height` | int | `200` | 底部圖表高度（px）；`0` = 不顯示圖表 |
-| `movement_threshold` | int | `2` | 判定移動的最小像素位移 |
-| `min_movement_frames` | int | `3` | 確認為真實移動所需的連續幀數 |
-| `stationary_decay` | int | `2` | 靜止時每幀遞減 movement_count 的量 |
-| `max_person_memory` | int | `30` | 未偵測到幾幀後清除人物追蹤紀錄 |
-
-**每台相機（`cameras` 陣列，最多 6 台）**
-
-| 欄位 | 型別 | 說明 |
-|------|------|------|
-| `video_path` | string | 影片路徑；`null` = 跳過此台 |
-| `crop` | `[x1, y1, x2, y2]` | 前處理裁剪範圍（原始影像座標） |
-| `start_line` | `[[x1,y1],[x2,y2]]` | 起跑線兩端點（原始影像座標） |
-| `end_line` | `[[x3,y3],[x4,y4]]` | 終點線兩端點；與 `start_line` 同時填入時啟用斜線投影模式 |
-| `distance_m` | float | 起終點線間的實際距離（公尺）；填入後才計算速度與圖表 |
-| `roi_x` | `[left, right]` | X 範圍過濾（原始像素） |
-| `roi_y` | `[top, bottom]` | Y 範圍過濾（原始像素） |
-| `switch_x` | int | 跑者 center_x 超過此值時切換到下一台；斜線模式下自動忽略 |
-| `pre_roll_px` | int | 起跑線前的緩衝距離（像素），預設 `200` |
-
 ---
 
-## 輸出檔案
+## 輸出檔案說明
 
-輸出位於 `MotionAGFormer/demo/output/{影片名稱}/`：
+執行 `analyze.py` 一鍵分析完成後，結果會整合輸出在影片所在的同目錄下：
 
-| 檔案 | 說明 |
+| 檔案路徑 | 說明 |
 |------|------|
-| `{name}_2D.mp4` | 2D 骨架疊加影片 |
-| `{name}.mp4` | 2D + 3D 並排影片 |
-| `{name}_2D_angles.mp4` | 2D 影片 + 4 個角度折線圖 |
-| `pred_3D/angles/{name}_angles.csv` | 逐幀關節角度數據 |
-
-角度 CSV 包含以下欄位：
-
-```
-frame, left_knee_angle, right_knee_angle,
-left_hip_angle, right_hip_angle,
-left_elbow_flexion_angle, right_elbow_flexion_angle,
-left_shoulder_flexion, right_shoulder_flexion,
-pelvis_torso_angle
-```
+| `test/test/metrics.csv` | 運動表現數據 (含逐幀速度 `speed_mps`、加速度 `accel_mps2`、累計距離等) |
+| `test/test/angles.csv` | 生物力學關節角度數據 (含膝、髖、肘、肩及骨盆軀幹角度) |
+| `test/test/cam1_uncropped_2D.mp4` | **Web 相容之原尺寸骨架線條與起終點疊加影片** (可用於網頁直接載入) |
+| `test/test/sequential_tracked/` | 包含其餘中間過程生成的 3D 模型資料與圖表數據 |
 
 ---
 
-## 參考來源
+## 參考與感謝
 
 - [MotionAGFormer](https://github.com/TaatiTeam/MotionAGFormer) — 3D 姿態估計模型
 - [MHFormer Demo](https://github.com/Vegetebird/MHFormer) — HRNet + YOLOv3 2D 姿態估計框架

@@ -1,16 +1,8 @@
 """
-overlay_original.py
+core/overlay.py
 
 在原始（未裁切）影片上疊加 2D 骨架與起終點標線，支援多相機串接。
-
-公開 API:
-    overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None)
-        cameras     : list of dict，每個 dict 須含 'video_path' 與可選的 'start_line'/'end_line'
-        offsets_npz : str，track_crop_roi 產出的 .npz 路徑
-                      必須含 'offsets' (N,2)、'orig_frames' (N,)、'cam_indices' (N,) 三個 key
-        kps_npz     : str，MotionAGFormer 產出的 keypoints.npz 路徑
-        output_video: str，輸出影片路徑
-        config      : dict or None，若含 'cameras' 欄位則以此為準（覆蓋 cameras 參數的 start/end_line）
+此模組封裝了原本在根目錄下 overlay_original.py 的核心運算邏輯。
 """
 
 import sys
@@ -19,20 +11,26 @@ import argparse
 import numpy as np
 import cv2
 import yaml
+import json
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
 # 骨架繪製（H36M 17 關節格式）
 # ---------------------------------------------------------------------------
 def show2Dpose_original(kps, img, offset_x, offset_y):
+    """
+    在原始影格上繪製 H36M 17 關節格式的 2D 骨架。
+    使用 offsets 修正回正確的相機原始空間座標。
+    """
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
                    [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
                    [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16]]
 
     LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
 
-    lcolor = (255, 0, 0)   # Blue
-    rcolor = (0, 0, 255)   # Red
+    lcolor = (255, 0, 0)   # Blue (左側)
+    rcolor = (0, 0, 255)   # Red (右側)
     thickness = 3
 
     for j, c in enumerate(connections):
@@ -48,9 +46,10 @@ def show2Dpose_original(kps, img, offset_x, offset_y):
 
 
 # ---------------------------------------------------------------------------
-# 虛線
+# 輔助虛線繪製
 # ---------------------------------------------------------------------------
 def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
+    """在影像上繪製指定長度間隔的虛線。"""
     dx = pt2[0] - pt1[0]
     dy = pt2[1] - pt1[1]
     length = (dx ** 2 + dy ** 2) ** 0.5
@@ -73,9 +72,10 @@ def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8)
 
 
 # ---------------------------------------------------------------------------
-# 在影格上畫起終點線
+# 在影格上畫起終點線與跑道範圍
 # ---------------------------------------------------------------------------
 def _draw_lines(frame, start_line, end_line):
+    """在原始影格上繪製起跑線、終點線以及中間包夾的虛線跑道區間。"""
     if start_line and end_line:
         p0 = (int(start_line[0][0]), int(start_line[0][1]))
         p3 = (int(start_line[1][0]), int(start_line[1][1]))
@@ -84,9 +84,9 @@ def _draw_lines(frame, start_line, end_line):
         for a, b in [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]:
             _draw_dashed_line(frame, a, b, (255, 255, 255), thickness=2)
         cv2.line(frame, p0, p3, (0, 0, 0), 5)
-        cv2.line(frame, p0, p3, (180, 255, 255), 3)  # yellow
+        cv2.line(frame, p0, p3, (180, 255, 255), 3)  # 黃色起跑線
         cv2.line(frame, p1, p2, (0, 0, 0), 5)
-        cv2.line(frame, p1, p2, (255, 200, 100), 3)  # light blue
+        cv2.line(frame, p1, p2, (255, 200, 100), 3)  # 天藍色終點線
     elif start_line:
         pt1 = (int(start_line[0][0]), int(start_line[0][1]))
         pt2 = (int(start_line[1][0]), int(start_line[1][1]))
@@ -169,8 +169,7 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
 
-    print(f"Creating uncropped overlay video: {output_video} ({len(orig_frames)} frames, {num_cams} camera(s))")
-    from tqdm import tqdm
+    print(f"[Core.Overlay] 正在輸出原解析度骨架影片: {output_video} (幀數: {len(orig_frames)}, 相機數: {num_cams})")
 
     # ── 逐幀輸出：按 v_idx 順序，切換相機 VideoCapture ──
     current_cam_idx = -1   # 目前已開啟的相機
@@ -225,13 +224,13 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
     if cap is not None:
         cap.release()
     out.release()
-    print(f"✅ Uncropped overlay video saved to {output_video}")
+    print(f"✅ [Core.Overlay] 原影片骨架疊加完成！儲存至: {output_video}")
 
 
 # ---------------------------------------------------------------------------
-# CLI 入口（保留，以便單獨測試）
+# CLI 參數解析器與入口（供 CLI Wrapper 直接導入呼叫）
 # ---------------------------------------------------------------------------
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--orig_video',   required=True,
                         help="第一台相機影片路徑（單相機模式，或作為 config 比對用）")
@@ -240,13 +239,18 @@ def main():
     parser.add_argument('--config_yaml',  default=None)
     parser.add_argument('--config_json',  default=None)
     parser.add_argument('--output_video', required=True)
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def run_cli(args=None):
+    if args is None:
+        args = parse_args()
+
+    config = None
     if args.config_yaml:
         with open(args.config_yaml, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
     elif args.config_json:
-        import json
         config = json.loads(args.config_json)
     else:
         print("Error: --config_yaml or --config_json is required.")
@@ -267,7 +271,3 @@ def main():
         cameras = [{'video_path': args.orig_video}]
 
     overlay_videos(cameras, args.offsets_npz, args.kps_npz, args.output_video, config=config)
-
-
-if __name__ == '__main__':
-    main()
