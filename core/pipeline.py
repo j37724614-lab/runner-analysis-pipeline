@@ -26,6 +26,10 @@ from core.utils import REPO_ROOT, convert_to_web_compatible_mp4
 from core import tracking as tcr
 from core.visualization import add_angle_overlay
 from core.overlay import overlay_videos
+from scripts.analysis.ankle_step_stride import (
+    annotate_step_stride_video,
+    run_step_stride_analysis,
+)
 
 # -----------------------------------------------------------------------
 # 延遲 import：只在真正需要時才載入 GPU-heavy 的 3D 重建函式庫
@@ -439,6 +443,9 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
             angle_csv_dest = angle_csv_orig
             print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig}")
 
+    avg_step_length = None
+    step_analysis = None
+
     # 【階段三】產出未裁剪、原比例的 skeleton 與線條疊加影片
     output_uncropped = None
     if cameras:
@@ -460,6 +467,33 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     output_video=output_uncropped,
                     config=config_dict,
                 )
+
+                print("\n" + "=" * 60)
+                print("【階段四】步頻與步幅分析")
+                print("=" * 60)
+                step_analysis = run_step_stride_analysis(
+                    config=config_dict,
+                    output_dir=output_dest,
+                    make_video=False,
+                )
+                avg_step_length = step_analysis.get("avg_step_length_m")
+                print(f"  ▶ 腳踝位置資料 (CSV): {step_analysis['ankle_csv']}")
+                print(f"  ▶ 步伐事件資料 (CSV): {step_analysis['steps_csv']}")
+                print(f"  ▶ 偵測步數: {step_analysis['detected_steps']}")
+                if step_analysis.get("avg_cadence_spm") is not None:
+                    print(f"  ▶ 平均步頻: {step_analysis['avg_cadence_spm']:.2f} steps/min")
+                if avg_step_length is not None:
+                    print(f"  ▶ 平均步幅: {avg_step_length:.2f} m")
+
+                tmp_uncropped = output_uncropped.replace(".mp4", "_tmp_steps.mp4")
+                annotate_step_stride_video(
+                    input_video=output_uncropped,
+                    output_video=tmp_uncropped,
+                    ankle_rows=step_analysis["ankle_rows"],
+                    step_events=step_analysis["step_events"],
+                    avg_cadence_spm=step_analysis.get("avg_cadence_spm"),
+                )
+                os.replace(tmp_uncropped, output_uncropped)
                 
                 # 轉碼為 H.264 Web 相容格式，加入 faststart metadata 以支援瀏覽器直接預覽
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
@@ -482,7 +516,6 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     total_time = None
     avg_velocity = None
     avg_acceleration = None
-    avg_step_length = None
 
     # 計算統計指標並回傳
     if os.path.exists(metrics_csv_dest):
@@ -506,6 +539,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         "metrics_csv": metrics_csv_dest,
         "angles_csv": angle_csv_dest,
         "uncropped_video": output_uncropped,
+        "step_analysis": step_analysis,
         "total_time": total_time,
         "avg_velocity": avg_velocity,
         "avg_acceleration": avg_acceleration,

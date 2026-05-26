@@ -96,6 +96,8 @@ MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「真正移�
 STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量, 靜止一幀就讓 movement_count 減 2（快速重置）
 MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄, 30 幀（約 0.5 秒）沒出現就刪除
 MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（前處理裁剪後像素）視為背景遠景人物，略過
+GROUND_POINT_EMA_ALPHA = 0.35  # 與 tracker_impl.py 對齊：bbox 底部中心點平滑係數
+LANE_WIDTH_M = 1.22
 
 
 # -----------------------------------------------------------------------
@@ -125,7 +127,14 @@ def camera(video_path, crop=None,
            roi_x=(0, 9999), roi_y=(0, 9999),
            switch_x=None, roi_zones=None,
            start_line=None, end_line=None,
-           pre_roll_px=200):
+           pre_roll_px=200,
+           end_roll_px=120,
+           start_roi_px=100,
+           homography_lane_margin_px=80,
+           distance_m=None,
+           H_matrix=None,
+           homography_src_points=None,
+           homography_dst_world=None):
     """
     start_line / end_line（可選）：各由兩個原始影像座標點組成的斜線，
       例如 start_line=[(150, 420), (150, 780)]。
@@ -157,12 +166,33 @@ def camera(video_path, crop=None,
             dtype=np.float32
         )
 
+    homography_start_x = None
+    if H_matrix is not None:
+        if start_line is not None:
+            start_world = [_transform_point_homography(pt, H_matrix) for pt in start_line]
+            if all(p is not None for p in start_world):
+                homography_start_x = float(np.mean([p[0] for p in start_world]))
+        elif roi_x[0] != 0 or roi_y[0] != 0:
+            start_world = _transform_point_homography((roi_x[0], roi_y[0]), H_matrix)
+            if start_world is not None:
+                homography_start_x = float(start_world[0])
+        else:
+            homography_start_x = 0.0
+
+    if homography_src_points is not None:
+        src_arr = np.asarray(homography_src_points, dtype=np.float32)
+        if len(src_arr) >= 6:
+            quad_roi = np.array([src_arr[0], src_arr[1], src_arr[4], src_arr[5]], dtype=np.float32)
+        elif len(src_arr) == 5:
+            quad_roi = np.array([src_arr[0], src_arr[1], src_arr[3], src_arr[4]], dtype=np.float32)
+
     return {
         'video_path':  video_path,
         'crop_params': crop,
         'roi_enabled': not no_roi,
         'roi_zones':   zones,
         'switch_x':    switch_x,
+        'distance_m':  distance_m,
         # 斜線模式欄位（舊模式均為 None）
         'start_line':  start_line,
         'end_line':    end_line,
@@ -171,11 +201,24 @@ def camera(video_path, crop=None,
         'track_dir':   track_dir,
         'pixel_span':  pixel_span,
         'quad_roi':    quad_roi,
+        'homography_lane_margin_px': homography_lane_margin_px,
         'track_roi':   {'start_mid':   start_mid,
                         'track_dir':   track_dir,
                         'pixel_span':  pixel_span,
-                        'pre_roll_px': pre_roll_px}
+                        'pre_roll_px': pre_roll_px,
+                        'end_roll_px': end_roll_px,
+                        'start_roi_px': start_roi_px}
                        if start_mid is not None and track_dir is not None else None,
+        'H_matrix':    H_matrix,
+        'homography_start_x': homography_start_x,
+        'homography_src_points': (
+            np.asarray(homography_src_points, dtype=np.float32)
+            if homography_src_points is not None else None
+        ),
+        'homography_dst_world': (
+            np.asarray(homography_dst_world, dtype=np.float32)
+            if homography_dst_world is not None else None
+        ),
     }
 # -----------------------------------------------------------------------
 # 相機設定（最多 6 台）
@@ -229,6 +272,22 @@ def _build_camera_from_entry(entry):
     el = entry.get('end_line')
     start_line = [tuple(p) for p in sl] if sl else None
     end_line   = [tuple(p) for p in el] if el else None
+    H_matrix = None
+    src_pts = entry.get('homography_src_points') or entry.get('src_points')
+    dst_pts = (
+        entry.get('homography_dst_world') or
+        entry.get('homography_dst_points_world')
+    )
+    if src_pts is not None and dst_pts is None and entry.get('start_meter') is not None:
+        dst_pts = build_lane_world_points(
+            float(entry['start_meter']),
+            num_points=len(src_pts),
+        )
+    if src_pts is not None and dst_pts is not None:
+        H_matrix, _ = _compute_homography(src_pts, dst_pts)
+    distance_m = entry.get('distance_m')
+    if distance_m is None and src_pts and entry.get('start_meter') is not None:
+        distance_m = 20.0
     return camera(
         video_path=entry.get('video_path'),
         crop=tuple(crop_val) if crop_val else None,
@@ -239,6 +298,13 @@ def _build_camera_from_entry(entry):
         start_line=start_line,
         end_line=end_line,
         pre_roll_px=int(entry.get('pre_roll_px', 200)),
+        end_roll_px=int(entry.get('end_roll_px', 120)),
+        start_roi_px=int(entry.get('start_roi_px', 100)),
+        homography_lane_margin_px=int(entry.get('homography_lane_margin_px', 80)),
+        distance_m=distance_m,
+        H_matrix=H_matrix,
+        homography_src_points=src_pts,
+        homography_dst_world=dst_pts,
     )
 
 
@@ -295,6 +361,68 @@ def _project_onto_track(point, start_mid, track_dir):
     dx = point[0] - start_mid[0]
     dy = point[1] - start_mid[1]
     return dx * track_dir[0] + dy * track_dir[1]
+
+
+def _project_point_to_track_line(point, start_mid, track_dir):
+    """將 point 投影到 start_mid + track_dir 定義的跑道中心線上。"""
+    proj = _project_onto_track(point, start_mid, track_dir)
+    return (
+        start_mid[0] + track_dir[0] * proj,
+        start_mid[1] + track_dir[1] * proj,
+    )
+
+
+def _compute_homography(src_points, dst_points_world):
+    """根據影像點與世界座標點計算 Homography。"""
+    if src_points is None or dst_points_world is None:
+        return None, None
+
+    src = np.asarray(src_points, dtype=np.float32)
+    dst = np.asarray(dst_points_world, dtype=np.float32)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError(
+            "homography_src_points / homography_dst_world 必須是 shape=(N,2) 且點數一致"
+        )
+    if len(src) < 4:
+        raise ValueError("Homography 至少需要 4 組對應點")
+
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    if H is None:
+        raise ValueError("Homography 計算失敗，請檢查點位是否共線或順序是否對應")
+    return H, mask
+
+
+def build_lane_world_points(start_meter, num_points=5, lane_width=LANE_WIDTH_M):
+    """建立單一跑道區段的世界座標；支援 5 點或 6 點 Homography 標定。"""
+    if num_points == 5:
+        return np.float32([
+            [start_meter + 0.0, lane_width],
+            [start_meter + 0.0, 0.0],
+            [start_meter + 10.0, 0.0],
+            [start_meter + 20.0, 0.0],
+            [start_meter + 20.0, lane_width],
+        ])
+
+    if num_points == 6:
+        return np.float32([
+            [start_meter + 0.0, lane_width],
+            [start_meter + 0.0, 0.0],
+            [start_meter + 10.0, 0.0],
+            [start_meter + 10.0, lane_width],
+            [start_meter + 20.0, 0.0],
+            [start_meter + 20.0, lane_width],
+        ])
+
+    raise ValueError("src_points 目前只支援 5 點或 6 點 Homography 標定")
+
+
+def _transform_point_homography(point, H):
+    """把單一影像點轉到世界座標，回傳 (xw, yw)。"""
+    if H is None:
+        return None
+    pts = np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(pts, H)
+    return tuple(mapped[0, 0])
 
 
 def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
@@ -413,6 +541,8 @@ def process_frame(img, model, velocity_tracker, device,
                   crop_x_offset, crop_y_offset,
                   instant_start=False,
                   track_roi=None,
+                  quad_roi=None,
+                  homography_lane_margin_px=80,
                   overlay_start_pts=None,
                   overlay_end_pts=None,
                   prefer_lead_runner=False,
@@ -423,6 +553,7 @@ def process_frame(img, model, velocity_tracker, device,
                 選最快人物 → 疊加框 → 固定大小裁剪。
 
     track_roi          dict or None：斜線模式的投影 ROI 參數（含 start_mid/track_dir/pixel_span/pre_roll_px）
+    quad_roi           np.ndarray or None：Homography/跑道四邊形，優先保留附近偵測
     overlay_start_pts  tuple[2] or None：起跑線兩端點（crop 後座標系），SHOW_OVERLAY 時繪製
     overlay_end_pts    tuple[2] or None：終點線兩端點（crop 後座標系），SHOW_OVERLAY 時繪製
 
@@ -460,33 +591,44 @@ def process_frame(img, model, velocity_tracker, device,
 # =======================================================================
     
     seen_ids = set()
+    lead_candidates = []
     valid_detections = []
 
     if r.boxes is not None and len(r.boxes) > 0:
         boxes = r.boxes.xyxy.cpu().numpy()       # shape (N, 4)，格式 x1 y1 x2 y2
         ids   = r.boxes.id.cpu().numpy() if r.boxes.id is not None else None    # shape (N,)，YOLO 分配的 track ID
 
+        # 第一輪：收集所有通過過濾的偵測，和 tracker_impl.py 保持一致。
         for i in range(len(boxes)):
             bx1, by1, bx2, by2 = map(int, boxes[i])
             if (by2 - by1) < MIN_PERSON_HEIGHT:
                 continue
             center_x = (bx1 + bx2) / 2   # bbox 中心 x（裁剪座標）
             center_y = (by1 + by2) / 2   # bbox 中心 y（裁剪座標）
-            ground_x, ground_y = _bbox_bottom_center((bx1, by1, bx2, by2))
+            ground_pt = _bbox_bottom_center((bx1, by1, bx2, by2))
+            ground_orig = (
+                ground_pt[0] + crop_x_offset,
+                ground_pt[1] + crop_y_offset,
+            )
 
             # ROI 過濾（換算回原始影片座標再比對）
-            orig_cx = ground_x + crop_x_offset
-            orig_cy = ground_y + crop_y_offset
+            orig_cx = center_x + crop_x_offset
+            orig_cy = center_y + crop_y_offset
             proj = None
             if track_roi is not None:
                 # 斜線模式：投影到跑道方向，範圍 [-pre_roll_px, pixel_span]
                 proj = _project_onto_track(
-                    (orig_cx, orig_cy),
+                    ground_orig,
                     track_roi['start_mid'], track_roi['track_dir']
                 )
                 pre_roll = track_roi.get('pre_roll_px', 0)
-                if not (-pre_roll <= proj <= track_roi['pixel_span']):
+                end_roll = track_roi.get('end_roll_px', 0)
+                if not (-pre_roll <= proj <= track_roi['pixel_span'] + end_roll):
                     continue
+                if nearest_to_start:
+                    start_roi = track_roi.get('start_roi_px', pre_roll)
+                    if abs(proj) > start_roi:
+                        continue
             elif roi_enabled and roi_zones:
                 # 舊矩形模式
                 if not any(z['x'][0] <= orig_cx <= z['x'][1] and
@@ -497,19 +639,41 @@ def process_frame(img, model, velocity_tracker, device,
             if ids is None:
                 continue
             tid = int(ids[i])
-            seen_ids.add(tid)
-            valid_detections.append({
-                'tid': tid,
-                'bbox': (bx1, by1, bx2, by2),
-                'center': (center_x, center_y),
-                'ground_point': (ground_x, ground_y),
-                'proj': proj,
-            })
+            dist_to_start = abs(proj) if track_roi is not None else float('inf')
+            valid_detections.append((dist_to_start, center_x, center_y,
+                                     bx1, by1, bx2, by2, tid, proj, ground_pt))
 
+        # Homography 跑道區域優先：如果有候選人在跑道四邊形附近，就先排除遠離跑道的人。
+        if quad_roi is not None and valid_detections:
+            lane_filtered = []
+            for det in valid_detections:
+                (_, _, _, bx1, by1, bx2, by2, _, _, ground_pt) = det
+                ground_orig = (
+                    ground_pt[0] + crop_x_offset,
+                    ground_pt[1] + crop_y_offset,
+                )
+                signed_dist = cv2.pointPolygonTest(
+                    quad_roi,
+                    (float(ground_orig[0]), float(ground_orig[1])),
+                    True,
+                )
+                if signed_dist >= -float(homography_lane_margin_px):
+                    lane_filtered.append(det)
+            if lane_filtered:
+                valid_detections = lane_filtered
+
+        # nearest_to_start 模式：只保留距 start_line 最近的一人。
+        if nearest_to_start and valid_detections:
+            valid_detections.sort(key=lambda x: x[0])
+            valid_detections = valid_detections[:1]
+
+        # 第二輪：更新 velocity_tracker。
+        for (_, center_x, center_y, bx1, by1, bx2, by2, tid, proj, ground_pt) in valid_detections:
+            seen_ids.add(tid)
             if tid in velocity_tracker:
                 d = velocity_tracker[tid]
-                ox, oy = d.get('ground_point', d['center'])
-                dist = np.sqrt((ground_x - ox) ** 2 + (ground_y - oy) ** 2)
+                ox, oy = d['center']
+                dist = np.sqrt((center_x - ox) ** 2 + (center_y - oy) ** 2)
                 d['velocities'].append(dist)
                 if dist > MOVEMENT_THRESHOLD:
                     d['movement_count'] += 1
@@ -518,30 +682,30 @@ def process_frame(img, model, velocity_tracker, device,
                     d['movement_count'] = max(0, d['movement_count'] - 1)
                     d['stationary_count'] += STATIONARY_DECAY
                 d['center'] = (center_x, center_y)
-                d['ground_point'] = (ground_x, ground_y)
                 d['bbox']   = (bx1, by1, bx2, by2)
+                d['ground_point'] = ground_pt
+                prev_ground = d.get('smoothed_ground_point', ground_pt)
+                alpha = GROUND_POINT_EMA_ALPHA
+                d['smoothed_ground_point'] = (
+                    alpha * ground_pt[0] + (1.0 - alpha) * prev_ground[0],
+                    alpha * ground_pt[1] + (1.0 - alpha) * prev_ground[1],
+                )
                 d['proj']   = proj
                 d['frames_since_detected'] = 0
             else:
                 velocity_tracker[tid] = {
                     'center':                (center_x, center_y),
-                    'ground_point':          (ground_x, ground_y),
                     'bbox':                  (bx1, by1, bx2, by2),
+                    'ground_point':          ground_pt,
+                    'smoothed_ground_point': ground_pt,
                     'proj':                  proj,
                     'velocities':            [0],
                     'movement_count':        MIN_MOVEMENT_FRAMES if instant_start else 1,
                     'stationary_count':      0,
                     'frames_since_detected': 0,
                 }
-
-    if nearest_to_start and valid_detections:
-        valid_detections = sorted(
-            valid_detections,
-            key=lambda det: abs(det['proj']) if det['proj'] is not None else float('inf')
-        )
-        keep_id = valid_detections[0]['tid']
-        valid_detections = [valid_detections[0]]
-        seen_ids = {keep_id}
+            if track_roi is not None and proj is not None:
+                lead_candidates.append({'tid': tid, 'proj': proj})
 
     # 清除過期追蹤
     for tid in list(velocity_tracker):
@@ -551,41 +715,29 @@ def process_frame(img, model, velocity_tracker, device,
                 del velocity_tracker[tid]
 
     # Step 4: 選出最快人物
-    valid_ids = {det['tid'] for det in valid_detections}
     fastest_id = None
     max_vel = -1.0
 
     if locked_target_id is not None:
+        locked_target_id = int(locked_target_id)
         d = velocity_tracker.get(locked_target_id)
-        if d is not None and d['frames_since_detected'] == 0 and locked_target_id in valid_ids:
+        if d is not None and d['frames_since_detected'] == 0:
             fastest_id = locked_target_id
+        else:
+            return None, None, None, None, None, None, None
 
     if fastest_id is None:
         for tid, d in velocity_tracker.items():
-            if d['frames_since_detected'] == 0 and tid in valid_ids:  # 本幀有偵測到
+            if d['frames_since_detected'] == 0:  # 本幀有偵測到
                 if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and  # 連續移動 ≥ 3 幀
                         d['stationary_count'] < 10):  # 靜止幀數 < 10
-                    v = np.mean(d['velocities'][-10:]) if d['velocities'] else 0  # 近期平均移動距離
+                    v = np.mean(d['velocities']) if d['velocities'] else 0
                     if v > max_vel:
                         max_vel = v
                         fastest_id = tid
 
-    if fastest_id is None and prefer_lead_runner and valid_ids:
-        lead_candidates = [
-            (tid, velocity_tracker[tid].get('proj'))
-            for tid in valid_ids
-            if tid in velocity_tracker and velocity_tracker[tid].get('proj') is not None
-        ]
-        if lead_candidates:
-            fastest_id = max(lead_candidates, key=lambda item: item[1])[0]
-
-    if fastest_id is None:
-        for tid, d in velocity_tracker.items():
-            if d['frames_since_detected'] == 0 and tid in valid_ids:
-                if (d['movement_count'] >= MIN_MOVEMENT_FRAMES and  # 連續移動 ≥ 3 幀
-                        d['stationary_count'] < 10):  # 靜止幀數 < 10
-                    fastest_id = tid
-                    break
+    if fastest_id is None and prefer_lead_runner and lead_candidates:
+        fastest_id = max(lead_candidates, key=lambda c: c['proj'])['tid']
 
     if fastest_id is None:
         return None, None, None, None, None, None, None
@@ -744,7 +896,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         track_roi   = cam.get('track_roi')
         is_last_cam = (cam_idx == len(cameras) - 1)
         if not dry_run:
-            if track_roi is not None:
+            if cam.get('H_matrix') is not None and cam.get('distance_m') is not None:
+                print(f"  切換條件: Homography 距離 ≥ {float(cam['distance_m']):.2f}m")
+            elif track_roi is not None:
                 print(f"  ROI 模式: 斜線投影（pixel_span={cam['pixel_span']:.0f}px，"
                       f"pre_roll={track_roi['pre_roll_px']}px）")
                 print(f"  切換條件: 投影距離 ≥ pixel_span（越過終點線）")
@@ -785,6 +939,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         runner_crossed_start = (track_roi is None)  # 舊模式直接視為已越線
         pre_roll_buf  = []   # (crop_frame, source_frame, bbox_in_crop)，最多 5 幀（起跑線前）
         candidate_buf = []   # (crop_frame, proj_px, source_frame, bbox_in_crop)，待確認起跑的候選幀
+        candidate_target_id = None
         K_CONFIRM     = 3    # 連續幾幀單調遞增才確認起跑
 
         def _write_output_frame(frame_to_write, source_frame, bbox_for_hrnet=None,
@@ -868,11 +1023,13 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     crop_x_offset, crop_y_offset,
                     instant_start=_instant_start,
                     track_roi=track_roi,
+                    quad_roi=cam.get('quad_roi'),
+                    homography_lane_margin_px=cam.get('homography_lane_margin_px', 80),
                     overlay_start_pts=_ov_s,
                     overlay_end_pts=_ov_e,
                     prefer_lead_runner=not runner_crossed_start,
                     nearest_to_start=not runner_crossed_start,
-                    locked_target_id=target_runner_id if runner_crossed_start else None,
+                    locked_target_id=target_runner_id,
                 )
             except RuntimeError:
                 torch.cuda.empty_cache()
@@ -882,11 +1039,13 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     crop_x_offset, crop_y_offset,
                     instant_start=_instant_start,
                     track_roi=track_roi,
+                    quad_roi=cam.get('quad_roi'),
+                    homography_lane_margin_px=cam.get('homography_lane_margin_px', 80),
                     overlay_start_pts=_ov_s,
                     overlay_end_pts=_ov_e,
                     prefer_lead_runner=not runner_crossed_start,
                     nearest_to_start=not runner_crossed_start,
-                    locked_target_id=target_runner_id if runner_crossed_start else None,
+                    locked_target_id=target_runner_id,
                 )
 
             if crop_frame is None:
@@ -917,6 +1076,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                 if proj_px < 0:
                     # 在起跑線前：放入 pre-roll buffer，不輸出
                     candidate_buf.clear()
+                    candidate_target_id = None
                     pre_roll_buf.append((crop_frame, source_frame, bbox_in_crop, off_x, off_y))
                     if len(pre_roll_buf) > 5:
                         pre_roll_buf.pop(0)
@@ -924,14 +1084,17 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
 
                 else:
                     # proj_px >= 0：進入候選區（需單調遞增才確認起跑）
-                    if candidate_buf and proj_px <= candidate_buf[-1][1]:
+                    if candidate_target_id != fastest_id:
+                        candidate_target_id = fastest_id
+                        candidate_buf.clear()
+                    elif candidate_buf and proj_px <= candidate_buf[-1][1]:
                         candidate_buf.clear()   # 後退或持平，重新收集
 
                     candidate_buf.append((crop_frame, proj_px, source_frame, bbox_in_crop, off_x, off_y))
 
                     if len(candidate_buf) >= K_CONFIRM:
                         runner_crossed_start = True
-                        target_runner_id = fastest_id
+                        target_runner_id = candidate_target_id
                         # 寫出 pre-roll 幀
                         for pre_f, pre_source, pre_bbox, pre_ox, pre_oy in pre_roll_buf:
                             _write_output_frame(pre_f, pre_source, pre_bbox, target_runner_id,
@@ -975,8 +1138,40 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             if current_valid_bbox is not None:
                 last_valid_bbox = current_valid_bbox
 
-            # ── 切換條件（斜線模式優先）──
-            if track_roi is not None and cam.get('pixel_span'):
+            # ── 切換條件：Homography → 斜線投影 → switch_x，與 tracker_impl.py 對齊 ──
+            if (cam.get('H_matrix') is not None and
+                    cam.get('distance_m') is not None and
+                    fastest_id is not None):
+                d = velocity_tracker.get(fastest_id)
+                if d is not None:
+                    bx1, by1, bx2, by2 = d['bbox']
+                    ground_pt = d.get('smoothed_ground_point') or d.get('ground_point')
+                    if ground_pt is not None:
+                        image_point = (
+                            float(ground_pt[0]) + crop_x_offset,
+                            float(ground_pt[1]) + crop_y_offset,
+                        )
+                        if cam.get('start_mid') is not None and cam.get('track_dir') is not None:
+                            image_point = _project_point_to_track_line(
+                                image_point, cam['start_mid'], cam['track_dir'])
+                    else:
+                        image_point = (
+                            (bx1 + bx2) / 2.0 + crop_x_offset,
+                            by2 + crop_y_offset,
+                        )
+                    world = _transform_point_homography(image_point, cam['H_matrix'])
+                    if world is not None:
+                        start_world_x = cam.get('homography_start_x')
+                        if start_world_x is None:
+                            start_world_x = 0.0
+                        homography_local_dist = max(0.0, float(world[0]) - start_world_x)
+                        if homography_local_dist >= float(cam['distance_m']):
+                            if not dry_run:
+                                print(f"  → 觸發{'退出ROI' if is_last_cam else '切換'}："
+                                      f"Homography距離={homography_local_dist:.2f}m "
+                                      f">= {float(cam['distance_m']):.2f}m")
+                            break
+            elif track_roi is not None and cam.get('pixel_span'):
                 # 斜線模式：投影 >= pixel_span → 越過終點線
                 d = velocity_tracker.get(fastest_id)
                 if d is not None:
@@ -1052,6 +1247,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         print(f"  Offsets: {offsets_path}")
 
     return total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height
+
 
 
 def main():
