@@ -452,7 +452,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         orig_stem = Path(cameras[0]['video_path']).stem
         offsets_npz = os.path.join(output_dest, f"{orig_stem}_offsets.npz")
         kps_npz = os.path.join(final_pose_dir, "input_2D", "keypoints.npz")
-        output_uncropped = os.path.join(output_dest, f"{orig_stem}_uncropped_2D.mp4")
+        output_uncropped = os.path.join(output_dest, "output_final.mp4")
 
         if os.path.exists(offsets_npz) and os.path.exists(kps_npz):
             if progress_callback: progress_callback(90)
