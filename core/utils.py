@@ -101,7 +101,7 @@ def convert_to_web_compatible_mp4(input_path, output_path=None):
         
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "fast",
+        "-c:v", "libx264", "-preset", "ultrafast",
         "-movflags", "+faststart",
         "-pix_fmt", "yuv420p",
         temp_output

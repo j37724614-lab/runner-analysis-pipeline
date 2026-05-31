@@ -549,6 +549,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     output_video=output_uncropped,
                     config=config_dict,
                 )
+                if progress_callback: progress_callback(93)
 
                 print("\n" + "=" * 60)
                 print("【階段四】步頻與步幅分析")
@@ -558,6 +559,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     output_dir=output_dest,
                     make_video=False,
                 )
+                if progress_callback: progress_callback(95)
                 avg_step_length = step_analysis.get("avg_step_length_m")
                 print(f"  ▶ 腳踝位置資料 (CSV): {step_analysis['ankle_csv']}")
                 print(f"  ▶ 步伐事件資料 (CSV): {step_analysis['steps_csv']}")
@@ -576,7 +578,8 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     avg_cadence_spm=step_analysis.get("avg_cadence_spm"),
                 )
                 os.replace(tmp_uncropped, output_uncropped)
-                
+                if progress_callback: progress_callback(97)
+
                 # 轉碼為 H.264 Web 相容格式，加入 faststart metadata 以支援瀏覽器直接預覽
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
                 convert_to_web_compatible_mp4(output_uncropped)
