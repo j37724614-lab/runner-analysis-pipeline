@@ -32,6 +32,7 @@ LEFT_ANKLE = 6
 TEXT_COLOR = (0, 0, 0)
 
 
+
 def _parse_line(values):
     if values is None:
         return None
@@ -504,7 +505,8 @@ def render_overlay(
                 label += f" L={past['step_length_m']:.2f}m"
             elif past["step_length_px"] is not None:
                 label += f" L={past['step_length_px']:.0f}px"
-            cv2.putText(frame, label, (px + 8, py - 8),
+            label_y = py + 43 if (past['step_index'] % 2 == 1) else py + 70
+            cv2.putText(frame, label, (px + 8, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 2, cv2.LINE_AA)
 
         cv2.putText(frame, f"Time: {row['time_s']:.2f}s", (30, 40),
@@ -574,7 +576,8 @@ def annotate_step_stride_video(
                 label += f" L={past['step_length_m']:.2f}m"
             elif past["step_length_px"] is not None:
                 label += f" L={past['step_length_px']:.0f}px"
-            cv2.putText(frame, label, (px + 8, py - 8),
+            label_y = py + 43 if (past['step_index'] % 2 == 1) else py + 70
+            cv2.putText(frame, label, (px + 8, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 2, cv2.LINE_AA)
 
         if row:
