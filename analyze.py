@@ -5,52 +5,260 @@ analyze.py — 綜合分析入口
 透過此腳本，可以一鍵完成所有分析流程。
 """
 
+import json
+import os
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import cv2
 
 from core.pipeline import run_analysis
+
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
+def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]:
+    cap = cv2.VideoCapture(video_path)
+    success, frame = cap.read()
+    cap.release()
+    if not success:
+        raise RuntimeError(f"cannot read first frame: {video_path}")
+
+    max_width = 1280
+    scale = min(1.0, max_width / frame.shape[1])
+    display = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
+    ok, encoded = cv2.imencode(".jpg", display)
+    if not ok:
+        raise RuntimeError(f"cannot encode first frame: {video_path}")
+
+    selected: dict[str, list[list[int]] | None] = {"points": None}
+    image_bytes = encoded.tobytes()
+    image_width = frame.shape[1]
+    image_height = frame.shape[0]
+
+    class PointPickerHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/frame.jpg":
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(image_bytes)))
+                self.end_headers()
+                self.wfile.write(image_bytes)
+                return
+
+            html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pick Line Points</title>
+  <style>
+    body {{ margin: 0; font-family: Arial, sans-serif; background: #111; color: #eee; }}
+    header {{ padding: 12px 16px; background: #222; position: sticky; top: 0; z-index: 2; }}
+    #wrap {{ position: relative; display: inline-block; margin: 16px; }}
+    #frame {{ max-width: calc(100vw - 32px); height: auto; display: block; }}
+    #overlay {{ position: absolute; left: 0; top: 0; pointer-events: none; }}
+    button {{ margin-right: 8px; padding: 8px 12px; }}
+    code {{ color: #9ee; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>Video: <code>{video_path}</code></div>
+    <div>Click order: 1 start top, 2 end top, 3 end bottom, 4 start bottom.</div>
+    <div>
+      <button onclick="undoPoint()">Undo</button>
+      <button onclick="resetPoints()">Reset</button>
+      <button onclick="submitPoints()">Submit 4 points</button>
+      <span id="status">0 / 4 points</span>
+    </div>
+  </header>
+  <div id="wrap">
+    <img id="frame" src="/frame.jpg" alt="first frame">
+    <canvas id="overlay"></canvas>
+  </div>
+  <script>
+    const naturalWidth = {image_width};
+    const naturalHeight = {image_height};
+    const img = document.getElementById("frame");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const points = [];
+    const labels = ["1 start top", "2 end top", "3 end bottom", "4 start bottom"];
+
+    function syncCanvas() {{
+      canvas.width = img.clientWidth;
+      canvas.height = img.clientHeight;
+      redraw();
+    }}
+
+    function toDisplay(point) {{
+      return [
+        point[0] * canvas.width / naturalWidth,
+        point[1] * canvas.height / naturalHeight,
+      ];
+    }}
+
+    function redraw() {{
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.lineWidth = 2;
+      ctx.font = "16px Arial";
+      points.forEach((point, idx) => {{
+        const [x, y] = toDisplay(point);
+        ctx.fillStyle = "#ff3b30";
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillText(labels[idx], x + 8, y - 8);
+      }});
+      if (points.length >= 2) drawLine(points[0], points[1], "#4da3ff");
+      if (points.length >= 4) {{
+        drawLine(points[3], points[2], "#4da3ff");
+        drawLine(points[0], points[3], "#34c759");
+        drawLine(points[1], points[2], "#34c759");
+      }}
+      statusEl.textContent = `${{points.length}} / 4 points`;
+    }}
+
+    function drawLine(a, b, color) {{
+      const [x1, y1] = toDisplay(a);
+      const [x2, y2] = toDisplay(b);
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }}
+
+    img.addEventListener("load", syncCanvas);
+    window.addEventListener("resize", syncCanvas);
+    img.addEventListener("click", (event) => {{
+      if (points.length >= 4) return;
+      const rect = img.getBoundingClientRect();
+      const x = Math.round((event.clientX - rect.left) * naturalWidth / rect.width);
+      const y = Math.round((event.clientY - rect.top) * naturalHeight / rect.height);
+      points.push([x, y]);
+      redraw();
+    }});
+
+    function undoPoint() {{
+      points.pop();
+      redraw();
+    }}
+
+    function resetPoints() {{
+      points.length = 0;
+      redraw();
+    }}
+
+    async function submitPoints() {{
+      if (points.length !== 4) {{
+        alert("Please select exactly 4 points.");
+        return;
+      }}
+      const response = await fetch("/submit", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ points }}),
+      }});
+      if (!response.ok) {{
+        alert("Submit failed.");
+        return;
+      }}
+      document.body.innerHTML = "<h2 style='font-family: Arial; padding: 24px;'>Submitted. Return to terminal.</h2>";
+    }}
+  </script>
+</body>
+</html>"""
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            if self.path != "/submit":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            points = payload.get("points")
+            if not isinstance(points, list) or len(points) != 4:
+                self.send_error(400, "expected 4 points")
+                return
+            selected["points"] = [[int(p[0]), int(p[1])] for p in points]
+            self.send_response(200)
+            self.end_headers()
+
+    preferred_port = int(os.getenv("POINT_PICKER_PORT", "18002"))
+    server = None
+    for port in range(preferred_port, preferred_port + 20):
+        try:
+            server = ReusableHTTPServer(("0.0.0.0", port), PointPickerHandler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise RuntimeError(f"cannot bind point picker port from {preferred_port} to {preferred_port + 19}")
+
+    public_host = os.getenv("POINT_PICKER_HOST", "catslab.ee.ncku.edu.tw")
+    print("\n" + "=" * 60)
+    print("Open this URL in your browser and pick 4 points:")
+    print(f"http://{public_host}:{server.server_port}")
+    print("Waiting for browser submission...")
+    print("=" * 60)
+
+    while selected["points"] is None:
+        server.handle_request()
+    server.server_close()
+
+    points = selected["points"]
+    start_line = [points[0], points[3]]
+    end_line = [points[1], points[2]]
+    return start_line, end_line
+
+
+def build_camera_config(video_path: str, distance_m: float,
+                        lane_margin_px: int = 10,
+                        pre_roll_px: int = 100) -> dict:
+    start_line, end_line = pick_line_points(video_path)
+    return {
+        "video_path": video_path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "distance_m": distance_m,
+        "homography_lane_margin_px": lane_margin_px,
+        "pre_roll_px": pre_roll_px,
+    }
+
 
 if __name__ == "__main__":
     start_time = time.perf_counter()
 
-    # 在此處直接定義設定參數 (config_dict)，取代原本的 --config / --config-json 命令列輸入
+    test_cameras = [
+        {
+            "video_path": "/home/jeter/runner-analysis-pipeline/MotionAGFormer/demo/video/IMG_5707 (1).mp4",
+            "distance_m": 20.0,
+        },
+        {
+            "video_path": "/home/jeter/runner-analysis-pipeline/video/0506_4.mp4",
+            "distance_m": 20.0,
+        },
+    ]
+
+    # cameras 裡每一筆代表一支攝影機影片；start/end line 由視窗點選產生，不再手寫 crop。
     config_dict = {
         "cameras": [
-            {
-                "video_path": "/home/jeter/runner-analysis-pipeline/video/0504_3.mp4",
-                "crop": [0, 400, 1920, 800],
-                "start_line": [[222, 715], [148, 725]],
-                "end_line": [[1700, 710], [1790, 718]],
-                "distance_m": 20.0
-            },
-            {
-                "video_path": "/home/jeter/runner-analysis-pipeline/video/0506_1.mp4",
-                "crop": [0, 400, 1920, 800],
-                "start_line": [[220, 715], [135, 725]],
-                "end_line": [[1730, 710], [1825, 725]],
-                "distance_m": 20.0
-            },
-            {
-                "video_path": "/home/jeter/runner-analysis-pipeline/video/0506_2.mp4",
-                "crop": [0, 400, 1920, 800],
-                "start_line": [[212, 715], [127, 725]],
-                "end_line": [[1755, 710], [1835, 718]],
-                "distance_m": 20.0
-            },
-            {
-                "video_path": "/home/jeter/runner-analysis-pipeline/video/0506_3.mp4",
-                "crop": [0, 400, 1920, 800],
-                "start_line": [[227, 713], [140, 727]],
-                "end_line": [[1722, 718], [1825, 725]],
-                "distance_m": 20.0
-            },
-            {
-                "video_path": "/home/jeter/runner-analysis-pipeline/video/0506_4.mp4",
-                "crop": [0, 400, 1920, 800],
-                "start_line": [[220, 715], [138, 726]],
-                "end_line": [[1727, 712], [1819, 722]],
-                "distance_m": 20.0
-            },
-        ]
+            build_camera_config(cam["video_path"], cam["distance_m"])
+            for cam in test_cameras
+        ],
+        "tracking_mode": "two_pass",
     }
 
     run_analysis(

@@ -220,30 +220,86 @@ def load_ankle_positions(keypoints_npz, offsets_npz, fps):
     return rows
 
 
-def detect_steps(ankle_rows, calibration, min_step_frames=8, prominence=None):
+def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, prominence=None):
     if not ankle_rows:
         return []
 
+    # Estimate FPS from ankle_rows timestamps if not provided.
+    if fps is None and len(ankle_rows) >= 2:
+        t0 = float(ankle_rows[0]['seq_time_s'])
+        t1 = float(ankle_rows[-1]['seq_time_s'])
+        n  = len(ankle_rows)
+        fps = (n - 1) / (t1 - t0) if t1 > t0 else 30.0
+    fps = fps or 30.0
+
+    if min_step_frames is None:
+        # Lower-ankle peaks represent every step. Keep the minimum gap fixed so
+        # close true contacts are not dropped by find_peaks(distance=...).
+        min_step_frames = 5
+    min_touchdown_gap_frames = max(8, min_step_frames)
+
+    def smooth(values):
+        n = len(values)
+        if n < 5:
+            return values
+        # Keep the lower-ankle smoothing short so close touchdown peaks are not
+        # flattened away.
+        win = min(7, n if n % 2 == 1 else n - 1)
+        if win % 2 == 0:
+            win -= 1
+        return savgol_filter(values, window_length=win, polyorder=2)
+
     y = np.array([r["lower_ankle_y"] for r in ankle_rows], dtype=float)
-    if len(y) >= 7:
-        window = min(len(y) if len(y) % 2 == 1 else len(y) - 1, 11)
-        if window >= 5:
-            y_smooth = savgol_filter(y, window_length=window, polyorder=2)
+    y_smooth = smooth(y)
+    lower_prominence = prominence
+    if lower_prominence is None:
+        q75, q25 = np.nanpercentile(y_smooth, [75, 25])
+        lower_prominence = max((q75 - q25) * 0.20, 1.5)
+
+    peaks, props = find_peaks(
+        y_smooth,
+        distance=min_step_frames,
+        prominence=lower_prominence,
+    )
+    prominences = props.get("prominences", np.zeros(len(peaks), dtype=float))
+
+    candidates = []
+    for peak_idx, peak_prominence in zip(peaks, prominences):
+        row = ankle_rows[int(peak_idx)]
+        conf = row["lower_ankle_conf"]
+        if not (np.isnan(float(conf)) if isinstance(conf, float) else False) and float(conf) < 0.30:
+            continue
+        candidates.append({
+            "row_idx": int(peak_idx),
+            "row": row,
+            "foot": row["lower_foot"],
+            "ankle_x": row["lower_ankle_x"],
+            "ankle_y": row["lower_ankle_y"],
+            "ankle_conf": conf,
+            "prominence": float(peak_prominence),
+        })
+
+    filtered_candidates = []
+    for candidate in candidates:
+        if not filtered_candidates:
+            filtered_candidates.append(candidate)
+            continue
+
+        previous = filtered_candidates[-1]
+        frame_gap = int(candidate["row"]["seq_frame"]) - int(previous["row"]["seq_frame"])
+        if frame_gap < min_touchdown_gap_frames:
+            prev_score = (previous["prominence"], previous["ankle_conf"], previous["ankle_y"])
+            cand_score = (candidate["prominence"], candidate["ankle_conf"], candidate["ankle_y"])
+            if cand_score > prev_score:
+                filtered_candidates[-1] = candidate
         else:
-            y_smooth = y
-    else:
-        y_smooth = y
-
-    if prominence is None:
-        prominence = max(float(np.nanstd(y_smooth)) * 0.25, 3.0)
-
-    peaks, _ = find_peaks(y_smooth, distance=min_step_frames, prominence=prominence)
+            filtered_candidates.append(candidate)
 
     events = []
     prev_proj = None
-    for step_idx, row_idx in enumerate(peaks, start=1):
-        row = ankle_rows[int(row_idx)]
-        point = (row["lower_ankle_x"], row["lower_ankle_y"])
+    for step_idx, candidate in enumerate(filtered_candidates, start=1):
+        row = candidate["row"]
+        point = (candidate["ankle_x"], candidate["ankle_y"])
         track_pos = _project(point, calibration)
         world_x = world_y = None
         if calibration.get("mode") == "homography":
@@ -263,10 +319,10 @@ def detect_steps(ankle_rows, calibration, min_step_frames=8, prominence=None):
             "time_s": row["time_s"],
             "seq_time_s": row["seq_time_s"],
             "cam": row["cam"],
-            "foot": row["lower_foot"],
-            "ankle_x": row["lower_ankle_x"],
-            "ankle_y": row["lower_ankle_y"],
-            "ankle_conf": row["lower_ankle_conf"],
+            "foot": candidate["foot"],
+            "ankle_x": candidate["ankle_x"],
+            "ankle_y": candidate["ankle_y"],
+            "ankle_conf": candidate["ankle_conf"],
             "track_position_px": None if calibration.get("mode") == "homography" else track_pos,
             "world_x_m": world_x,
             "world_y_m": world_y,
@@ -543,7 +599,7 @@ def run_step_stride_analysis(
     make_video=True,
     output_video=None,
     meters_per_pixel=None,
-    min_step_frames=8,
+    min_step_frames=None,
     prominence=None,
 ):
     """Run ankle, step length, and cadence analysis from a pipeline config dict."""
@@ -601,6 +657,7 @@ def run_step_stride_analysis(
         cam_events = detect_steps(
             cam_rows,
             calibration,
+            fps=fps,
             min_step_frames=min_step_frames,
             prominence=prominence,
         )
@@ -673,7 +730,7 @@ def parse_args():
     parser.add_argument("--distance-m", type=float, default=None)
     parser.add_argument("--start-line", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"))
     parser.add_argument("--end-line", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"))
-    parser.add_argument("--min-step-frames", type=int, default=8)
+    parser.add_argument("--min-step-frames", type=int, default=None)
     parser.add_argument("--prominence", type=float, default=None)
     parser.add_argument("--make-video", action="store_true")
     parser.add_argument("--output-video", default=None)
@@ -719,6 +776,7 @@ def main():
     step_events = detect_steps(
         ankle_rows,
         calibration,
+        fps=fps,
         min_step_frames=args.min_step_frames,
         prominence=args.prominence,
     )

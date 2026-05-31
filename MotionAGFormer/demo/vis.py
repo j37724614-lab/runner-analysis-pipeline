@@ -19,8 +19,10 @@ vis.py — 2D/3D 姿態估計 + 關節角度計算
 
 import sys
 import argparse
+import json
 from pathlib import Path
 import os
+from datetime import datetime
 
 # vis.py 位於 MotionAGFormer/demo/vis.py
 # 需要兩個目錄同時在 sys.path：
@@ -59,11 +61,210 @@ matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
 
 
+H36M_JOINT_NAMES = [
+    'Hip',
+    'RHip', 'RKnee', 'RAnkle',
+    'LHip', 'LKnee', 'LAnkle',
+    'Spine', 'Thorax',
+    'Neck_Nose', 'Head',
+    'LShoulder', 'LElbow', 'LWrist',
+    'RShoulder', 'RElbow', 'RWrist',
+]
+
+# Per-joint motion allowance for H36M 17-joint order. Core joints are stricter;
+# ankles and wrists can move faster but are still bounded to suppress drift.
+_JOINT_SPEED_H36M = np.array([
+    0.7,  # 0: Pelvis
+    0.8,  # 1: R.Hip
+    1.0,  # 2: R.Knee
+    1.2,  # 3: R.Ankle
+    0.8,  # 4: L.Hip
+    1.0,  # 5: L.Knee
+    1.2,  # 6: L.Ankle
+    0.7,  # 7: Spine
+    0.7,  # 8: Thorax
+    0.9,  # 9: Nose
+    0.9,  # 10: Head
+    0.8,  # 11: L.Shoulder
+    1.0,  # 12: L.Elbow
+    1.2,  # 13: L.Wrist
+    0.8,  # 14: R.Shoulder
+    1.0,  # 15: R.Elbow
+    1.2,  # 16: R.Wrist
+], dtype=np.float32)
+
+# Per-joint displacement threshold (px) — from joint_motion_stats_from_raw_archive.csv.
+# Most joints use p95; knees use p90 to reject large visual misdetections earlier.
+_JOINT_MAX_PX = np.array([
+    10.35, 11.76, 19.62, 63.90,  # Hip, RHip, RKnee, RAnkle
+    15.35, 25.38, 63.49,          # LHip, LKnee, LAnkle
+    12.49, 14.23, 12.10, 12.92,  # Spine, Thorax, Neck_Nose, Head
+    17.77, 36.43, 50.29,          # LShoulder, LElbow, LWrist
+    15.14, 35.21, 50.69,          # RShoulder, RElbow, RWrist
+], dtype=np.float32)
+
+# Per-joint p99 displacement (px) — kept as a looser reference threshold.
+_JOINT_HARD_PX = np.array([
+    16.75, 17.47, 55.29, 80.52,  # Hip, RHip, RKnee, RAnkle
+    23.64, 55.38, 80.70,          # LHip, LKnee, LAnkle
+    20.80, 26.58, 20.26, 24.67,  # Spine, Thorax, Neck_Nose, Head
+    29.21, 57.39, 72.75,          # LShoulder, LElbow, LWrist
+    25.34, 53.99, 72.80,          # RShoulder, RElbow, RWrist
+], dtype=np.float32)
+
+# Per-joint Savitzky-Golay window. Torso and knees get stronger smoothing
+# because they are the most visible drift sources in the current data.
+_SG_WINDOW_BY_JOINT = np.array([
+    15,        # 0  Hip
+    11, 7, 3,  # 1  RHip, RKnee, RAnkle
+    11, 7, 3,  # 4  LHip, LKnee, LAnkle
+    15, 15, 15, 15,  # 7  Spine, Thorax, Neck_Nose, Head
+    11, 9, 7,  # 11 LShoulder, LElbow, LWrist
+    11, 9, 7,  # 14 RShoulder, RElbow, RWrist
+], dtype=np.int32)
+
+_ARCHIVE_POINTER_FILENAME = "keypoints_raw_archive_dir.txt"
+
+
 def _reset_dir(path):
     """清掉同名輸出資料夾，避免混到上一次不同尺寸或不同幀數的 PNG。"""
     if os.path.isdir(path):
         shutil.rmtree(path)
     os.makedirs(path, exist_ok=True)
+
+
+def _archive_raw_keypoints(video_path, output_dir, raw_keypoints_with_conf, valid_frames):
+    """Save a non-overwriting copy of raw HRNet keypoints and its source video."""
+    archive_root = Path(
+        os.getenv(
+            "KEYPOINT_RAW_ARCHIVE_DIR",
+            str(_REPO_ROOT.parent / "keypoints_raw_archive"),
+        )
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    video_stem = Path(video_path).stem
+    archive_dir = archive_root / f"{timestamp}_{video_stem}"
+    archive_dir.mkdir(parents=True, exist_ok=False)
+
+    archive_npz = archive_dir / "keypoints_raw.npz"
+    np.savez_compressed(
+        archive_npz,
+        reconstruction=raw_keypoints_with_conf,
+        valid_frames=valid_frames,
+    )
+
+    source_video_copy = None
+    source_video_original_name_copy = None
+    source_video_error = None
+    video_path_obj = Path(video_path)
+    if video_path_obj.exists():
+        source_video_copy = archive_dir / f"source_video{video_path_obj.suffix}"
+        source_video_original_name_copy = archive_dir / video_path_obj.name
+        try:
+            shutil.copy2(video_path_obj, source_video_copy)
+            if source_video_original_name_copy != source_video_copy:
+                shutil.copy2(video_path_obj, source_video_original_name_copy)
+        except OSError as exc:
+            source_video_error = str(exc)
+            source_video_copy = None
+            source_video_original_name_copy = None
+    else:
+        source_video_error = f"source video not found: {video_path}"
+
+    metadata = {
+        "video_path": str(video_path),
+        "output_dir": str(output_dir),
+        "created_at": timestamp,
+        "keypoints_shape": list(raw_keypoints_with_conf.shape),
+        "source_video_copy": str(source_video_copy) if source_video_copy else None,
+        "source_video_original_name_copy": (
+            str(source_video_original_name_copy)
+            if source_video_original_name_copy
+            else None
+        ),
+        "source_video_error": source_video_error,
+    }
+    with open(archive_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    return archive_npz
+
+
+def _remember_keypoints_archive_dir(output_dir, archive_npz):
+    """Record the archive folder so final mp4 outputs can be copied there later."""
+    pointer_path = Path(output_dir) / "input_2D" / _ARCHIVE_POINTER_FILENAME
+    pointer_path.write_text(str(Path(archive_npz).parent), encoding="utf-8")
+
+
+def _final_video_candidates(video_path, output_dir):
+    video_name = Path(video_path).stem
+    return [
+        Path(output_dir) / f"{video_name}.mp4",
+        Path(output_dir) / f"{video_name}_2D.mp4",
+    ]
+
+
+def _export_final_video_frames(video_path, output_dir):
+    """Export each generated final mp4 frame as PNG under output_dir/final_video_frames."""
+    frame_root = Path(output_dir) / "final_video_frames"
+    exported_dirs = []
+
+    for src in _final_video_candidates(video_path, output_dir):
+        if not src.exists():
+            continue
+
+        target_dir = frame_root / src.stem
+        _reset_dir(target_dir)
+
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            print(f"Warning: cannot open final video for PNG export: {src}")
+            continue
+
+        frame_idx = 0
+        written = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            out_path = target_dir / f"{frame_idx:06d}.png"
+            if cv2.imwrite(str(out_path), frame):
+                written += 1
+            frame_idx += 1
+
+        cap.release()
+        exported_dirs.append(target_dir)
+        print(f"Final video PNG frames saved to {target_dir} ({written} frames)")
+
+    return exported_dirs
+
+
+def _copy_final_videos_to_keypoints_archive(video_path, output_dir):
+    """Copy generated pose videos into the same folder as keypoints_raw.npz."""
+    pointer_path = Path(output_dir) / "input_2D" / _ARCHIVE_POINTER_FILENAME
+    if not pointer_path.exists():
+        return []
+
+    archive_dir = Path(pointer_path.read_text(encoding="utf-8").strip())
+    if not archive_dir.exists():
+        return []
+
+    copied = []
+    for src in _final_video_candidates(video_path, output_dir):
+        if not src.exists():
+            continue
+        dst = archive_dir / f"final_{src.name}"
+        shutil.copy2(src, dst)
+        copied.append(dst)
+
+    if copied:
+        final_video_metadata = {
+            "final_videos": [str(path) for path in copied],
+        }
+        with open(archive_dir / "final_videos.json", "w", encoding="utf-8") as f:
+            json.dump(final_video_metadata, f, ensure_ascii=False, indent=2)
+
+    return copied
 
 
 def _interpolate_low_conf_keypoints(keypoints, scores, conf_threshold=0.50):
@@ -107,60 +308,345 @@ def _interpolate_low_conf_keypoints(keypoints, scores, conf_threshold=0.50):
     return filled, interpolated_mask
 
 
+def _load_bbox_heights(bbox_csv, num_frames, num_persons=1):
+    """
+    Read per-frame bbox heights from track_crop_roi.py bbox_map.csv.
+
+    Missing frames are forward-filled then backward-filled. The reference height
+    is the median valid bbox height, so jump limits scale with the runner size.
+    """
+    import csv as _csv
+
+    heights = np.zeros((num_persons, num_frames), dtype=np.float32)
+    if not bbox_csv or not os.path.exists(bbox_csv):
+        return None, None
+
+    with open(bbox_csv, newline='') as f:
+        for row in _csv.DictReader(f):
+            fi = int(row['output_frame'])
+            if 0 <= fi < num_frames:
+                heights[0, fi] = max(float(row['y2']) - float(row['y1']), 0.0)
+
+    valid = heights[heights > 0]
+    if valid.size == 0:
+        return None, None
+    ref_height = float(np.median(valid))
+
+    for person_idx in range(num_persons):
+        h = heights[person_idx]
+        last = 0.0
+        for frame_idx in range(num_frames):
+            if h[frame_idx] > 0:
+                last = h[frame_idx]
+            elif last > 0:
+                h[frame_idx] = last
+        last = 0.0
+        for frame_idx in range(num_frames - 1, -1, -1):
+            if h[frame_idx] > 0:
+                last = h[frame_idx]
+            elif last > 0:
+                h[frame_idx] = last
+
+    return heights, ref_height
+
+
 def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
                           max_jump_px=45.0, hard_jump_px=90.0,
-                          interpolated_mask=None):
+                          interpolated_mask=None, bbox_heights=None,
+                          bbox_ref_height=None, trust_low_conf=0.35,
+                          trust_full_conf=0.60, return_debug=False):
     """
-    對 HRNet 2D keypoints 做時間 EMA 平滑。
+    對 HRNet 2D keypoints 做自適應時間平滑。
 
     keypoints: shape (M, T, J, 2)
     scores:    shape (M, T, J)
 
-    高信心或已插值補過、且位移合理的點用 EMA 更新。
-    高信心但位移偏大的點會限制最大步長後更新，避免快速擺動關節卡在上一幀。
-    未插值的低信心或極端跳點才沿用上一幀，避免錯點把骨架拉飄。
+    - bbox height 將像素跳點限制正規化到人體當前大小。
+    - H36M per-joint speed factor 讓核心關節更穩、末梢關節允許較快移動。
+    - velocity prediction 用上一幀速度預測合理位置，避免連續快動作被誤判。
+    - confidence trust 使用連續權重，避免 0.49/0.51 造成硬切。
     """
     if keypoints.size == 0 or scores.size == 0:
-        return keypoints
+        return (keypoints, []) if return_debug else keypoints
 
     smoothed = keypoints.astype(np.float32, copy=True)
     num_person, num_frames, num_joints = scores.shape
     if interpolated_mask is None:
         interpolated_mask = np.zeros(scores.shape, dtype=bool)
 
+    if num_joints <= len(_JOINT_SPEED_H36M):
+        joint_speed = _JOINT_SPEED_H36M[:num_joints].astype(np.float32)
+    else:
+        extra = np.ones(num_joints - len(_JOINT_SPEED_H36M), dtype=np.float32)
+        joint_speed = np.concatenate([_JOINT_SPEED_H36M, extra])
+
+    debug_rows = []
+    trust_span = max(trust_full_conf - trust_low_conf, 1e-6)
+
     for person_idx in range(num_person):
         prev = None
+        velocity = None
         for frame_idx in range(num_frames):
             current = smoothed[person_idx, frame_idx]
             current_scores = scores[person_idx, frame_idx]
 
             if prev is None:
                 prev = current.copy()
+                velocity = np.zeros_like(prev, dtype=np.float32)
+                smoothed[person_idx, frame_idx] = prev
+                if return_debug:
+                    for joint_idx in range(num_joints):
+                        debug_rows.append({
+                            'person': person_idx,
+                            'frame': frame_idx,
+                            'joint': H36M_JOINT_NAMES[joint_idx] if joint_idx < len(H36M_JOINT_NAMES) else str(joint_idx),
+                            'confidence': float(current_scores[joint_idx]),
+                            'raw_x': float(current[joint_idx, 0]),
+                            'raw_y': float(current[joint_idx, 1]),
+                            'smoothed_x': float(prev[joint_idx, 0]),
+                            'smoothed_y': float(prev[joint_idx, 1]),
+                            'trust': 1.0,
+                            'jump': 0.0,
+                            'joint_max': 0.0,
+                            'joint_hard': 0.0,
+                            'bbox_height': 0.0,
+                            'bbox_scale': 1.0,
+                            'update_type': 'init',
+                        })
                 continue
 
-            high_conf = (current_scores >= conf_threshold) | interpolated_mask[person_idx, frame_idx]
-            jump = np.linalg.norm(current - prev, axis=1)
-            normal_update = high_conf & (jump <= max_jump_px)
+            if bbox_heights is not None and bbox_ref_height and bbox_ref_height > 0:
+                bbox_height = max(float(bbox_heights[person_idx, frame_idx]), 1.0)
+                scale = np.clip(bbox_height / bbox_ref_height, 0.6, 1.8)
+            else:
+                bbox_height = 0.0
+                scale = 1.0
 
-            if np.any(normal_update):
-                prev[normal_update] = (
-                    alpha * prev[normal_update] +
-                    (1.0 - alpha) * current[normal_update]
-                )
+            joint_max = max_jump_px * scale * joint_speed
+            joint_hard = hard_jump_px * scale * joint_speed
 
-            limited_update = high_conf & (jump > max_jump_px) & (jump <= hard_jump_px)
-            if np.any(limited_update):
-                direction = current[limited_update] - prev[limited_update]
-                distance = jump[limited_update][:, None]
-                capped_current = prev[limited_update] + direction / distance * max_jump_px
-                prev[limited_update] = (
-                    alpha * prev[limited_update] +
-                    (1.0 - alpha) * capped_current
-                )
+            vel_mag = np.linalg.norm(velocity, axis=1, keepdims=True)
+            velocity = np.where(
+                vel_mag > joint_max[:, None],
+                velocity / np.maximum(vel_mag, 1e-6) * joint_max[:, None],
+                velocity,
+            )
+            predicted = prev + velocity
 
+            diff = current - predicted
+            jump = np.linalg.norm(diff, axis=1)
+
+            trust = np.clip((current_scores - trust_low_conf) / trust_span, 0.0, 1.0)
+            is_interp = interpolated_mask[person_idx, frame_idx]
+            trust = np.where(is_interp, np.maximum(trust, 0.5), trust)
+            w_cur = trust * (1.0 - alpha)
+
+            safe_dist = np.maximum(jump, 1e-6)
+            capped = predicted + diff / safe_dist[:, None] * joint_max[:, None]
+
+            normal_update = jump <= joint_max
+            limited_update = (jump > joint_max) & (jump <= joint_hard)
+            outlier_update = jump > joint_hard
+
+            target = np.where(
+                normal_update[:, None],
+                current,
+                np.where(limited_update[:, None], capped, prev),
+            )
+
+            low_trust = w_cur <= 1e-6
+            new_prev = (1.0 - w_cur[:, None]) * prev + w_cur[:, None] * target
+            final_step = new_prev - prev
+            final_step_mag = np.linalg.norm(final_step, axis=1, keepdims=True)
+            final_step_cap = joint_max[:, None] * 0.80
+            final_step_limited = final_step_mag > final_step_cap
+            new_prev = np.where(
+                final_step_limited,
+                prev + final_step / np.maximum(final_step_mag, 1e-6) * final_step_cap,
+                new_prev,
+            )
+
+            displacement = new_prev - prev
+            new_velocity = 0.5 * velocity + 0.5 * displacement
+            new_velocity[outlier_update] *= 0.25
+            new_velocity[low_trust] *= 0.5
+
+            if return_debug:
+                update_type = np.full(num_joints, 'normal', dtype=object)
+                update_type[limited_update] = 'limited'
+                update_type[outlier_update] = 'outlier_hold'
+                update_type[low_trust] = 'low_trust_hold'
+                update_type[is_interp & ~outlier_update & ~limited_update & ~low_trust] = 'interpolated'
+                update_type[final_step_limited[:, 0] & ~outlier_update & ~low_trust] = 'final_step_limited'
+                for joint_idx in range(num_joints):
+                    debug_rows.append({
+                        'person': person_idx,
+                        'frame': frame_idx,
+                        'joint': H36M_JOINT_NAMES[joint_idx] if joint_idx < len(H36M_JOINT_NAMES) else str(joint_idx),
+                        'confidence': float(current_scores[joint_idx]),
+                        'raw_x': float(current[joint_idx, 0]),
+                        'raw_y': float(current[joint_idx, 1]),
+                        'smoothed_x': float(new_prev[joint_idx, 0]),
+                        'smoothed_y': float(new_prev[joint_idx, 1]),
+                        'trust': float(trust[joint_idx]),
+                        'jump': float(jump[joint_idx]),
+                        'joint_max': float(joint_max[joint_idx]),
+                        'joint_hard': float(joint_hard[joint_idx]),
+                        'bbox_height': float(bbox_height),
+                        'bbox_scale': float(scale),
+                        'update_type': update_type[joint_idx],
+                    })
+
+            prev = new_prev
+            velocity = new_velocity
             smoothed[person_idx, frame_idx] = prev
 
-    return smoothed
+    return (smoothed, debug_rows) if return_debug else smoothed
+
+
+def _smooth_keypoints_sg(keypoints, scores,
+                          conf_threshold=0.50,
+                          sg_window=7,
+                          sg_polyorder=2,
+                          frame_bad_joint_threshold=8,
+                          bbox_heights=None,
+                          bbox_ref_height=None,
+                          return_debug=False):
+    """
+    離線平滑：confidence 過濾 → 雙側孤立點偵測 → 線性插值 → Savitzky-Golay。
+
+    Phase 1: 低信心幀標記（conf < conf_threshold）
+    Phase 2: 雙側孤立點偵測 — frame t 若與前後幀距離均超過 _JOINT_MAX_PX（p95），
+             且前後幀彼此距離較小，則視為孤立跳點
+    Phase 3: 若同一幀壞點過多，整幀視為不可靠，避免半套錯骨架留下來
+    Phase 4: np.interp 線性插值補壞點
+    Phase 5: Savitzky-Golay 平滑整段軌跡
+
+    keypoints: (M, T, J, 2)
+    scores:    (M, T, J)
+    """
+    from scipy.signal import savgol_filter
+
+    if keypoints.size == 0 or scores.size == 0:
+        return (keypoints, []) if return_debug else keypoints
+
+    smoothed = keypoints.astype(np.float32, copy=True)
+    M, T, J = scores.shape
+    debug_rows = []
+
+    for person_idx in range(M):
+        kp = smoothed[person_idx]   # (T, J, 2)
+        sc = scores[person_idx]     # (T, J)
+
+        # Per-frame bbox scale (T,)
+        if bbox_heights is not None and bbox_ref_height and bbox_ref_height > 0:
+            bh    = np.maximum(bbox_heights[person_idx], 1.0)
+            scale = np.clip(bh / bbox_ref_height, 0.6, 1.8)
+        else:
+            scale = np.ones(T, dtype=np.float32)
+
+        low_conf_all = sc < conf_threshold
+        bilateral_all = np.zeros((T, J), dtype=bool)
+        thresh_all = np.zeros((T, J), dtype=np.float32)
+        jumps_all = np.zeros((T, J), dtype=np.float32)
+
+        for joint_idx in range(J):
+            traj_x = kp[:, joint_idx, 0]
+            traj_y = kp[:, joint_idx, 1]
+
+            max_px = float(_JOINT_MAX_PX[joint_idx]) if joint_idx < len(_JOINT_MAX_PX) else 45.0
+            thresh = max_px * scale
+            thresh_all[:, joint_idx] = thresh
+
+            x_prev = np.concatenate([[traj_x[0]], traj_x[:-1]])
+            x_next = np.concatenate([traj_x[1:], [traj_x[-1]]])
+            y_prev = np.concatenate([[traj_y[0]], traj_y[:-1]])
+            y_next = np.concatenate([traj_y[1:], [traj_y[-1]]])
+
+            d_prev = np.hypot(traj_x - x_prev, traj_y - y_prev)
+            d_next = np.hypot(traj_x - x_next, traj_y - y_next)
+            d_span = np.hypot(x_next - x_prev, y_next - y_prev)
+
+            bilateral = (d_prev > thresh) & (d_next > thresh) & (d_span < d_prev) & (d_span < d_next)
+            bilateral[0] = False
+            bilateral[-1] = False
+            bilateral_all[:, joint_idx] = bilateral
+            jumps_all[:, joint_idx] = d_prev
+
+        point_bad_all = low_conf_all | bilateral_all
+        frame_bad_count = np.sum(point_bad_all, axis=1)
+        frame_bad = frame_bad_count >= int(frame_bad_joint_threshold)
+
+        for joint_idx in range(J):
+            traj_x = kp[:, joint_idx, 0].copy()
+            traj_y = kp[:, joint_idx, 1].copy()
+            conf   = sc[:, joint_idx]
+
+            # Phase 1/2/3: point-level bad mask plus frame-level fallback.
+            bad_mask = low_conf_all[:, joint_idx]
+            bilateral = bilateral_all[:, joint_idx]
+            thresh = thresh_all[:, joint_idx]
+            final_bad = bad_mask | bilateral | frame_bad
+
+            # Phase 4: interpolate over bad spans
+            good_idx = np.where(~final_bad)[0]
+            if len(good_idx) == 0:
+                if return_debug:
+                    for t in range(T):
+                        jname = H36M_JOINT_NAMES[joint_idx] if joint_idx < len(H36M_JOINT_NAMES) else str(joint_idx)
+                        debug_rows.append({'person': person_idx, 'frame': t, 'joint': jname,
+                                           'confidence': float(conf[t]),
+                                           'raw_x': float(traj_x[t]), 'raw_y': float(traj_y[t]),
+                                           'smoothed_x': float(traj_x[t]), 'smoothed_y': float(traj_y[t]),
+                                           'jump': 0.0, 'threshold': float(thresh[t]),
+                                           'frame_bad_count': int(frame_bad_count[t]),
+                                           'update_type': 'all_bad'})
+                continue
+
+            all_idx      = np.arange(T)
+            traj_x_fixed = np.interp(all_idx, good_idx, traj_x[good_idx])
+            traj_y_fixed = np.interp(all_idx, good_idx, traj_y[good_idx])
+
+            # Phase 5: Savitzky-Golay smoothing
+            win = int(_SG_WINDOW_BY_JOINT[joint_idx]) if joint_idx < len(_SG_WINDOW_BY_JOINT) else sg_window
+            win = min(win, T)
+            if win % 2 == 0:
+                win -= 1
+            if win >= sg_polyorder + 2 and T >= win:
+                traj_x_smooth = savgol_filter(traj_x_fixed, win, sg_polyorder, mode='mirror')
+                traj_y_smooth = savgol_filter(traj_y_fixed, win, sg_polyorder, mode='mirror')
+            else:
+                traj_x_smooth = traj_x_fixed
+                traj_y_smooth = traj_y_fixed
+
+            smoothed[person_idx, :, joint_idx, 0] = traj_x_smooth
+            smoothed[person_idx, :, joint_idx, 1] = traj_y_smooth
+
+            if return_debug:
+                update_types = np.where(
+                    frame_bad, 'frame_bad',
+                    np.where(bad_mask, 'low_conf',
+                             np.where(bilateral, 'bilateral_outlier', 'good'))
+                )
+                jumps = jumps_all[:, joint_idx]
+                for t in range(T):
+                    jname = H36M_JOINT_NAMES[joint_idx] if joint_idx < len(H36M_JOINT_NAMES) else str(joint_idx)
+                    debug_rows.append({
+                        'person':      person_idx,
+                        'frame':       t,
+                        'joint':       jname,
+                        'confidence':  float(conf[t]),
+                        'raw_x':       float(traj_x[t]),
+                        'raw_y':       float(traj_y[t]),
+                        'smoothed_x':  float(traj_x_smooth[t]),
+                        'smoothed_y':  float(traj_y_smooth[t]),
+                        'jump':        float(jumps[t]),
+                        'threshold':   float(thresh[t]),
+                        'frame_bad_count': int(frame_bad_count[t]),
+                        'update_type': str(update_types[t]),
+                    })
+
+    return (smoothed, debug_rows) if return_debug else smoothed
 
 
 def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
@@ -168,15 +654,6 @@ def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
     if scores.size == 0:
         return
 
-    joint_names = [
-        'Hip',
-        'RHip', 'RKnee', 'RAnkle',
-        'LHip', 'LKnee', 'LAnkle',
-        'Spine', 'Thorax',
-        'Neck_Nose', 'Head',
-        'LShoulder', 'LElbow', 'LWrist',
-        'RShoulder', 'RElbow', 'RWrist',
-    ]
     rows = []
     for person_idx in range(scores.shape[0]):
         frames = valid_frames[person_idx] if person_idx < len(valid_frames) else None
@@ -187,7 +664,7 @@ def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
                 'frame': frame_idx,
                 'source_frame': source_frame,
             }
-            for joint_idx, joint_name in enumerate(joint_names):
+            for joint_idx, joint_name in enumerate(H36M_JOINT_NAMES):
                 row[joint_name] = float(scores[person_idx, frame_idx, joint_idx])
             rows.append(row)
 
@@ -268,19 +745,28 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         bbox_csv=bbox_csv,
     )
     keypoints, scores, valid_frames = h36m_coco_format(keypoints, scores)
-    keypoints, interpolated_mask = _interpolate_low_conf_keypoints(
+    raw_keypoints = keypoints.copy()
+    raw_scores = scores.copy()
+    bbox_heights = None
+    bbox_ref_height = None
+    if bbox_csv and keypoints.shape[0] > 0:
+        bbox_heights, bbox_ref_height = _load_bbox_heights(
+            bbox_csv,
+            keypoints.shape[1],
+            keypoints.shape[0],
+        )
+        if bbox_ref_height:
+            print(f'Adaptive bbox reference height: {bbox_ref_height:.1f}px')
+
+    keypoints, smoothing_debug_rows = _smooth_keypoints_sg(
         keypoints,
         scores,
         conf_threshold=0.50,
-    )
-    keypoints = _smooth_keypoints_ema(
-        keypoints,
-        scores,
-        alpha=0.20,
-        conf_threshold=0.50,
-        max_jump_px=45.0,
-        hard_jump_px=90.0,
-        interpolated_mask=interpolated_mask,
+        sg_window=7,
+        sg_polyorder=2,
+        bbox_heights=bbox_heights,
+        bbox_ref_height=bbox_ref_height,
+        return_debug=True,
     )
 
     # Add conf score to the last dim
@@ -291,9 +777,29 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
 
     output_npz = os.path.join(output_2d_dir, 'keypoints.npz')
     np.savez_compressed(output_npz, reconstruction=keypoints, valid_frames=valid_frames)
+    raw_output_npz = os.path.join(output_2d_dir, 'keypoints_raw.npz')
+    raw_keypoints_with_conf = np.concatenate((raw_keypoints, raw_scores[..., None]), axis=-1)
+    np.savez_compressed(
+        raw_output_npz,
+        reconstruction=raw_keypoints_with_conf,
+        valid_frames=valid_frames,
+    )
+    print(f'Raw HRNet keypoints saved to {raw_output_npz}')
+    archived_raw_npz = _archive_raw_keypoints(
+        video_path,
+        output_dir,
+        raw_keypoints_with_conf,
+        valid_frames,
+    )
+    _remember_keypoints_archive_dir(output_dir, archived_raw_npz)
+    print(f'Raw HRNet keypoints archived to {archived_raw_npz}')
     confidence_csv = os.path.join(output_dir, 'hrnet_confidence.csv')
     _save_hrnet_confidence_csv(scores, valid_frames, confidence_csv)
     print(f'HRNet confidence CSV saved to {confidence_csv}')
+    if smoothing_debug_rows:
+        debug_csv = os.path.join(output_dir, 'keypoint_smoothing_debug.csv')
+        pd.DataFrame(smoothing_debug_rows).to_csv(debug_csv, index=False)
+        print(f'Keypoint smoothing debug CSV saved to {debug_csv}')
 
 
 def img2video(video_path, output_dir):
@@ -434,6 +940,49 @@ def _angle_between(v1, v2):
     return np.degrees(np.arccos(cos))
 
 
+def _fix_supplementary_angle_flips(angles, max_delta=45.0, improvement_margin=15.0):
+    """
+    Correct isolated 180-angle flips while preserving normal knee motion.
+
+    MotionAGFormer sometimes puts the knee on the opposite 3D side for a few
+    frames. The unsigned arccos angle then becomes the supplementary angle.
+    We only flip when 180-angle is much closer to the local temporal trend.
+    """
+    arr = np.asarray(angles, dtype=np.float32).copy()
+    if arr.size < 3:
+        return arr, []
+
+    corrected = arr.copy()
+    corrections = []
+
+    for idx in range(arr.size):
+        neighbor_values = []
+        for nidx in (idx - 2, idx - 1, idx + 1, idx + 2):
+            if 0 <= nidx < arr.size and np.isfinite(corrected[nidx]):
+                neighbor_values.append(float(corrected[nidx]))
+        if len(neighbor_values) < 2 or not np.isfinite(arr[idx]):
+            continue
+
+        local_ref = float(np.median(neighbor_values))
+        raw = float(arr[idx])
+        supplementary = 180.0 - raw
+        raw_error = abs(raw - local_ref)
+        supp_error = abs(supplementary - local_ref)
+
+        if raw_error > max_delta and supp_error + improvement_margin < raw_error:
+            corrected[idx] = supplementary
+            corrections.append({
+                'frame': int(idx),
+                'raw_angle': raw,
+                'corrected_angle': supplementary,
+                'local_reference': local_ref,
+                'raw_error': raw_error,
+                'corrected_error': supp_error,
+            })
+
+    return corrected, corrections
+
+
 def compute_angles(npz_path, output_dir):
     """
     讀取 3D keypoints npz，逐幀計算各關節角度，並存成 CSV。
@@ -488,12 +1037,23 @@ def compute_angles(npz_path, output_dir):
     ]
 
     df = pd.DataFrame(results, columns=columns)
+    knee_corrections = []
+    for col in ('left_knee_angle', 'right_knee_angle'):
+        fixed, corrections = _fix_supplementary_angle_flips(df[col].to_numpy())
+        df[col] = fixed
+        for correction in corrections:
+            correction['joint'] = col
+            knee_corrections.append(correction)
 
     out_dir = os.path.join(output_dir, 'pred_3D', 'angles')
     os.makedirs(out_dir, exist_ok=True)
     video_name = os.path.basename(os.path.normpath(output_dir))
     out_csv = os.path.join(out_dir, f'{video_name}_angles.csv')
     df.to_csv(out_csv, index=False)
+    if knee_corrections:
+        debug_csv = os.path.join(out_dir, f'{video_name}_knee_angle_corrections.csv')
+        pd.DataFrame(knee_corrections).to_csv(debug_csv, index=False)
+        print(f'Knee supplementary angle corrections saved to {debug_csv}')
     print(f'\n✅ Angle computation done. Saved to {out_csv}')
     return out_csv
 
@@ -692,6 +1252,10 @@ def run_pose_estimation(video_path: str, output_dir: str,
 
     if not skip_video:
         img2video(video_path, output_dir)
+        _export_final_video_frames(video_path, output_dir)
+        archived_final_videos = _copy_final_videos_to_keypoints_archive(video_path, output_dir)
+        for archived_video in archived_final_videos:
+            print(f'Final pose video archived to {archived_video}')
         print('Generating demo successful!')
 
     return output_dir

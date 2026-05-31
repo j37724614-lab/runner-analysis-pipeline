@@ -31,6 +31,70 @@ from scripts.analysis.ankle_step_stride import (
     run_step_stride_analysis,
 )
 
+
+def _copy_output_final_to_keypoints_archive(final_pose_dir: str, output_video: str):
+    """Copy the web-compatible final video into the raw-keypoints archive folder."""
+    pointer_path = Path(final_pose_dir) / "input_2D" / "keypoints_raw_archive_dir.txt"
+    if not pointer_path.exists():
+        return None
+
+    archive_dir = Path(pointer_path.read_text(encoding="utf-8").strip())
+    if not archive_dir.exists() or not os.path.exists(output_video):
+        return None
+
+    copied_video = archive_dir / "output_final.mp4"
+    shutil.copy2(output_video, copied_video)
+
+    final_videos_json = archive_dir / "final_videos.json"
+    final_videos = []
+    if final_videos_json.exists():
+        try:
+            with open(final_videos_json, encoding="utf-8") as f:
+                final_videos = json.load(f).get("final_videos", [])
+        except (OSError, json.JSONDecodeError):
+            final_videos = []
+
+    copied_video_str = str(copied_video)
+    if copied_video_str not in final_videos:
+        final_videos.append(copied_video_str)
+    with open(final_videos_json, "w", encoding="utf-8") as f:
+        json.dump({"final_videos": final_videos}, f, ensure_ascii=False, indent=2)
+
+    return copied_video
+
+
+def _export_video_frames(video_path: str, output_root: str, folder_name: str = "final_video_frames"):
+    """Export every frame of a final video as PNG under output_root/folder_name/video_stem."""
+    if not video_path or not os.path.exists(video_path):
+        return None
+
+    video_stem = Path(video_path).stem
+    frames_dir = Path(output_root) / folder_name / video_stem
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  ▶ 無法開啟最終影片輸出逐幀 PNG: {video_path}")
+        return None
+
+    frame_idx = 0
+    written = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_path = frames_dir / f"{frame_idx:06d}.png"
+        if cv2.imwrite(str(frame_path), frame):
+            written += 1
+        frame_idx += 1
+
+    cap.release()
+    print(f"  ▶ 最終影片逐幀 PNG: {frames_dir} ({written} frames)")
+    return str(frames_dir)
+
+
 # -----------------------------------------------------------------------
 # 延遲 import：只在真正需要時才載入 GPU-heavy 的 3D 重建函式庫
 # -----------------------------------------------------------------------
@@ -84,10 +148,12 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
         if 'crop_height'         in extra_cfg: tcr.CROP_HEIGHT         = int(extra_cfg['crop_height'])
         if 'auto_crop'           in extra_cfg: tcr.AUTO_CROP           = bool(extra_cfg['auto_crop'])
         if 'show_overlay'        in extra_cfg: tcr.SHOW_OVERLAY        = bool(extra_cfg['show_overlay'])
+        if 'draw_bbox_overlay'   in extra_cfg: tcr.DRAW_BBOX_OVERLAY   = bool(extra_cfg['draw_bbox_overlay'])
         if 'movement_threshold'  in extra_cfg: tcr.MOVEMENT_THRESHOLD  = int(extra_cfg['movement_threshold'])
         if 'min_movement_frames' in extra_cfg: tcr.MIN_MOVEMENT_FRAMES = int(extra_cfg['min_movement_frames'])
         if 'stationary_decay'    in extra_cfg: tcr.STATIONARY_DECAY    = int(extra_cfg['stationary_decay'])
         if 'max_person_memory'   in extra_cfg: tcr.MAX_PERSON_MEMORY   = int(extra_cfg['max_person_memory'])
+        if 'tracking_mode'       in extra_cfg: tcr.TRACKING_MODE       = str(extra_cfg['tracking_mode'])
 
     # 建立並過濾有效相機清單
     CAMERAS = [tcr._build_camera_from_entry(e) for e in cameras_cfg]
@@ -145,7 +211,22 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
     frame_map_name = output_name.replace('.mp4', '_frame_map.csv')
     frame_map_path = os.path.join(output_dir, frame_map_name)
 
-    tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
+    if tcr.TRACKING_MODE == 'two_pass':
+        print("two_pass 模式：第一遍收集所有候選人軌跡...")
+        caps_pass1 = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
+        all_detections, frame_cache = tcr._collect_all_detections(caps_pass1, CAMERAS, model)
+        for c in caps_pass1:
+            c.release()
+        print(f"  收集完成：共 {len(all_detections)} 筆偵測")
+        first_cam_base = os.path.splitext(os.path.basename(CAMERAS[0]['video_path']))[0]
+        preset_ids, summaries = tcr._score_and_select_runners(all_detections, CAMERAS)
+        tcr._stitch_target_id(frame_cache, preset_ids, CAMERAS)
+        tcr._write_two_pass_debug(all_detections, summaries, preset_ids, first_cam_base)
+        print("two_pass 模式：第二遍輸出追焦影片（快取模式，跳過 YOLO）...")
+        tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path,
+                             preset_target_ids=preset_ids, frame_cache=frame_cache)
+    else:
+        tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
     out.release()
 
     print(f"\nStep 1 完成，置中裁剪影片儲存至：{output_path}\n")
@@ -448,6 +529,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
 
     # 【階段三】產出未裁剪、原比例的 skeleton 與線條疊加影片
     output_uncropped = None
+    output_final_frames_dir = None
     if cameras:
         orig_stem = Path(cameras[0]['video_path']).stem
         offsets_npz = os.path.join(output_dest, f"{orig_stem}_offsets.npz")
@@ -499,6 +581,16 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
                 convert_to_web_compatible_mp4(output_uncropped)
                 print(f"  ▶ [Core.Pipeline] 網頁串流格式轉檔成功: {output_uncropped}")
+                output_final_frames_dir = _export_video_frames(
+                    output_uncropped,
+                    output_dest if output_dest else os.path.dirname(output_uncropped),
+                )
+                archived_output_final = _copy_output_final_to_keypoints_archive(
+                    final_pose_dir,
+                    output_uncropped,
+                )
+                if archived_output_final:
+                    print(f"  ▶ 已複製 Web 相容影片到 keypoints archive: {archived_output_final}")
 
                 # 清理 Phase 1 YOLO 產出之中間置中裁剪影片，節省空間
                 print("\n  ▶ 正在清理中間過程影片...")
@@ -539,6 +631,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         "metrics_csv": metrics_csv_dest,
         "angles_csv": angle_csv_dest,
         "uncropped_video": output_uncropped,
+        "output_final_frames_dir": output_final_frames_dir,
         "step_analysis": step_analysis,
         "total_time": total_time,
         "avg_velocity": avg_velocity,
