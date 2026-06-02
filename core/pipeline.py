@@ -17,6 +17,7 @@ import json
 import shutil
 import argparse
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 import cv2
@@ -26,6 +27,7 @@ from core.utils import REPO_ROOT, convert_to_web_compatible_mp4
 from core import tracking as tcr
 from core.visualization import add_angle_overlay
 from core.overlay import overlay_videos
+from core.tracker_impl import compute_speed_from_bbox_map
 from scripts.analysis.ankle_step_stride import (
     annotate_step_stride_video,
     run_step_stride_analysis,
@@ -411,6 +413,16 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     一鍵啟動分析管線：運動表現 (Phase 1) -> 生物力學 (Phase 2) -> 原始影片疊加 (Phase 3) -> 網頁格式轉檔。
     """
     cameras = config_dict.get("cameras", [])
+    tracking_cameras = []
+    for cam in cameras:
+        tracking_cam = dict(cam)
+        # Step-length analysis can use four-point homography, but the historical
+        # speed/distance metrics are based on start/end line scaling.  Keep the
+        # tracking path on that calibration so existing velocity outputs do not
+        # change when homography is enabled for step length.
+        tracking_cam.pop("homography_src_points", None)
+        tracking_cam.pop("homography_dst_world", None)
+        tracking_cameras.append(tracking_cam)
     if not output_dest:
         output_dest = config_dict.get("output_dest")
     
@@ -429,74 +441,77 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     extra_cfg = {k: v for k, v in config_dict.items() if k != "cameras"}
 
     print("=" * 60)
-    print("【階段一】運動表現分析 — 速度與加速度量測")
+    print("【階段一/二】骨架追蹤 + 2D/3D 姿態估計")
     print("=" * 60)
-    
+
     if progress_callback: progress_callback(5)
-    
-    if not skip_track:
-        # Phase 1: 透過 CLI Subprocess 呼叫 track_runners.py 以達 CUDA 行程隔離
-        track_script = str(REPO_ROOT / "track_runners.py")
-        track_cmd = [sys.executable, track_script]
-        track_config = config_dict.copy()
-        track_config["gpu"] = gpu
-        track_config["skip_video"] = True  # 階段一不重複繪製影片以求加速
-        track_cmd.extend(["--config-json", json.dumps(track_config)])
-            
-        try:
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = gpu
-            subprocess.run(track_cmd, env=env, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"track_runners.py 子程序執行失敗: {e}")
-            return None
-    else:
-        print("使用者指定 skip_track，略過運動表現分析影片生成。")
 
-    if progress_callback: progress_callback(30)
-
-    print("\n" + "=" * 60)
-    print("【階段二】生物力學分析 — 2D/3D姿態與角度計算")
-    print("=" * 60)
-    
-    if progress_callback: progress_callback(40)
-    
     result = run_pipeline(
-        cameras=cameras,
+        cameras=tracking_cameras,
         extra_cfg=extra_cfg,
         output_dir=output_dest,
         gpu=gpu,
         only_2d=only_2d,
         skip_track=skip_track,
-        skip_video=True, # 階段二不產生裁剪骨架影片，只保存中間 2D 關節
+        skip_video=True,  # 中間裁剪骨架影片僅用於姿態估計，不輸出
     )
-    
-    if progress_callback: progress_callback(80)
-    
-    print("\n" + "★" * 60)
-    print("🎉 所有分析流程已順利完成！ 🎉")
-    print("★" * 60)
-    
+
+    if progress_callback: progress_callback(70)
+
     track_out_dir = config_dict.get("output_dir", "output_cut")
     track_out_name = config_dict.get("output_name", "sequential_tracked.mp4")
-    
-    # 重新命名 track_runners 產出的 CSV 檔為全域 metrics.csv
-    track_csv_orig = os.path.join(track_out_dir, track_out_name.replace(".mp4", "_metrics.csv"))
     metrics_csv_dest = os.path.join(output_dest if output_dest else track_out_dir, "metrics.csv")
-    
-    if os.path.exists(track_csv_orig) and track_csv_orig != metrics_csv_dest:
-        os.rename(track_csv_orig, metrics_csv_dest)
-        track_csv_display = metrics_csv_dest
-    else:
-        track_csv_display = track_csv_orig if os.path.exists(track_csv_orig) else "未生成"
 
-    print("\n[分析結果]")
-    print(f"  ▶ 運動表現分析資料 (CSV): {track_csv_display}")
-    
-    print("\n[生物力學分析結果]")
+    # 速度分析：從骨架追蹤產出的 bbox_map.csv 直接計算，無需重跑 YOLO
+    tracked_video = result.get('tracked_video')
+    if not skip_track and tracked_video:
+        video_stem_for_bbox = Path(tracked_video).stem
+        bbox_map_path = os.path.join(output_dest, f"{video_stem_for_bbox}_bbox_map.csv")
+        # offsets.npz is named after the first camera's video, not the tracked output
+        first_cam_stem = Path(cameras[0]['video_path']).stem if cameras else video_stem_for_bbox
+        offsets_npz_path = os.path.join(output_dest, f"{first_cam_stem}_offsets.npz")
+        if os.path.exists(bbox_map_path):
+            print("\n" + "=" * 60)
+            print("【速度分析】從 bbox_map.csv 計算速度與加速度（無需重跑 YOLO）")
+            print("=" * 60)
+            try:
+                fps_val = 60.0
+                if cameras and cameras[0].get('video_path'):
+                    _cap = cv2.VideoCapture(cameras[0]['video_path'])
+                    if _cap.isOpened():
+                        fps_val = _cap.get(cv2.CAP_PROP_FPS) or 60.0
+                        _cap.release()
+                all_track_data = compute_speed_from_bbox_map(
+                    bbox_map_path, tracking_cameras, fps_override=fps_val,
+                    offsets_npz=offsets_npz_path)
+                if all_track_data:
+                    import csv as _csv_mod
+                    with open(metrics_csv_dest, 'w', newline='', encoding='utf-8') as _f:
+                        _w = _csv_mod.DictWriter(
+                            _f, fieldnames=[
+                                'cam', 'cam_frame', 'source_frame', 'absolute_frame',
+                                'dist_m', 'dist_raw_m', 'dist_smooth_m',
+                                'world_x', 'image_point_x', 'image_point_y',
+                                'speed_mps', 'accel_mps2',
+                                'is_interpolated', 'interp_gap_len', 'speed_confidence'])
+                        _w.writeheader()
+                        _w.writerows(all_track_data)
+                    print(f"  ▶ 速度分析完成，{len(all_track_data)} 幀 → {metrics_csv_dest}")
+                else:
+                    print("  ▶ 速度計算未產出資料（無 calibration 資訊或 bbox 不足）")
+            except Exception as _e:
+                print(f"  ▶ 速度計算失敗: {_e}")
+        else:
+            print(f"  ▶ bbox_map.csv 不存在，速度分析略過: {bbox_map_path}")
+    else:
+        print("  使用者指定 skip_track，略過速度分析。")
+
+    if progress_callback: progress_callback(80)
+
+    print("\n" + "=" * 60)
     final_pose_dir = result.get('output_dir', '未定義')
-    
-    # 將 MotionAGFormer 產生的雜亂輸出資料夾改名為 sequential_tracked
+
+    # MotionAGFormer 輸出資料夾統一改名為 sequential_tracked
     expected_pose_dir = os.path.join(output_dest, "sequential_tracked")
     if os.path.exists(final_pose_dir) and final_pose_dir != expected_pose_dir:
         if os.path.exists(expected_pose_dir):
@@ -505,14 +520,12 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         final_pose_dir = expected_pose_dir
 
     print(f"  ▶ 姿態分析資料夾: {final_pose_dir}")
-         
-    # 將角度 CSV 從深度目錄中提取到 output 目錄下，重新命名為 angles.csv
-    tracked_video = result.get('tracked_video')
+
+    # 將角度 CSV 提取到 output 目錄下，命名為 angles.csv
     angle_csv_dest = None
     if tracked_video:
         video_stem = Path(tracked_video).stem
         angle_csv_orig = os.path.join(final_pose_dir, "pred_3D", "angles", f"{video_stem}_angles.csv")
-
         if os.path.exists(angle_csv_orig) and output_dest:
             angle_csv_dest = os.path.join(output_dest, "angles.csv")
             try:
@@ -527,7 +540,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     avg_step_length = None
     step_analysis = None
 
-    # 【階段三】產出未裁剪、原比例的 skeleton 與線條疊加影片
+    # 【階段三 + 四a】並行：原比例骨架影片疊加 + 步頻分析
     output_uncropped = None
     output_final_frames_dir = None
     if cameras:
@@ -539,27 +552,27 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         if os.path.exists(offsets_npz) and os.path.exists(kps_npz):
             if progress_callback: progress_callback(90)
             print("\n" + "=" * 60)
-            print("【階段三】匯出未裁切之原比例骨架影片 (Core.Overlay)")
+            print("【階段三/四a】並行：骨架影片疊加 + 步頻分析")
             print("=" * 60)
             try:
-                overlay_videos(
-                    cameras=cameras,
-                    offsets_npz=offsets_npz,
-                    kps_npz=kps_npz,
-                    output_video=output_uncropped,
-                    config=config_dict,
-                )
-                if progress_callback: progress_callback(93)
+                with ThreadPoolExecutor(max_workers=2) as _pool:
+                    _fut_overlay = _pool.submit(
+                        overlay_videos,
+                        cameras=cameras,
+                        offsets_npz=offsets_npz,
+                        kps_npz=kps_npz,
+                        output_video=output_uncropped,
+                        config=config_dict,
+                    )
+                    _fut_step = _pool.submit(
+                        run_step_stride_analysis,
+                        config=config_dict,
+                        output_dir=output_dest,
+                        make_video=False,
+                    )
 
-                print("\n" + "=" * 60)
-                print("【階段四】步頻與步幅分析")
-                print("=" * 60)
-                step_analysis = run_step_stride_analysis(
-                    config=config_dict,
-                    output_dir=output_dest,
-                    make_video=False,
-                )
-                if progress_callback: progress_callback(95)
+                _fut_overlay.result()
+                step_analysis = _fut_step.result()
                 avg_step_length = step_analysis.get("avg_step_length_m")
                 print(f"  ▶ 腳踝位置資料 (CSV): {step_analysis['ankle_csv']}")
                 print(f"  ▶ 步伐事件資料 (CSV): {step_analysis['steps_csv']}")
@@ -569,6 +582,10 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 if avg_step_length is not None:
                     print(f"  ▶ 平均步幅: {avg_step_length:.2f} m")
 
+                # 【階段四b】步伐標注（需 overlay 影片 + 步頻資料都完成才能執行）
+                print("\n" + "=" * 60)
+                print("【階段四b】步伐標注影片合成")
+                print("=" * 60)
                 tmp_uncropped = output_uncropped.replace(".mp4", "_tmp_steps.mp4")
                 annotate_step_stride_video(
                     input_video=output_uncropped,
@@ -578,9 +595,8 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     avg_cadence_spm=step_analysis.get("avg_cadence_spm"),
                 )
                 os.replace(tmp_uncropped, output_uncropped)
-                if progress_callback: progress_callback(97)
 
-                # 轉碼為 H.264 Web 相容格式，加入 faststart metadata 以支援瀏覽器直接預覽
+                # 轉碼為 H.264 Web 相容格式
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
                 convert_to_web_compatible_mp4(output_uncropped)
                 print(f"  ▶ [Core.Pipeline] 網頁串流格式轉檔成功: {output_uncropped}")
@@ -595,7 +611,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 if archived_output_final:
                     print(f"  ▶ 已複製 Web 相容影片到 keypoints archive: {archived_output_final}")
 
-                # 清理 Phase 1 YOLO 產出之中間置中裁剪影片，節省空間
+                # 清理中間裁剪追蹤影片
                 print("\n  ▶ 正在清理中間過程影片...")
                 if tracked_video and os.path.exists(tracked_video):
                     os.remove(tracked_video)
@@ -605,7 +621,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 print(f"匯出未裁切影片失敗: {e}")
 
     print("\n" + "=" * 60)
-    
+
     if progress_callback: progress_callback(100)
     
     total_time = None
@@ -623,12 +639,42 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     if cap.isOpened():
                         fps_val = cap.get(cv2.CAP_PROP_FPS) or 60.0
                         cap.release()
-                
+
                 total_time = float((df["absolute_frame"].max() + 1) / fps_val)
                 avg_velocity = float(df["speed_mps"].mean())
                 avg_acceleration = float(df["accel_mps2"].mean())
         except Exception as e:
             print(f"指標計算異常: {e}")
+
+    # Fallback: metrics.csv 缺失時從 frame_map CSV 估算 total_time，避免 DB NOT NULL 失敗
+    if total_time is None:
+        try:
+            fps_val = 60.0
+            if cameras and cameras[0].get('video_path'):
+                cap = cv2.VideoCapture(cameras[0]['video_path'])
+                if cap.isOpened():
+                    fps_val = cap.get(cv2.CAP_PROP_FPS) or 60.0
+                    cap.release()
+            frame_map_csv = os.path.join(
+                track_out_dir,
+                track_out_name.replace(".mp4", "_frame_map.csv")
+            )
+            if os.path.exists(frame_map_csv):
+                df_fm = pd.read_csv(frame_map_csv)
+                if not df_fm.empty and "orig_frame" in df_fm.columns:
+                    total_time = float((df_fm["orig_frame"].max() + 1) / fps_val)
+                    print(f"  [fallback] total_time 從 frame_map 估算: {total_time:.2f}s")
+        except Exception as e:
+            print(f"  [fallback] total_time 計算異常: {e}")
+
+    if total_time is None:
+        total_time = 0.0
+        print("  [warning] total_time 無法取得，設為 0.0")
+
+    if avg_velocity is None:
+        avg_velocity = 0.0
+    if avg_acceleration is None:
+        avg_acceleration = 0.0
 
     return {
         "metrics_csv": metrics_csv_dest,

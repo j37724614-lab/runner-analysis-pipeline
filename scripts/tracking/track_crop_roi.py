@@ -344,7 +344,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
     使用指定 bbox 重新裁切一幀，供 YOLO 缺失幀的插值補幀使用。
 
     bbox 座標系與 process_frame() 相同：若有 crop_params，bbox 是前處理裁剪後的座標。
-    回傳 (crop_frame, bbox_in_crop)。
+    回傳 (crop_frame, bbox_in_crop, off_x, off_y)。
     """
     if crop_params:
         cx1, cy1, cx2, cy2 = crop_params
@@ -352,8 +352,10 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
         cx1, cx2 = max(0, cx1), min(w, cx2)
         cy1, cy2 = max(0, cy1), min(h, cy2)
         if cx2 <= cx1 or cy2 <= cy1:
-            return None, None
+            return None, None, None, None
         img = img[cy1:cy2, cx1:cx2]
+    else:
+        cx1 = cy1 = 0
 
     bx1, by1, bx2, by2 = map(int, bbox)
     h_img, w_img = img.shape[:2]
@@ -362,7 +364,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
     by1 = int(np.clip(by1, 0, max(h_img - 1, 0)))
     by2 = int(np.clip(by2, 0, max(h_img - 1, 0)))
     if bx2 <= bx1 or by2 <= by1:
-        return None, None
+        return None, None, None, None
 
     if SHOW_OVERLAY and DRAW_BBOX_OVERLAY:
         color = (255, 0, 255) if label_interpolated else (0, 255, 0)
@@ -406,7 +408,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False):
         else:
             crop_frame = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
 
-    return crop_frame, bbox_in_crop
+    return crop_frame, bbox_in_crop, c1x + cx1, c1y + cy1
 
 
 def process_frame(img, model, velocity_tracker, device,
@@ -830,7 +832,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             for idx, item in enumerate(pending_missing, start=1):
                 ratio = idx / (gap_len + 1)
                 interp_bbox = _interpolate_bbox(last_valid_bbox, right_bbox, ratio)
-                interp_frame, interp_bbox_in_crop = _crop_from_bbox(
+                interp_frame, interp_bbox_in_crop, interp_off_x, interp_off_y = _crop_from_bbox(
                     item['frame'],
                     cam['crop_params'],
                     interp_bbox,
@@ -845,8 +847,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     track_id,
                     is_interpolated=True,
                     interp_gap_len=gap_len,
-                    off_x=off_x,
-                    off_y=off_y,
+                    off_x=interp_off_x if interp_off_x is not None else off_x,
+                    off_y=interp_off_y if interp_off_y is not None else off_y,
                 )
                 cam_interpolated += 1
             pending_missing.clear()

@@ -101,10 +101,21 @@ def _homography_calibration(src_points, dst_points_world):
         "direction": (1.0, 0.0),
         "meters_per_pixel": None,
         "homography": H,
+        "world_x_min": float(np.nanmin(dst[:, 0])),
+        "world_x_max": float(np.nanmax(dst[:, 0])),
     }
 
 
 def _make_calibration(cam_cfg, cfg, args, start_line, end_line, distance_m):
+    calibration = _track_calibration(
+        start_line=start_line,
+        end_line=end_line,
+        distance_m=distance_m,
+        meters_per_pixel=args.meters_per_pixel,
+    )
+    if calibration.get("meters_per_pixel") is not None:
+        return calibration
+
     homography = _homography_calibration(
         cam_cfg.get("homography_src_points") or cfg.get("homography_src_points"),
         cam_cfg.get("homography_dst_world") or cfg.get("homography_dst_world"),
@@ -112,12 +123,7 @@ def _make_calibration(cam_cfg, cfg, args, start_line, end_line, distance_m):
     if homography is not None:
         return homography
 
-    return _track_calibration(
-        start_line=start_line,
-        end_line=end_line,
-        distance_m=distance_m,
-        meters_per_pixel=args.meters_per_pixel,
-    )
+    return calibration
 
 
 def _transform_homography(point, H):
@@ -234,22 +240,30 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
     fps = fps or 30.0
 
     if min_step_frames is None:
-        # Lower-ankle peaks represent every step. Keep the minimum gap fixed so
-        # close true contacts are not dropped by find_peaks(distance=...).
-        min_step_frames = 5
-    min_touchdown_gap_frames = max(8, min_step_frames)
+        # Minimum frames between consecutive touchdowns based on fps.
+        # Assumes max cadence ~4.5 steps/s per foot (270 spm).
+        min_step_frames = max(4, int(fps / 4.5))
+    min_touchdown_gap_frames = max(3, min_step_frames // 2)
 
     def smooth(values):
+        from scipy.signal import butter, filtfilt
         n = len(values)
-        if n < 5:
+        if n < 13:
             return values
-        # Keep the lower-ankle smoothing short so close touchdown peaks are not
-        # flattened away.
-        win = min(7, n if n % 2 == 1 else n - 1)
-        if win % 2 == 0:
-            win -= 1
-        return savgol_filter(values, window_length=win, polyorder=2)
+        # Low-pass Butterworth at 6 Hz removes skeleton jitter while preserving
+        # step peaks (~2-4 Hz). Used only for peak detection; reported ankle
+        # coordinates always come from the original rows.
+        cutoff_hz = 6.0
+        nyq = fps / 2.0
+        if cutoff_hz >= nyq:
+            return values
+        b, a = butter(4, cutoff_hz / nyq, btype='low')
+        return filtfilt(b, a, values)
 
+    # Use combined lower_ankle_y signal so detection is robust to left/right label swaps.
+    # distance = fps/8 (~7 at 60fps) allows alternating-foot peaks spaced ~fps/cadence/2
+    # frames apart to both be detected, unlike min_step_frames which is calibrated for
+    # same-foot intervals and would suppress every other step.
     y = np.array([r["lower_ankle_y"] for r in ankle_rows], dtype=float)
     y_smooth = smooth(y)
     lower_prominence = prominence
@@ -257,20 +271,39 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
         q75, q25 = np.nanpercentile(y_smooth, [75, 25])
         lower_prominence = max((q75 - q25) * 0.20, 1.5)
 
+    peak_distance = max(3, int(fps / 8.0))
     peaks, props = find_peaks(
         y_smooth,
-        distance=min_step_frames,
+        distance=peak_distance,
         prominence=lower_prominence,
     )
     prominences = props.get("prominences", np.zeros(len(peaks), dtype=float))
 
-    candidates = []
-    for peak_idx, peak_prominence in zip(peaks, prominences):
+    def _valid_conf(conf, min_conf):
+        try:
+            value = float(conf)
+        except (TypeError, ValueError):
+            return False
+        return np.isnan(value) or value >= min_conf
+
+    def _inside_calibrated_range(candidate):
+        if calibration.get("mode") != "homography":
+            return True
+        world_x = _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
+        x_min = calibration.get("world_x_min")
+        x_max = calibration.get("world_x_max")
+        if x_min is None or x_max is None:
+            return True
+        margin_m = 0.5
+        return float(x_min) - margin_m <= world_x <= float(x_max) + margin_m
+
+    def _candidate_from_peak(peak_idx, peak_prominence, source):
         row = ankle_rows[int(peak_idx)]
         conf = row["lower_ankle_conf"]
-        if not (np.isnan(float(conf)) if isinstance(conf, float) else False) and float(conf) < 0.30:
-            continue
-        candidates.append({
+        if not _valid_conf(conf, 0.30):
+            return None
+        # Foot label: whichever ankle is lower at this frame (lower_foot is pre-computed).
+        candidate = {
             "row_idx": int(peak_idx),
             "row": row,
             "foot": row["lower_foot"],
@@ -278,7 +311,15 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
             "ankle_y": row["lower_ankle_y"],
             "ankle_conf": conf,
             "prominence": float(peak_prominence),
-        })
+            "source": source,
+        }
+        return candidate if _inside_calibrated_range(candidate) else None
+
+    candidates = []
+    for peak_idx, peak_prominence in zip(peaks, prominences):
+        candidate = _candidate_from_peak(peak_idx, peak_prominence, "smooth")
+        if candidate is not None:
+            candidates.append(candidate)
 
     filtered_candidates = []
     for candidate in candidates:
@@ -295,6 +336,198 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
                 filtered_candidates[-1] = candidate
         else:
             filtered_candidates.append(candidate)
+
+    # Rescue narrow raw peaks that the low-pass filter may suppress.
+    # This is intentionally conservative: raw peaks are only considered inside
+    # unusually large time gaps or unusually large track-position gaps between
+    # smooth detections, and still must pass confidence, prominence, timing,
+    # and track-position checks.
+    raw_q75, raw_q25 = np.nanpercentile(y, [75, 25])
+    raw_prominence = max((raw_q75 - raw_q25) * 0.20, 1.5)
+    raw_peaks, raw_props = find_peaks(
+        y,
+        distance=peak_distance,
+        prominence=raw_prominence,
+    )
+    raw_prominences = {
+        int(peak): float(prom)
+        for peak, prom in zip(raw_peaks, raw_props.get("prominences", []))
+    }
+    smooth_peak_indexes = {c["row_idx"] for c in filtered_candidates}
+    rescue_gap_frames = max(min_step_frames + peak_distance, int(round(min_step_frames * 1.8)))
+    rescued_candidates = []
+
+    def _track_pos(candidate):
+        return _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
+
+    def _large_step_rescue_threshold(candidates):
+        if len(candidates) < 3:
+            return None
+
+        positions = [_track_pos(candidate) for candidate in candidates]
+        step_lengths = [
+            abs(positions[i] - positions[i - 1])
+            for i in range(1, len(positions))
+        ]
+        typical_step = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
+        thresholds = []
+        if typical_step > 1e-6:
+            thresholds.append(typical_step * 1.6)
+
+        # If calibration is available, also treat implausibly long human steps
+        # as a signal that an intermediate touchdown may have been missed.
+        large_step_m = 2.46
+        if calibration.get("mode") == "homography":
+            thresholds.append(large_step_m)
+        else:
+            meters_per_pixel = calibration.get("meters_per_pixel")
+            if meters_per_pixel:
+                thresholds.append(large_step_m / float(meters_per_pixel))
+
+        return min(thresholds) if thresholds else None
+
+    def _position_is_between(prev_candidate, rescue_candidate, next_candidate):
+        prev_pos = _track_pos(prev_candidate)
+        next_pos = _track_pos(next_candidate)
+        rescue_pos = _track_pos(rescue_candidate)
+        span = abs(next_pos - prev_pos)
+        if span <= 1e-6:
+            return True
+        min_margin = 0.20 if calibration.get("mode") == "homography" else 20.0
+        margin = max(min_margin, span * 0.25)
+        return min(prev_pos, next_pos) - margin <= rescue_pos <= max(prev_pos, next_pos) + margin
+
+    def _rescue_height_is_plausible(prev_candidate, rescue_candidate, next_candidate):
+        # A raw rescue peak should be near the landing height of the surrounding
+        # contacts. Peaks much higher in the image are usually ankle jitter,
+        # even if they are local maxima in the raw signal.
+        surrounding_y = min(float(prev_candidate["ankle_y"]), float(next_candidate["ankle_y"]))
+        return float(rescue_candidate["ankle_y"]) >= surrounding_y - raw_prominence
+
+    def _rescue_split_is_plausible(prev_candidate, rescue_candidate, next_candidate):
+        prev_pos = _track_pos(prev_candidate)
+        next_pos = _track_pos(next_candidate)
+        rescue_pos = _track_pos(rescue_candidate)
+        span = abs(next_pos - prev_pos)
+        if span <= 1e-6:
+            return True
+        before = abs(rescue_pos - prev_pos)
+        after = abs(next_pos - rescue_pos)
+        return min(before, after) >= span * 0.25
+
+    large_step_rescue_threshold = _large_step_rescue_threshold(filtered_candidates)
+
+    for prev_candidate, next_candidate in zip(filtered_candidates, filtered_candidates[1:]):
+        rescued_candidates.append(prev_candidate)
+        gap = int(next_candidate["row"]["seq_frame"]) - int(prev_candidate["row"]["seq_frame"])
+        movement = abs(_track_pos(next_candidate) - _track_pos(prev_candidate))
+        large_step_gap = (
+            large_step_rescue_threshold is not None
+            and movement > large_step_rescue_threshold
+        )
+        if gap < rescue_gap_frames and not large_step_gap:
+            continue
+
+        prev_idx = prev_candidate["row_idx"]
+        next_idx = next_candidate["row_idx"]
+        middle_raw_candidates = []
+        for peak_idx in raw_peaks:
+            peak_idx = int(peak_idx)
+            if peak_idx in smooth_peak_indexes:
+                continue
+            if not (prev_idx < peak_idx < next_idx):
+                continue
+            if peak_idx - prev_idx < min_touchdown_gap_frames:
+                continue
+            if next_idx - peak_idx < min_touchdown_gap_frames:
+                continue
+
+            candidate = _candidate_from_peak(
+                peak_idx,
+                raw_prominences.get(peak_idx, 0.0),
+                "raw_rescue",
+            )
+            if candidate is None:
+                continue
+            if not _valid_conf(candidate["ankle_conf"], 0.50):
+                continue
+            if candidate["prominence"] < raw_prominence:
+                continue
+            if not _position_is_between(prev_candidate, candidate, next_candidate):
+                continue
+            if not _rescue_height_is_plausible(prev_candidate, candidate, next_candidate):
+                continue
+            if not _rescue_split_is_plausible(prev_candidate, candidate, next_candidate):
+                continue
+            middle_raw_candidates.append(candidate)
+
+        if middle_raw_candidates:
+            middle_raw_candidates.sort(
+                key=lambda c: (c["prominence"], c["ankle_conf"], c["ankle_y"]),
+                reverse=True,
+            )
+            rescued_candidates.append(middle_raw_candidates[0])
+
+    if filtered_candidates:
+        rescued_candidates.append(filtered_candidates[-1])
+    filtered_candidates = sorted(rescued_candidates, key=lambda c: c["row_idx"])
+
+    def _candidate_score(candidate):
+        return (candidate["prominence"], candidate["ankle_conf"], candidate["ankle_y"])
+
+    def _min_valid_step_track_units():
+        # Normal running step length is usually well above 0.6 m. Values below
+        # this are more likely duplicate contacts from ankle jitter than true
+        # alternating touchdowns. Keep this conservative for short runners or
+        # slow jogs.
+        min_step_length_m = 0.60
+        if calibration.get("mode") == "homography":
+            return min_step_length_m
+
+        meters_per_pixel = calibration.get("meters_per_pixel")
+        if meters_per_pixel:
+            return min_step_length_m / float(meters_per_pixel)
+
+        return None
+
+    def _dedupe_short_contacts(candidates):
+        if len(candidates) < 2:
+            return candidates
+
+        positions = [_track_pos(candidate) for candidate in candidates]
+        step_lengths = [
+            abs(positions[i] - positions[i - 1])
+            for i in range(1, len(positions))
+        ]
+        typical_step_px = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
+        absolute_short_step = _min_valid_step_track_units()
+        if absolute_short_step is not None:
+            short_step_px = max(absolute_short_step, typical_step_px * 0.35)
+        else:
+            short_step_px = max(20.0, typical_step_px * 0.35)
+        short_gap_frames = max(min_touchdown_gap_frames, int(round(fps / 5.0)))
+
+        deduped = []
+        for candidate in candidates:
+            if not deduped:
+                deduped.append(candidate)
+                continue
+
+            previous = deduped[-1]
+            gap = int(candidate["row"]["seq_frame"]) - int(previous["row"]["seq_frame"])
+            movement = abs(_track_pos(candidate) - _track_pos(previous))
+            duplicate = (
+                (movement < short_step_px) or
+                (gap < short_gap_frames and movement < short_step_px)
+            )
+            if duplicate:
+                if _candidate_score(candidate) > _candidate_score(previous):
+                    deduped[-1] = candidate
+            else:
+                deduped.append(candidate)
+        return deduped
+
+    filtered_candidates = _dedupe_short_contacts(filtered_candidates)
 
     events = []
     prev_proj = None

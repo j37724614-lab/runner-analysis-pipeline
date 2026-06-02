@@ -41,7 +41,7 @@ DEFAULT_MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「�
 DEFAULT_STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量
 DEFAULT_MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄
 DEFAULT_CAM_WARMUP_FRAMES   = 5   # 切換相機後前幾幀放寬選取條件
-DEFAULT_MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
+DEFAULT_MIN_PERSON_HEIGHT   = 40  # bbox 高度小於此值（裁切後像素）視為背景遠景人物，略過
 DEFAULT_GROUND_POINT_EMA_ALPHA = 0.35  # bbox 底部中心點 EMA 平滑係數；越小越穩但延遲越大
 DEFAULT_FLAT_INTERP_EPS_M = 0.001      # 距離變化小於此值視為 flat segment
 
@@ -464,6 +464,9 @@ def camera(video_path, crop=None,
     }
 
 
+LANE_WIDTH_M = 1.22
+
+
 def _build_camera_from_json(entry):
     sl = entry.get('start_line')
     el = entry.get('end_line')
@@ -475,6 +478,29 @@ def _build_camera_from_json(entry):
     if src_pts and dst_pts:
         H_matrix, _ = _compute_homography(
             np.float32(src_pts), np.float32(dst_pts))
+    elif sl and el and entry.get('distance_m') is not None:
+        # Auto-build homography from the 4 anchor corners (start_line × 2 + end_line × 2).
+        # Near side = higher image-y (lower in frame); far side = lower image-y.
+        s0, s1 = [float(v) for v in sl[0]], [float(v) for v in sl[1]]
+        e0, e1 = [float(v) for v in el[0]], [float(v) for v in el[1]]
+        start_far, start_near = (s0, s1) if s0[1] <= s1[1] else (s1, s0)
+        end_far,   end_near   = (e0, e1) if e0[1] <= e1[1] else (e1, e0)
+        dist = float(entry['distance_m'])
+        src_pts = [start_far, start_near, end_far, end_near]
+        dst_pts = [[0.0, 0.0], [0.0, LANE_WIDTH_M],
+                   [dist, 0.0], [dist, LANE_WIDTH_M]]
+        try:
+            H_matrix, _ = _compute_homography(np.float32(src_pts), np.float32(dst_pts))
+            # Reject near-singular H matrices: when the anchor quad has tiny vertical
+            # extent (side-on camera), the H matrix is poorly conditioned and amplifies
+            # bbox x-noise into large world_x errors, causing speed to trend upward.
+            # Fall back to linear projection which is stable for side-on cameras.
+            if np.linalg.cond(H_matrix) > 5000:
+                H_matrix = None
+                src_pts = dst_pts = None
+        except Exception:
+            H_matrix = None
+            src_pts = dst_pts = None
 
     return camera(
         video_path=entry.get('video_path'),
@@ -493,9 +519,6 @@ def _build_camera_from_json(entry):
         homography_src_points=src_pts,
         homography_dst_world=dst_pts,
     )
-
-
-LANE_WIDTH_M = 1.22
 
 
 def build_lane_world_points(start_meter, num_points=5, lane_width=LANE_WIDTH_M):
@@ -824,9 +847,11 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
     d = _interpolate_flat_segments(d, eps=flat_interp_eps_m)
 
     # 2. Butterworth filtfilt（需 n >= 15）
+    # Cutoff at 3.5 Hz: removes bbox-jitter noise (30+ Hz) while preserving
+    # real acceleration changes (~0-1 Hz in a 100m sprint).
     if n >= 15:
         try:
-            b_but, a_but = butter(2, 6.0 / (fps / 2.0), btype='low')
+            b_but, a_but = butter(2, 3.5 / (fps / 2.0), btype='low')
             d_smooth = filtfilt(b_but, a_but, d)
             for k in range(1, n):
                 if d_smooth[k] < d_smooth[k - 1]:
@@ -845,8 +870,10 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
                              [0,  1,            dt],
                              [0,  0,             1]])
             kf.H = np.array([[1, 0, 0]])
-            kf.Q = np.diag([0.001, 0.01, 0.5])
-            base_r = 0.05
+            # Q[2,2]: lower value → Kalman resists rapid velocity changes from noisy
+            # measurements; 0.15 is tuned for 100m sprint (real accel ≤ 5 m/s²).
+            kf.Q = np.diag([0.001, 0.01, 0.15])
+            base_r = 0.15
             kf.R = np.array([[base_r]])
             # 跨機傳遞初始速度與加速度，避免切換時從 0 重新爬升
             kf.x = np.array([[d_smooth[0]], [float(init_v)], [float(init_a)]])
@@ -871,6 +898,160 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
         a = np.zeros(n)
 
     return d_smooth, v_smooth, a
+
+
+def compute_speed_from_bbox_map(bbox_map_csv, cameras_cfg_list, fps_override=None,
+                                offsets_npz=None):
+    """
+    Compute speed/acceleration metrics from bbox_map.csv (produced by skeleton
+    tracker) without re-running YOLO.  Returns all_track_data list in the same
+    format as the main() CSV output.
+
+    bbox_map.csv stores coordinates in per-frame person-centered crop space.
+    offsets_npz (cam1_offsets.npz) contains the (off_x, off_y) per output frame
+    needed to convert back to original image coordinates.
+    """
+    # Build offset lookup: (source_frame, cam_0idx) → (off_x, off_y)
+    offset_map = {}
+    if offsets_npz and os.path.exists(offsets_npz):
+        d = np.load(offsets_npz)
+        offs = d['offsets']           # shape (N, 2)
+        orig_frames = d['orig_frames']
+        cam_indices = d['cam_indices']
+        for i in range(len(orig_frames)):
+            key = (int(orig_frames[i]), int(cam_indices[i]))
+            offset_map[key] = (int(offs[i, 0]), int(offs[i, 1]))
+
+    rows_by_cam = {}
+    with open(bbox_map_csv, 'r', newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            cam_0idx = int(row['cam']) - 1
+            rows_by_cam.setdefault(cam_0idx, []).append(row)
+    for k in rows_by_cam:
+        rows_by_cam[k].sort(key=lambda r: int(r['cam_frame']))
+
+    cameras = [_build_camera_from_json(c) for c in cameras_cfg_list]
+
+    all_track_data = []
+    cumulative_dist_offset = 0.0
+    absolute_frame_offset = 0
+    last_kf_v = 0.0
+    last_kf_a = 0.0
+
+    for cam_idx, cam in enumerate(cameras):
+        cam_rows = rows_by_cam.get(cam_idx, [])
+        if not cam_rows:
+            continue
+
+        fps = fps_override
+        if fps is None and cam.get('video_path'):
+            cap = cv2.VideoCapture(cam['video_path'])
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+                cap.release()
+        fps = fps or 60.0
+
+        cp = cam.get('crop_params')
+        crop_x_offset = cp[0] if cp else 0
+        crop_y_offset = cp[1] if cp else 0
+
+        d_raw = []
+        interpolated_mask = []
+        source_frames = []
+
+        for row in cam_rows:
+            x1, y1 = int(row['x1']), int(row['y1'])
+            x2, y2 = int(row['x2']), int(row['y2'])
+            # bbox coords are in person-centered crop space; add frame-level offset
+            # (off_x, off_y) from offsets.npz to recover original image coordinates.
+            src_frame = int(row['source_frame'])
+            frame_off_x, frame_off_y = offset_map.get((src_frame, cam_idx), (0, 0))
+            cx_orig = (x1 + x2) / 2.0 + frame_off_x + crop_x_offset
+            cy_orig = (y1 + y2) / 2.0 + frame_off_y + crop_y_offset
+            y2_orig = y2 + frame_off_y + crop_y_offset
+
+            dist_raw = None
+            if cam.get('m_per_pixel') is not None or cam.get('H_matrix') is not None:
+                if cam.get('H_matrix') is not None:
+                    # Evaluate H matrix at the track centerline y rather than y2_orig.
+                    # y2 (bbox bottom) fluctuates frame-to-frame as the runner lifts their
+                    # feet; feeding that noise through H amplifies it into world_x errors.
+                    # The track runs nearly horizontally in the image, so world_x is driven
+                    # almost entirely by cx_orig; using a fixed track-center y keeps the
+                    # mapping stable.
+                    sl, el = cam.get('start_line'), cam.get('end_line')
+                    if sl and el:
+                        track_y = (sl[0][1] + sl[1][1] + el[0][1] + el[1][1]) / 4.0
+                    else:
+                        track_y = y2_orig
+                    world = _transform_point_homography((cx_orig, track_y), cam['H_matrix'])
+                    if world is not None:
+                        world_x = float(world[0])
+                        start_world_x = cam.get('homography_start_x') or 0.0
+                        local_dist = world_x - start_world_x
+                        if cam.get('distance_m') is not None:
+                            local_dist = min(local_dist, float(cam['distance_m']))
+                        dist_raw = cumulative_dist_offset + max(0.0, local_dist)
+                elif cam.get('track_dir') and cam.get('start_mid'):
+                    proj_px = _project_onto_track(
+                        (cx_orig, cy_orig), cam['start_mid'], cam['track_dir'])
+                    dist_raw = cumulative_dist_offset + max(
+                        0.0, proj_px * cam['m_per_pixel'])
+                else:
+                    dist_raw = cumulative_dist_offset + max(
+                        0.0, (cx_orig - cam['start_x']) * cam['m_per_pixel'])
+
+            d_raw.append(dist_raw)
+            interpolated_mask.append(bool(int(row.get('is_interpolated', 0))))
+            source_frames.append(int(row['source_frame']))
+
+        has_any_metric = any(v is not None for v in d_raw)
+        has_metrics = (
+            (cam.get('m_per_pixel') is not None or cam.get('H_matrix') is not None)
+            and has_any_metric
+        )
+
+        if not has_metrics:
+            absolute_frame_offset += len(cam_rows)
+            continue
+
+        d_raw_for_csv = list(d_raw)
+        missing = sum(v is None for v in d_raw)
+        if missing and has_any_metric:
+            d_raw = _interpolate_missing_numeric(d_raw)
+
+        interp_gap_len, speed_confidence = _interpolation_metadata(interpolated_mask)
+        d_smooth, v_smooth, a_arr = _compute_kf_series(
+            d_raw, fps, init_v=last_kf_v, init_a=last_kf_a,
+            measurement_confidence=speed_confidence)
+
+        cumulative_dist_offset = float(d_smooth[-1]) if len(d_smooth) > 0 else cumulative_dist_offset
+        last_kf_v = float(v_smooth[-1])
+        last_kf_a = float(a_arr[-1])
+
+        for i in range(len(d_smooth)):
+            dist_raw_i = d_raw_for_csv[i] if i < len(d_raw_for_csv) else None
+            all_track_data.append({
+                'cam':             cam_idx + 1,
+                'cam_frame':       i,
+                'source_frame':    source_frames[i] if i < len(source_frames) else '',
+                'absolute_frame':  absolute_frame_offset + i,
+                'dist_m':          round(float(d_smooth[i]), 3),
+                'dist_raw_m':      round(float(dist_raw_i), 3) if dist_raw_i is not None else '',
+                'dist_smooth_m':   round(float(d_smooth[i]), 3),
+                'world_x':         '',
+                'image_point_x':   '',
+                'image_point_y':   '',
+                'speed_mps':       round(float(v_smooth[i]), 3),
+                'accel_mps2':      round(float(a_arr[i]), 3),
+                'is_interpolated': int(interpolated_mask[i]) if i < len(interpolated_mask) else 0,
+                'interp_gap_len':  interp_gap_len[i] if i < len(interp_gap_len) else 0,
+                'speed_confidence': round(float(speed_confidence[i]), 3) if i < len(speed_confidence) else 1.0,
+            })
+
+        absolute_frame_offset += len(cam_rows)
+
+    return all_track_data
 
 
 def _draw_chart(fig, axes, canvas, d_smooth, v_smooth, a, fps, target_w, target_h,
@@ -1215,6 +1396,7 @@ def main(config_dict=None):
     if 'min_person_height'   in cfg: config['min_person_height']   = int(cfg['min_person_height'])
     if 'ground_point_ema_alpha' in cfg: config['ground_point_ema_alpha'] = float(cfg['ground_point_ema_alpha'])
     if 'flat_interp_eps_m'   in cfg: config['flat_interp_eps_m']   = float(cfg['flat_interp_eps_m'])
+    skip_video = bool(cfg.get('skip_video', False))
 
     # 設定 GPU 環境變數
     os.environ['CUDA_VISIBLE_DEVICES'] = config['gpu']
@@ -1681,59 +1863,17 @@ def main(config_dict=None):
             v_prev = np.array(accumulated_v) if accumulated_v else np.array([])
             a_prev = np.array(accumulated_a) if accumulated_a else np.array([])
 
-        print(f"  [第二段] 渲染輸出中...")
+        print(f"  [第二段] {'CSV 計算中（skip_video）' if skip_video else '渲染輸出中'}...")
         cam_written = 0
 
         for i, strip in enumerate(frame_buffer):
+            frame_out = strip  # default
+
             if has_metrics and meta_buffer[i] is not None:
-                # 正式幀：文字 + 圖表 + CSV 資料
+                # CSV 資料（無論是否 skip_video 都要記錄）
                 dist_i  = float(d_smooth[i])
                 speed_i = float(v_smooth[i])
                 accel_i = float(a_arr[i])
-
-                # 疊加速度文字
-                bx1s, by1s = meta_buffer[i][0], meta_buffer[i][1]
-                if i < len(interpolated_bbox_mask) and interpolated_bbox_mask[i]:
-                    bx1i, by1i, bx2i, by2i = meta_buffer[i]
-                    cv2.rectangle(strip, (bx1i, by1i), (bx2i, by2i), (255, 0, 255), 2)
-                    cv2.putText(strip, "interp", (bx1i + 3, by1i + 22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
-                label = (f"{dist_i:.1f}m  "
-                         f"{speed_i:.2f}m/s  "
-                         f"{accel_i:+.1f}m/s\u00b2")
-                strip = _draw_text_bgr(
-                    strip,
-                    label,
-                    (bx1s, max(by1s - 32, 5)),
-                    font=_get_font(size=22),
-                    color=(0, 255, 255),
-                    thickness=2,
-                )
-
-                # 底部圖表：第一幀時建立畫布（之後重複使用）
-                if chart_fig is None:
-                    _cw = strip.shape[1]
-                    chart_fig, chart_axes = plt.subplots(
-                        1, 3, figsize=(_cw / 100, config['chart_height'] / 100), dpi=100)
-                    chart_canvas = FigureCanvas(chart_fig)
-
-                # 前機完整 + 本機到第 i 幀（absolute_frame 概念：跨機連續）
-                if len(d_prev) > 0:
-                    d_cur = np.concatenate([d_prev, d_smooth[:i + 1]])
-                    v_cur = np.concatenate([v_prev, v_smooth[:i + 1]])
-                    a_cur = np.concatenate([a_prev, a_arr[:i + 1]])
-                else:
-                    d_cur = d_smooth[:i + 1]
-                    v_cur = v_smooth[:i + 1]
-                    a_cur = a_arr[:i + 1]
-
-                chart = _draw_chart(
-                    chart_fig, chart_axes, chart_canvas,
-                    d_cur, v_cur, a_cur,
-                    fps, strip.shape[1], config['chart_height'],
-                    global_d_max, global_t_max,
-                    font_prop=chart_font_prop)
-                frame_out = np.vstack([strip, chart])
 
                 debug_i = metric_debug_buffer[i] if i < len(metric_debug_buffer) else None
                 dist_raw_i = d_raw_for_csv[i] if i < len(d_raw_for_csv) else None
@@ -1757,23 +1897,66 @@ def main(config_dict=None):
                     'interp_gap_len':  interp_gap_len[i] if i < len(interp_gap_len) else 0,
                     'speed_confidence': round(speed_confidence[i], 3) if i < len(speed_confidence) else 1.0,
                 })
-            elif has_metrics and meta_buffer[i] is None:
+
+                if not skip_video:
+                    # 疊加速度文字
+                    bx1s, by1s = meta_buffer[i][0], meta_buffer[i][1]
+                    if i < len(interpolated_bbox_mask) and interpolated_bbox_mask[i]:
+                        bx1i, by1i, bx2i, by2i = meta_buffer[i]
+                        cv2.rectangle(strip, (bx1i, by1i), (bx2i, by2i), (255, 0, 255), 2)
+                        cv2.putText(strip, "interp", (bx1i + 3, by1i + 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+                    label = (f"{dist_i:.1f}m  "
+                             f"{speed_i:.2f}m/s  "
+                             f"{accel_i:+.1f}m/s\u00b2")
+                    strip = _draw_text_bgr(
+                        strip,
+                        label,
+                        (bx1s, max(by1s - 32, 5)),
+                        font=_get_font(size=22),
+                        color=(0, 255, 255),
+                        thickness=2,
+                    )
+
+                    # 底部圖表：第一幀時建立畫布（之後重複使用）
+                    if chart_fig is None:
+                        _cw = strip.shape[1]
+                        chart_fig, chart_axes = plt.subplots(
+                            1, 3, figsize=(_cw / 100, config['chart_height'] / 100), dpi=100)
+                        chart_canvas = FigureCanvas(chart_fig)
+
+                    # 前機完整 + 本機到第 i 幀（absolute_frame 概念：跨機連續）
+                    if len(d_prev) > 0:
+                        d_cur = np.concatenate([d_prev, d_smooth[:i + 1]])
+                        v_cur = np.concatenate([v_prev, v_smooth[:i + 1]])
+                        a_cur = np.concatenate([a_prev, a_arr[:i + 1]])
+                    else:
+                        d_cur = d_smooth[:i + 1]
+                        v_cur = v_smooth[:i + 1]
+                        a_cur = a_arr[:i + 1]
+
+                    chart = _draw_chart(
+                        chart_fig, chart_axes, chart_canvas,
+                        d_cur, v_cur, a_cur,
+                        fps, strip.shape[1], config['chart_height'],
+                        global_d_max, global_t_max,
+                        font_prop=chart_font_prop)
+                    frame_out = np.vstack([strip, chart])
+            elif has_metrics and meta_buffer[i] is None and not skip_video:
                 # pre-roll 幀：保留畫面 but 圖表區填黑
                 empty = np.zeros((config['chart_height'], strip.shape[1], 3), dtype=np.uint8)
                 frame_out = np.vstack([strip, empty])
-            else:
-                frame_out = strip
 
-            # 初始化 VideoWriter（第一幀才知道最終尺寸）
-            if out is None:
-                h_out, w_out = frame_out.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fourcc, fps, (w_out, h_out))
-                print(f"  VideoWriter 初始化：{w_out}x{h_out}")
-
-            out.write(frame_out)
-            cam_written  += 1
-            total_written += 1
+            if not skip_video:
+                # 初始化 VideoWriter（第一幀才知道最終尺寸）
+                if out is None:
+                    h_out, w_out = frame_out.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(output_path, fourcc, fps, (w_out, h_out))
+                    print(f"  VideoWriter 初始化：{w_out}x{h_out}")
+                out.write(frame_out)
+                cam_written  += 1
+                total_written += 1
 
         # 本機序列加入跨機累積（供下一機圖表連續顯示）
         if has_metrics:

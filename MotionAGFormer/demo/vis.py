@@ -123,6 +123,23 @@ _SG_WINDOW_BY_JOINT = np.array([
     11, 9, 7,  # 14 RShoulder, RElbow, RWrist
 ], dtype=np.int32)
 
+# H36M kinematic tree root-to-leaf (parent, child) — for bone-length normalization.
+_BONES_H36M = [
+    (0, 1), (1, 2), (2, 3),
+    (0, 4), (4, 5), (5, 6),
+    (0, 7), (7, 8), (8, 9), (9, 10),
+    (8, 11), (11, 12), (12, 13),
+    (8, 14), (14, 15), (15, 16),
+]
+
+# (proximal, joint, distal, min_deg) — prevents hyperextension in 2D projection.
+_JOINT_ANGLE_LIMITS_2D = [
+    (1, 2, 3, 20),    # RKnee
+    (4, 5, 6, 20),    # LKnee
+    (11, 12, 13, 15), # LElbow
+    (14, 15, 16, 15), # RElbow
+]
+
 _ARCHIVE_POINTER_FILENAME = "keypoints_raw_archive_dir.txt"
 
 
@@ -504,26 +521,11 @@ def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
     return (smoothed, debug_rows) if return_debug else smoothed
 
 
-def _hampel_1d(arr, k):
-    """Vectorised Hampel filter: replace outliers with the local median.
-    k = half-window in frames. Threshold = 2 × 1.4826 × MAD (≈ 2σ equivalent).
-    """
-    padded = np.pad(arr, k, mode='edge')
-    windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * k + 1)
-    medians = np.median(windows, axis=1)
-    mads = np.median(np.abs(windows - medians[:, None]), axis=1)
-    outlier = np.abs(arr - medians) > 3.0 * 1.4826 * np.maximum(mads, 1e-6)
-    out = arr.copy()
-    out[outlier] = medians[outlier]
-    return out
-
-
 def _smooth_keypoints_sg(keypoints, scores,
                           conf_threshold=0.50,
                           sg_window=7,
                           sg_polyorder=2,
                           frame_bad_joint_threshold=8,
-                          fps=30.0,
                           bbox_heights=None,
                           bbox_ref_height=None,
                           return_debug=False):
@@ -622,11 +624,6 @@ def _smooth_keypoints_sg(keypoints, scores,
             traj_x_fixed = np.interp(all_idx, good_idx, traj_x[good_idx])
             traj_y_fixed = np.interp(all_idx, good_idx, traj_y[good_idx])
 
-            # Phase 4b: Hampel filter — catches multi-frame drifts bilateral misses
-            k = max(2, round(3 * fps / 30))
-            traj_x_fixed = _hampel_1d(traj_x_fixed, k)
-            traj_y_fixed = _hampel_1d(traj_y_fixed, k)
-
             # Phase 5: Savitzky-Golay smoothing
             win = int(_SG_WINDOW_BY_JOINT[joint_idx]) if joint_idx < len(_SG_WINDOW_BY_JOINT) else sg_window
             win = min(win, T)
@@ -691,6 +688,68 @@ def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
+def _normalize_bone_lengths_2d(keypoints, blend=0.8):
+    """Soft-constrain each bone to its per-video median length (root-to-leaf).
+    Only adjusts frames deviating >10%. blend=0.8 means 80% pull toward target.
+    """
+    M, T, J, C = keypoints.shape
+    result = keypoints.copy()
+    for person_idx in range(M):
+        kp = result[person_idx]
+        for parent_idx, child_idx in _BONES_H36M:
+            diff = kp[:, child_idx, :2] - kp[:, parent_idx, :2]
+            lengths = np.linalg.norm(diff, axis=1)
+            valid = lengths > 1.0
+            if valid.sum() < 2:
+                continue
+            ref_len = float(np.median(lengths[valid]))
+            ratios = np.where(lengths > 1.0, ref_len / lengths, 1.0)
+            adjust = np.abs(ratios - 1.0) > 0.10
+            if not np.any(adjust):
+                continue
+            normalized = kp[:, parent_idx, :2] + diff * ratios[:, None]
+            kp[adjust, child_idx, :2] = (
+                (1.0 - blend) * kp[adjust, child_idx, :2] + blend * normalized[adjust]
+            )
+    return result
+
+
+def _apply_anatomical_limits_2d(keypoints):
+    """Prevent impossible 2D joint angles (below anatomical minimum).
+    Rotates the distal joint around the joint centre to enforce the minimum angle.
+    """
+    M, T, J, _ = keypoints.shape
+    result = keypoints.copy()
+    for person_idx in range(M):
+        kp = result[person_idx]
+        for p_idx, j_idx, d_idx, min_deg in _JOINT_ANGLE_LIMITS_2D:
+            p = kp[:, p_idx, :2]
+            j = kp[:, j_idx, :2]
+            d = kp[:, d_idx, :2]
+            v1 = p - j
+            v2 = d - j
+            len1 = np.linalg.norm(v1, axis=1)
+            len2 = np.linalg.norm(v2, axis=1)
+            valid = (len1 > 1.0) & (len2 > 1.0)
+            cos_a = np.einsum('ti,ti->t', v1, v2) / np.maximum(len1 * len2, 1e-8)
+            angles = np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
+            needs_fix = valid & (angles < min_deg)
+            if not np.any(needs_fix):
+                continue
+            for t in np.where(needs_fix)[0]:
+                delta = np.radians(float(min_deg) - float(angles[t]))
+                cross = v1[t, 0] * v2[t, 1] - v1[t, 1] * v2[t, 0]
+                if cross < 0:
+                    delta = -delta
+                cos_d, sin_d = np.cos(delta), np.sin(delta)
+                v2r = np.array([
+                    v2[t, 0] * cos_d - v2[t, 1] * sin_d,
+                    v2[t, 0] * sin_d + v2[t, 1] * cos_d,
+                ])
+                kp[t, d_idx, :2] = j[t] + v2r
+    return result
+
+
 def show2Dpose(kps, img):
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
                    [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
@@ -752,7 +811,6 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
     cap = cv2.VideoCapture(video_path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
 
     print('\nGenerating 2D pose...')
@@ -785,12 +843,13 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         conf_threshold=0.50,
         sg_window=7,
         sg_polyorder=2,
-        fps=video_fps,
         bbox_heights=bbox_heights,
         bbox_ref_height=bbox_ref_height,
         return_debug=True,
     )
-    keypoints = _smooth_keypoints_butterworth(keypoints, video_fps, cutoff_hz=13.0)
+
+    keypoints = _normalize_bone_lengths_2d(keypoints)
+    keypoints = _apply_anatomical_limits_2d(keypoints)
 
     # Add conf score to the last dim
     keypoints = np.concatenate((keypoints, scores[..., None]), axis=-1)
@@ -947,54 +1006,9 @@ def flip_data(data, left_joints=[1, 2, 3, 14, 15, 16], right_joints=[4, 5, 6, 11
     return flipped_data
 
 
-def _smooth_keypoints_butterworth(keypoints, fps, cutoff_hz=10.0, order=4):
-    """Zero-phase Butterworth low-pass filter on keypoint x/y coordinates.
-    Removes high-frequency jitter while preserving natural joint motion.
-    cutoff_hz=8 keeps running biomechanics (2-3 Hz fundamental) intact.
-    """
-    from scipy.signal import butter, filtfilt
-    nyq = fps / 2.0
-    if cutoff_hz >= nyq:
-        return keypoints
-    b, a = butter(order, cutoff_hz / nyq, btype='low')
-    min_samples = 3 * max(len(a), len(b))
-    M, T, J = keypoints.shape[:3]
-    if T < min_samples:
-        return keypoints
-    result = keypoints.copy()
-    for person_idx in range(M):
-        for joint_idx in range(J):
-            for coord_idx in range(2):
-                arr = result[person_idx, :, joint_idx, coord_idx].astype(np.float64)
-                result[person_idx, :, joint_idx, coord_idx] = filtfilt(b, a, arr)
-    return result
-
-
 # ===============================
 # 角度計算工具
 # ===============================
-def _smooth_angles_butterworth(df, fps, cutoff_hz=10.0, order=4):
-    """Zero-phase Butterworth low-pass filter applied in-place to all angle columns.
-
-    6 Hz is the standard biomechanics cutoff for joint angles. Increase to 10-12 Hz
-    if the smoothing looks too aggressive on fast sprint data.
-    Requires at least 3*order valid frames; columns with fewer valid frames are left unchanged.
-    """
-    from scipy.signal import butter, filtfilt
-    nyq = fps / 2.0
-    if cutoff_hz >= nyq:
-        return
-    b, a = butter(order, cutoff_hz / nyq, btype='low')
-    min_samples = 3 * max(len(a), len(b))
-    for col in df.columns:
-        if col == 'frame':
-            continue
-        arr = df[col].to_numpy(dtype=np.float64)
-        if np.isfinite(arr).sum() < min_samples:
-            continue
-        df[col] = filtfilt(b, a, arr)
-
-
 def _angle_between(v1, v2):
     """計算兩個向量之間的夾角（度數）"""
     v1 = np.asarray(v1, dtype=float)
@@ -1049,6 +1063,38 @@ def _fix_supplementary_angle_flips(angles, max_delta=45.0, improvement_margin=15
             })
 
     return corrected, corrections
+
+
+def _smooth_angles_butterworth(df, fps, cutoff_hz=10.0, order=4):
+    """Zero-phase Butterworth low-pass filter applied to all angle columns in df."""
+    from scipy.signal import butter, filtfilt
+    nyq = fps / 2.0
+    if cutoff_hz >= nyq:
+        return
+    b, a = butter(order, cutoff_hz / nyq, btype='low')
+    min_samples = 3 * max(len(a), len(b))
+    angle_cols = [c for c in df.columns if c != 'frame']
+    for col in angle_cols:
+        arr = df[col].to_numpy(dtype=np.float64)
+        if len(arr) >= min_samples:
+            df[col] = filtfilt(b, a, arr)
+
+
+def _smooth_angles_sg(df, fps, polyorder=3):
+    """FPS-adaptive Savitzky-Golay smoothing on angle columns.
+    Fits a local polynomial over ~0.27s window. Preserves peaks better than
+    Butterworth at equivalent bandwidth because the passband is flat.
+    Effective BW ≈ 6 Hz at both 30fps and 60fps.
+    """
+    from scipy.signal import savgol_filter
+    win = max(polyorder + 2, int(fps * 0.22))
+    if win % 2 == 0:
+        win += 1
+    angle_cols = [c for c in df.columns if c != 'frame']
+    for col in angle_cols:
+        arr = df[col].to_numpy(dtype=np.float64)
+        if len(arr) >= win:
+            df[col] = savgol_filter(arr, win, polyorder, mode='mirror')
 
 
 def compute_angles(npz_path, output_dir, fps=30.0):
@@ -1113,7 +1159,7 @@ def compute_angles(npz_path, output_dir, fps=30.0):
             correction['joint'] = col
             knee_corrections.append(correction)
 
-    _smooth_angles_butterworth(df, fps)
+    _smooth_angles_sg(df, fps)
 
     out_dir = os.path.join(output_dir, 'pred_3D', 'angles')
     os.makedirs(out_dir, exist_ok=True)
@@ -1174,7 +1220,9 @@ def get_pose3D(video_path, output_dir, skip_video=False):
 
     cap = cv2.VideoCapture(video_path)
     video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps_3d = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if video_fps <= 0:
+        video_fps = 30.0
     ret, first_img = cap.read()
     if not ret:
         cap.release()
@@ -1230,7 +1278,8 @@ def get_pose3D(video_path, output_dir, skip_video=False):
     npz_out_path = os.path.join(output_dir_3D_npz, '3Dkeypoints.npz')
     np.savez_compressed(npz_out_path, pred_3d=post_out_all)
 
-    compute_angles(npz_out_path, output_dir, fps=video_fps_3d)
+    # 角度計算（整合在此，不需外部再呼叫）
+    compute_angles(npz_out_path, output_dir, fps=video_fps)
 
     ## 3D pose images
     if not skip_video:

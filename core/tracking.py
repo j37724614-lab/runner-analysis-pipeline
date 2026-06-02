@@ -96,7 +96,7 @@ MOVEMENT_THRESHOLD  = 2   # 判定為移動的最小像素位移,連續兩幀中
 MIN_MOVEMENT_FRAMES = 3   # 需連續移動至少此幀數才視為「真正移動」,必須連續移動 ≥ 3 幀，才被認定為「真的在跑」
 STATIONARY_DECAY    = 2   # 靜止時每幀遞減 movement_count 的量, 靜止一幀就讓 movement_count 減 2（快速重置）
 MAX_PERSON_MEMORY   = 30  # 超過此幀數未偵測到則清除該人物的速度紀錄, 30 幀（約 0.5 秒）沒出現就刪除
-MIN_PERSON_HEIGHT   = 80  # bbox 高度小於此值（前處理裁剪後像素）視為背景遠景人物，略過
+MIN_PERSON_HEIGHT   = 40  # bbox 高度小於此值（前處理裁剪後像素）視為背景遠景人物，略過
 GROUND_POINT_EMA_ALPHA = 0.35  # 與 tracker_impl.py 對齊：bbox 底部中心點平滑係數
 LANE_WIDTH_M = 1.22
 
@@ -297,10 +297,10 @@ def _build_camera_from_entry(entry):
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
         crop_val = (
-            max(0, min(xs) - padding),
-            max(0, min(ys) - padding),
-            max(xs) + padding,
-            max(ys) + padding,
+            int(max(0, min(xs) - padding)),
+            int(max(0, min(ys) - padding)),
+            int(max(xs) + padding),
+            int(max(ys) + padding),
         )
 
     return camera(
@@ -486,7 +486,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False, track_id=N
     使用指定 bbox 重新裁切一幀，供 YOLO 缺失幀的插值補幀使用。
 
     bbox 座標系與 process_frame() 相同：若有 crop_params，bbox 是前處理裁剪後的座標。
-    回傳 (crop_frame, bbox_in_crop)。
+    回傳 (crop_frame, bbox_in_crop, off_x, off_y)。
     """
     if crop_params:
         cx1, cy1, cx2, cy2 = crop_params
@@ -494,8 +494,10 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False, track_id=N
         cx1, cx2 = max(0, cx1), min(w, cx2)
         cy1, cy2 = max(0, cy1), min(h, cy2)
         if cx2 <= cx1 or cy2 <= cy1:
-            return None, None
+            return None, None, None, None
         img = img[cy1:cy2, cx1:cx2]
+    else:
+        cx1 = cy1 = 0
 
     bx1, by1, bx2, by2 = map(int, bbox)
     h_img, w_img = img.shape[:2]
@@ -504,7 +506,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False, track_id=N
     by1 = int(np.clip(by1, 0, max(h_img - 1, 0)))
     by2 = int(np.clip(by2, 0, max(h_img - 1, 0)))
     if bx2 <= bx1 or by2 <= by1:
-        return None, None
+        return None, None, None, None
 
     if SHOW_OVERLAY and DRAW_BBOX_OVERLAY:
         color = (255, 0, 255) if label_interpolated else (0, 255, 0)
@@ -573,7 +575,7 @@ def _crop_from_bbox(img, crop_params, bbox, label_interpolated=False, track_id=N
         else:
             crop_frame = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
 
-    return crop_frame, bbox_in_crop
+    return crop_frame, bbox_in_crop, c1x + cx1, c1y + cy1
 
 
 def process_frame(img, model, velocity_tracker, device,
@@ -1372,7 +1374,7 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             for idx, item in enumerate(pending_missing, start=1):
                 ratio = idx / (gap_len + 1)
                 interp_bbox = _interpolate_bbox(last_valid_bbox, right_bbox, ratio)
-                interp_frame, interp_bbox_in_crop = _crop_from_bbox(
+                interp_frame, interp_bbox_in_crop, interp_off_x, interp_off_y = _crop_from_bbox(
                     item['frame'],
                     cp,
                     interp_bbox,
@@ -1388,8 +1390,8 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
                     track_id,
                     is_interpolated=True,
                     interp_gap_len=gap_len,
-                    off_x=off_x,
-                    off_y=off_y,
+                    off_x=interp_off_x if interp_off_x is not None else off_x,
+                    off_y=interp_off_y if interp_off_y is not None else off_y,
                 )
                 cam_interpolated += 1
             pending_missing.clear()
