@@ -67,8 +67,8 @@ CUDA_VISIBLE_DEVICES = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
 DEVICE = 0
 
-# 模型權重路徑（yolo11x.pt 放在 repo 根目錄；下載方式見 README）
-MODEL_PATH = str(BASE_DIR / "yolo26x.pt")
+# 模型權重路徑（下載方式見 README）
+MODEL_PATH = str(BASE_DIR / "models" / "yolo26x.pt")
 
 # 中文字型路徑（ROI 標籤使用）
 FONT_PATH = str(BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")

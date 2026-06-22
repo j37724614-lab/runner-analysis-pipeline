@@ -97,6 +97,48 @@ def _export_video_frames(video_path: str, output_root: str, folder_name: str = "
     return str(frames_dir)
 
 
+def _add_time_to_angles_csv(angle_csv_path: str | None, video_path: str | None = None, fps: float | None = None):
+    """Add final-video-relative time columns to an angle CSV."""
+    if not angle_csv_path or not os.path.exists(angle_csv_path):
+        return None
+
+    resolved_fps = fps
+    if video_path and os.path.exists(video_path):
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            if video_fps and video_fps > 0:
+                resolved_fps = float(video_fps)
+        cap.release()
+
+    if not resolved_fps or resolved_fps <= 0:
+        resolved_fps = 60.0
+
+    try:
+        df = pd.read_csv(angle_csv_path)
+        if "frame" not in df.columns:
+            print(f"  ▶ 角度 CSV 缺少 frame 欄位，略過時間欄位補齊: {angle_csv_path}")
+            return None
+
+        time_sec = df["frame"].astype(float) / resolved_fps
+        for col in ["time_s", "time_sec"]:
+            if col in df.columns:
+                df[col] = time_sec
+            else:
+                df.insert(1, col, time_sec)
+
+        leading_cols = [col for col in ["frame", "time_sec", "time_s"] if col in df.columns]
+        remaining_cols = [col for col in df.columns if col not in leading_cols]
+        df = df[leading_cols + remaining_cols]
+
+        df.to_csv(angle_csv_path, index=False)
+        print(f"  ▶ 已補齊角度時間欄位: {angle_csv_path} (fps={resolved_fps:.3f})")
+        return angle_csv_path
+    except Exception as e:
+        print(f"  ▶ 補齊角度時間欄位失敗: {e}")
+        return None
+
+
 # -----------------------------------------------------------------------
 # 延遲 import：只在真正需要時才載入 GPU-heavy 的 3D 重建函式庫
 # -----------------------------------------------------------------------
@@ -156,6 +198,15 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
         if 'stationary_decay'    in extra_cfg: tcr.STATIONARY_DECAY    = int(extra_cfg['stationary_decay'])
         if 'max_person_memory'   in extra_cfg: tcr.MAX_PERSON_MEMORY   = int(extra_cfg['max_person_memory'])
         if 'tracking_mode'       in extra_cfg: tcr.TRACKING_MODE       = str(extra_cfg['tracking_mode'])
+        if 'prescan_enabled'     in extra_cfg: tcr.PRESCAN_ENABLED     = bool(extra_cfg['prescan_enabled'])
+        if 'prescan_engine_path' in extra_cfg: tcr.PRESCAN_ENGINE_PATH = str(extra_cfg['prescan_engine_path'])
+        if 'prescan_stride'      in extra_cfg: tcr.PRESCAN_STRIDE      = int(extra_cfg['prescan_stride'])
+        if 'prescan_imgsz'       in extra_cfg: tcr.PRESCAN_IMGSZ       = int(extra_cfg['prescan_imgsz'])
+        if 'prescan_conf'        in extra_cfg: tcr.PRESCAN_CONF        = float(extra_cfg['prescan_conf'])
+        if 'prescan_iou'         in extra_cfg: tcr.PRESCAN_IOU         = float(extra_cfg['prescan_iou'])
+        if 'prescan_buffer_sec'  in extra_cfg: tcr.PRESCAN_BUFFER_SEC  = float(extra_cfg['prescan_buffer_sec'])
+        if 'prescan_max_gap_sec' in extra_cfg: tcr.PRESCAN_MAX_GAP_SEC = float(extra_cfg['prescan_max_gap_sec'])
+        if 'prescan_use_grab'    in extra_cfg: tcr.PRESCAN_USE_GRAB    = bool(extra_cfg['prescan_use_grab'])
 
     # 建立並過濾有效相機清單
     CAMERAS = [tcr._build_camera_from_entry(e) for e in cameras_cfg]
@@ -214,19 +265,25 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
     frame_map_path = os.path.join(output_dir, frame_map_name)
 
     if tcr.TRACKING_MODE == 'two_pass':
+        frame_ranges_by_cam = tcr.run_temporal_prescan(CAMERAS, output_dir=output_dir) if tcr.PRESCAN_ENABLED else None
         print("two_pass 模式：第一遍收集所有候選人軌跡...")
         caps_pass1 = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
-        all_detections, frame_cache = tcr._collect_all_detections(caps_pass1, CAMERAS, model)
+        all_detections, frame_cache = tcr._collect_all_detections(
+            caps_pass1, CAMERAS, model, frame_ranges_by_cam=frame_ranges_by_cam
+        )
         for c in caps_pass1:
             c.release()
         print(f"  收集完成：共 {len(all_detections)} 筆偵測")
         first_cam_base = os.path.splitext(os.path.basename(CAMERAS[0]['video_path']))[0]
-        preset_ids, summaries = tcr._score_and_select_runners(all_detections, CAMERAS)
-        tcr._stitch_target_id(frame_cache, preset_ids, CAMERAS)
+        preset_ids, summaries = tcr._score_and_select_runners(
+            all_detections, CAMERAS, frame_ranges_by_cam=frame_ranges_by_cam
+        )
+        tcr._stitch_target_id(frame_cache, preset_ids, CAMERAS, fps=first_fps)
         tcr._write_two_pass_debug(all_detections, summaries, preset_ids, first_cam_base)
         print("two_pass 模式：第二遍輸出追焦影片（快取模式，跳過 YOLO）...")
         tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path,
-                             preset_target_ids=preset_ids, frame_cache=frame_cache)
+                             preset_target_ids=preset_ids, frame_cache=frame_cache,
+                             frame_ranges_by_cam=frame_ranges_by_cam)
     else:
         tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
     out.release()
@@ -531,11 +588,25 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
             try:
                 os.rename(angle_csv_orig, angle_csv_dest)
                 print(f"  ▶ 關節角度資料 (CSV): {angle_csv_dest}")
+                angle_fps = None
+                if cameras and cameras[0].get('video_path'):
+                    cap = cv2.VideoCapture(cameras[0]['video_path'])
+                    if cap.isOpened():
+                        angle_fps = cap.get(cv2.CAP_PROP_FPS) or None
+                    cap.release()
+                _add_time_to_angles_csv(angle_csv_dest, fps=angle_fps)
             except Exception as e:
                 print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig} (重新命名失敗: {e})")
         elif os.path.exists(angle_csv_orig):
             angle_csv_dest = angle_csv_orig
             print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig}")
+            angle_fps = None
+            if cameras and cameras[0].get('video_path'):
+                cap = cv2.VideoCapture(cameras[0]['video_path'])
+                if cap.isOpened():
+                    angle_fps = cap.get(cv2.CAP_PROP_FPS) or None
+                cap.release()
+            _add_time_to_angles_csv(angle_csv_dest, fps=angle_fps)
 
     avg_step_length = None
     step_analysis = None
@@ -600,6 +671,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
                 convert_to_web_compatible_mp4(output_uncropped)
                 print(f"  ▶ [Core.Pipeline] 網頁串流格式轉檔成功: {output_uncropped}")
+                _add_time_to_angles_csv(angle_csv_dest, video_path=output_uncropped)
                 output_final_frames_dir = _export_video_frames(
                     output_uncropped,
                     output_dest if output_dest else os.path.dirname(output_uncropped),

@@ -83,6 +83,20 @@ CROP_HEIGHT = 260
 AUTO_CROP   = False  # True → 先 dry-run 收集 bbox 統計，自動設定裁剪尺寸
 TRACKING_MODE = 'online'  # 'online' | 'two_pass'
 
+# Optional temporal pre-scan. Only used when TRACKING_MODE == 'two_pass'.
+# It scans sampled frames with a TensorRT INT8 YOLO engine, finds ranges where
+# a valid person appears, expands the ranges with buffer, and limits both
+# two-pass Pass 1 and Pass 2 to those original-frame ranges.
+PRESCAN_ENABLED = False
+PRESCAN_ENGINE_PATH = get_model_path("yolo26x_ultralytics_int8.engine")
+PRESCAN_STRIDE = 8
+PRESCAN_IMGSZ = 640
+PRESCAN_CONF = 0.25
+PRESCAN_IOU = 0.7
+PRESCAN_BUFFER_SEC = 1.0
+PRESCAN_MAX_GAP_SEC = 1.0
+PRESCAN_USE_GRAB = True
+
 # 是否在裁剪畫面上疊加框
 #   True  = 綠色 bbox（最快跑者）+ 藍色 ROI 框
 #   False = 輸出乾淨畫面（無任何疊加）
@@ -913,7 +927,242 @@ def process_frame(img, model, velocity_tracker, device,
     return crop_frame, fastest_id, fastest_center_orig, fastest_bx2_orig, bbox_in_crop, c1x + crop_x_offset, c1y + crop_y_offset
 
 
-def _collect_all_detections(caps, cameras, model):
+def _frame_ranges_for_camera(frame_ranges_by_cam, cam_idx, total_frames):
+    if not frame_ranges_by_cam:
+        return None
+    ranges = frame_ranges_by_cam.get(cam_idx)
+    if not ranges:
+        return None
+    cleaned = []
+    last_start = None
+    last_end = None
+    for item in ranges:
+        if isinstance(item, dict):
+            start = int(item.get('start_frame', 0))
+            end = int(item.get('end_frame', total_frames - 1))
+        else:
+            start, end = item
+            start = int(start)
+            end = int(end)
+        start = max(0, min(start, max(total_frames - 1, 0)))
+        end = max(0, min(end, max(total_frames - 1, 0)))
+        if end < start:
+            continue
+        if last_start is None:
+            last_start, last_end = start, end
+        elif start <= last_end + 1:
+            last_end = max(last_end, end)
+        else:
+            cleaned.append((last_start, last_end))
+            last_start, last_end = start, end
+    if last_start is not None:
+        cleaned.append((last_start, last_end))
+    return cleaned or None
+
+
+def _merge_prescan_hit_frames(hit_frames, total_frames, stride, buffer_frames, max_gap_frames):
+    if not hit_frames:
+        return []
+    ranges = []
+    start = end = int(hit_frames[0])
+    for frame_idx in hit_frames[1:]:
+        frame_idx = int(frame_idx)
+        if frame_idx - end <= max_gap_frames:
+            end = frame_idx
+        else:
+            ranges.append((start, end))
+            start = end = frame_idx
+    ranges.append((start, end))
+
+    expanded = []
+    last_start = last_end = None
+    for start, end in ranges:
+        start = max(0, start - buffer_frames)
+        end = min(max(total_frames - 1, 0), end + buffer_frames + stride - 1)
+        if last_start is None:
+            last_start, last_end = start, end
+        elif start <= last_end + 1:
+            last_end = max(last_end, end)
+        else:
+            expanded.append((last_start, last_end))
+            last_start, last_end = start, end
+    expanded.append((last_start, last_end))
+    return expanded
+
+
+def _prescan_detection_is_valid(result, cam, min_height):
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return False, 0
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    track_roi = cam.get('track_roi')
+    roi_enabled = cam.get('roi_enabled')
+    roi_zones = cam.get('roi_zones') or []
+    valid_count = 0
+    for box in xyxy:
+        bx1, by1, bx2, by2 = map(float, box[:4])
+        if by2 - by1 < min_height:
+            continue
+        center_x = (bx1 + bx2) / 2.0
+        center_y = (by1 + by2) / 2.0
+        ground_pt = _bbox_bottom_center((bx1, by1, bx2, by2))
+        if track_roi is not None:
+            proj_px = _project_onto_track(
+                ground_pt, track_roi['start_mid'], track_roi['track_dir']
+            )
+            pre_roll = track_roi.get('pre_roll_px', 0)
+            end_roll = track_roi.get('end_roll_px', 0)
+            if not (-pre_roll <= proj_px <= track_roi['pixel_span'] + end_roll):
+                continue
+        elif roi_enabled and roi_zones:
+            if not any(z['x'][0] <= center_x <= z['x'][1] and
+                       z['y'][0] <= center_y <= z['y'][1]
+                       for z in roi_zones):
+                continue
+        valid_count += 1
+    return valid_count > 0, valid_count
+
+
+def run_temporal_prescan(cameras, output_dir=None):
+    if not PRESCAN_ENABLED:
+        return None
+    if not PRESCAN_ENGINE_PATH or not os.path.exists(PRESCAN_ENGINE_PATH):
+        print(f"  [prescan] engine not found, skip: {PRESCAN_ENGINE_PATH}")
+        return None
+
+    import time
+
+    out_dir = output_dir or OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    model = YOLO(PRESCAN_ENGINE_PATH, task='detect')
+    frame_ranges_by_cam = {}
+    reports = []
+    print("temporal pre-scan：使用 INT8 engine 找有效 frame range...")
+
+    for cam_idx, cam in enumerate(cameras):
+        video_path = cam.get('video_path')
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"  [prescan] 相機 {cam_idx + 1}: 無法開啟 {video_path}")
+            continue
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        buffer_frames = max(0, int(round(PRESCAN_BUFFER_SEC * fps)))
+        max_gap_frames = max(0, int(round(PRESCAN_MAX_GAP_SEC * fps)))
+        hit_frames = []
+        sampled_rows = []
+        sampled = 0
+        valid_boxes_total = 0
+        frame_idx = 0
+        start_time = time.perf_counter()
+
+        while frame_idx < total_frames:
+            if frame_idx % PRESCAN_STRIDE == 0:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                sampled += 1
+                result = model.predict(
+                    frame,
+                    imgsz=PRESCAN_IMGSZ,
+                    conf=PRESCAN_CONF,
+                    iou=PRESCAN_IOU,
+                    device=DEVICE,
+                    verbose=False,
+                )[0]
+                is_hit, valid_count = _prescan_detection_is_valid(
+                    result, cam, MIN_PERSON_HEIGHT
+                )
+                if is_hit:
+                    hit_frames.append(frame_idx)
+                    valid_boxes_total += valid_count
+                sampled_rows.append({
+                    'frame': frame_idx,
+                    'time_s': frame_idx / fps if fps > 0 else None,
+                    'hit': int(is_hit),
+                    'valid_boxes': int(valid_count),
+                })
+            else:
+                ok = cap.grab() if PRESCAN_USE_GRAB else cap.read()[0]
+                if not ok:
+                    break
+            frame_idx += 1
+
+        cap.release()
+        elapsed = time.perf_counter() - start_time
+        ranges = _merge_prescan_hit_frames(
+            hit_frames, total_frames, PRESCAN_STRIDE, buffer_frames, max_gap_frames
+        )
+        frame_ranges_by_cam[cam_idx] = ranges
+        range_rows = [
+            {
+                'start_frame': int(start),
+                'end_frame': int(end),
+                'num_frames': int(end - start + 1),
+                'start_time_s': float(start / fps) if fps > 0 else None,
+                'end_time_s': float(end / fps) if fps > 0 else None,
+            }
+            for start, end in ranges
+        ]
+        kept_frames = sum(r['num_frames'] for r in range_rows)
+        reports.append({
+            'cam_idx': cam_idx,
+            'video_path': video_path,
+            'fps': fps,
+            'total_frames': total_frames,
+            'sampled_frames': sampled,
+            'hit_sampled_frames': len(hit_frames),
+            'valid_boxes': valid_boxes_total,
+            'elapsed_sec': elapsed,
+            'ranges': range_rows,
+            'kept_frames': kept_frames,
+            'kept_ratio': kept_frames / total_frames if total_frames else 0.0,
+        })
+        print(
+            f"  [prescan] 相機 {cam_idx + 1}: sampled={sampled}, "
+            f"hits={len(hit_frames)}, ranges={len(ranges)}, "
+            f"kept={kept_frames}/{total_frames}, elapsed={elapsed:.2f}s"
+        )
+
+        first_cam_base = os.path.splitext(os.path.basename(video_path))[0]
+        sample_path = os.path.join(out_dir, f"{first_cam_base}_prescan_samples.csv")
+        with open(sample_path, 'w', newline='') as f:
+            writer = csv.DictWriter(
+                f, fieldnames=['frame', 'time_s', 'hit', 'valid_boxes']
+            )
+            writer.writeheader()
+            writer.writerows(sampled_rows)
+
+    first_cam_base = (
+        os.path.splitext(os.path.basename(cameras[0]['video_path']))[0]
+        if cameras and cameras[0].get('video_path') else 'tracking'
+    )
+    report_path = os.path.join(out_dir, f"{first_cam_base}_prescan_ranges.json")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'enabled': True,
+            'engine_path': PRESCAN_ENGINE_PATH,
+            'params': {
+                'stride': PRESCAN_STRIDE,
+                'imgsz': PRESCAN_IMGSZ,
+                'conf': PRESCAN_CONF,
+                'iou': PRESCAN_IOU,
+                'buffer_sec': PRESCAN_BUFFER_SEC,
+                'max_gap_sec': PRESCAN_MAX_GAP_SEC,
+                'use_grab': PRESCAN_USE_GRAB,
+            },
+            'cameras': reports,
+        }, f, ensure_ascii=False, indent=2)
+    print(f"  [prescan] report: {report_path}")
+
+    if not any(frame_ranges_by_cam.values()):
+        print("  [prescan] 未找到有效區間，two_pass 將退回掃完整影片")
+        return None
+    return frame_ranges_by_cam
+
+
+def _collect_all_detections(caps, cameras, model, frame_ranges_by_cam=None):
     """
     Pass 1: 讀遍所有相機，以完整原始畫面收集每幀通過 ROI/高度過濾的所有偵測（不選最快）。
     回傳 (all_rows, frame_cache)：
@@ -940,13 +1189,30 @@ def _collect_all_detections(caps, cameras, model):
         roi_enabled = cam['roi_enabled']
         roi_zones = cam['roi_zones']
 
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        valid_ranges = _frame_ranges_for_camera(frame_ranges_by_cam, cam_idx, total_frames)
+        range_cursor = 0
         frame_count = 0
+        if valid_ranges:
+            frame_count = valid_ranges[0][0]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+
         while cap.isOpened():
+            if valid_ranges:
+                while range_cursor < len(valid_ranges) and frame_count > valid_ranges[range_cursor][1]:
+                    range_cursor += 1
+                    if range_cursor < len(valid_ranges):
+                        frame_count = valid_ranges[range_cursor][0]
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+                if range_cursor >= len(valid_ranges):
+                    break
+
             ret, frame = cap.read()
             if not ret:
                 break
 
             img = frame
+            source_frame = frame_count
 
             results = model.track(img, persist=True, classes=[0], show=False,
                                   device=DEVICE, conf=0.25, iou=0.1,
@@ -988,7 +1254,7 @@ def _collect_all_detections(caps, cameras, model):
                         tid = int(ids[i])
                         all_rows.append({
                             'cam_idx':    cam_idx,
-                            'frame_idx':  frame_count,
+                            'frame_idx':  source_frame,
                             'track_id':   tid,
                             'bx1': bx1, 'by1': by1, 'bx2': bx2, 'by2': by2,
                             'center_x':   center_x,
@@ -996,7 +1262,7 @@ def _collect_all_detections(caps, cameras, model):
                             'proj_px':    proj_px,
                             'bbox_height': bbox_h,
                         })
-                        key = (cam_idx, frame_count)
+                        key = (cam_idx, source_frame)
                         if key not in frame_cache:
                             frame_cache[key] = []
                         frame_cache[key].append({
@@ -1009,7 +1275,7 @@ def _collect_all_detections(caps, cameras, model):
     return all_rows, frame_cache
 
 
-def _score_and_select_runners(all_detections, cameras):
+def _score_and_select_runners(all_detections, cameras, frame_ranges_by_cam=None):
     """
     依軌跡品質評分，選出每台相機的主跑者。
     回傳 (preset_ids, summaries)：
@@ -1023,10 +1289,14 @@ def _score_and_select_runners(all_detections, cameras):
         groups[(row['cam_idx'], row['track_id'])].append(row)
 
     cam_total_frames = defaultdict(int)
-    for row in all_detections:
-        ci = row['cam_idx']
-        if row['frame_idx'] + 1 > cam_total_frames[ci]:
-            cam_total_frames[ci] = row['frame_idx'] + 1
+    if frame_ranges_by_cam:
+        for cam_idx, ranges in frame_ranges_by_cam.items():
+            cam_total_frames[cam_idx] = sum(int(end) - int(start) + 1 for start, end in ranges)
+    else:
+        for row in all_detections:
+            ci = row['cam_idx']
+            if row['frame_idx'] + 1 > cam_total_frames[ci]:
+                cam_total_frames[ci] = row['frame_idx'] + 1
 
     summaries = []
     for (cam_idx, track_id), rows in groups.items():
@@ -1106,11 +1376,13 @@ def _score_and_select_runners(all_detections, cameras):
     return preset_ids, summaries
 
 
-def _stitch_target_id(frame_cache, preset_ids, cameras, max_gap=5, max_dist_px=100):
+def _stitch_target_id(frame_cache, preset_ids, cameras, fps=30.0, max_dist_px=100):
     """
-    In-place 修補 frame_cache：當 target_id 短暫消失（≤ max_gap 幀），
+    In-place 修補 frame_cache：當 target_id 短暫消失，
     若空缺幀有其他 ID 的 bbox 位置與大小接近預期（線性插值），就把 track_id 改成 target_id。
+    max_gap 由 fps 自動推算（約 0.2 秒），上限 15 幀。
     """
+    max_gap = max(5, min(15, round(fps * 0.2)))
     for cam_idx, target_id in preset_ids.items():
         target_frames = sorted(
             fi for (ci, fi), dets in frame_cache.items()
@@ -1209,7 +1481,7 @@ def _write_two_pass_debug(all_detections, summaries, preset_ids, base_name):
 
 
 def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=None,
-                     preset_target_ids=None, frame_cache=None):
+                     preset_target_ids=None, frame_cache=None, frame_ranges_by_cam=None):
     """
     逐台相機執行 YOLO 追蹤並（選擇性）寫入影片。
 
@@ -1252,11 +1524,16 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         vid_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps    = cap.get(cv2.CAP_PROP_FPS) or 60.0
         total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        valid_ranges = _frame_ranges_for_camera(frame_ranges_by_cam, cam_idx, total)
+        range_cursor = 0
 
         if not dry_run:
             print(f"{'─'*60}")
             print(f"相機 {cam_idx+1}/{len(cameras)}: {cam['video_path']}")
             print(f"  解析度: {vid_w}x{vid_h}，幀數: {total}，FPS: {fps:.1f}")
+            if valid_ranges:
+                kept_frames = sum(end - start + 1 for start, end in valid_ranges)
+                print(f"  pre-scan range: {valid_ranges}，處理 {kept_frames}/{total} 幀")
 
         configured_cp = cam['crop_params']
         use_full_frame_tracking = frame_cache is not None
@@ -1316,6 +1593,9 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
         cam_skipped = 0
         cam_written = 0
         frame_count = 0
+        if valid_ranges:
+            frame_count = valid_ranges[0][0]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
         cam_interpolated = 0
         pending_missing = []  # YOLO 暫時缺失的幀，等下一個有效 bbox 後線性補回
         last_valid_bbox = None
@@ -1409,11 +1689,21 @@ def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=No
             overview_out = cv2.VideoWriter(overview_path, _ov_fourcc, fps, (vid_w, vid_h))
 
         while cap.isOpened():
+            if valid_ranges:
+                while range_cursor < len(valid_ranges) and frame_count > valid_ranges[range_cursor][1]:
+                    range_cursor += 1
+                    pending_missing.clear()
+                    if range_cursor < len(valid_ranges):
+                        frame_count = valid_ranges[range_cursor][0]
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+                if range_cursor >= len(valid_ranges):
+                    break
+
             ret, frame = cap.read()
             if not ret:
                 break
+            source_frame = frame_count
             frame_count += 1
-            source_frame = frame_count - 1
 
             # 在 process_frame 修改 img 之前先複製原始幀，供 overview 使用
             overview_frame = frame.copy() if overview_out is not None else None
@@ -1729,7 +2019,7 @@ def main():
 
     # 允許 config 覆蓋全域常數（--config 與 --config-json 共用）
     if _cfg:
-        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, AUTO_CROP, SHOW_OVERLAY, DRAW_BBOX_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY, MIN_PERSON_HEIGHT, TRACKING_MODE
+        global OUTPUT_DIR, CROP_WIDTH, CROP_HEIGHT, AUTO_CROP, SHOW_OVERLAY, DRAW_BBOX_OVERLAY, MOVEMENT_THRESHOLD, MIN_MOVEMENT_FRAMES, STATIONARY_DECAY, MAX_PERSON_MEMORY, MIN_PERSON_HEIGHT, TRACKING_MODE, PRESCAN_ENABLED, PRESCAN_ENGINE_PATH, PRESCAN_STRIDE, PRESCAN_IMGSZ, PRESCAN_CONF, PRESCAN_IOU, PRESCAN_BUFFER_SEC, PRESCAN_MAX_GAP_SEC, PRESCAN_USE_GRAB
         if 'output_dir'          in _cfg: OUTPUT_DIR         = _cfg['output_dir']
         if 'crop_width'          in _cfg: CROP_WIDTH          = int(_cfg['crop_width'])
         if 'crop_height'         in _cfg: CROP_HEIGHT         = int(_cfg['crop_height'])
@@ -1742,6 +2032,15 @@ def main():
         if 'max_person_memory'   in _cfg: MAX_PERSON_MEMORY   = int(_cfg['max_person_memory'])
         if 'min_person_height'   in _cfg: MIN_PERSON_HEIGHT   = int(_cfg['min_person_height'])
         if 'tracking_mode'       in _cfg: TRACKING_MODE       = str(_cfg['tracking_mode'])
+        if 'prescan_enabled'     in _cfg: PRESCAN_ENABLED     = bool(_cfg['prescan_enabled'])
+        if 'prescan_engine_path' in _cfg: PRESCAN_ENGINE_PATH = str(_cfg['prescan_engine_path'])
+        if 'prescan_stride'      in _cfg: PRESCAN_STRIDE      = int(_cfg['prescan_stride'])
+        if 'prescan_imgsz'       in _cfg: PRESCAN_IMGSZ       = int(_cfg['prescan_imgsz'])
+        if 'prescan_conf'        in _cfg: PRESCAN_CONF        = float(_cfg['prescan_conf'])
+        if 'prescan_iou'         in _cfg: PRESCAN_IOU         = float(_cfg['prescan_iou'])
+        if 'prescan_buffer_sec'  in _cfg: PRESCAN_BUFFER_SEC  = float(_cfg['prescan_buffer_sec'])
+        if 'prescan_max_gap_sec' in _cfg: PRESCAN_MAX_GAP_SEC = float(_cfg['prescan_max_gap_sec'])
+        if 'prescan_use_grab'    in _cfg: PRESCAN_USE_GRAB    = bool(_cfg['prescan_use_grab'])
 
     if not CAMERAS:
         raise ValueError("所有相機的 video_path 均為 None，請至少設定一台。")
@@ -1840,19 +2139,25 @@ def main():
     # 正式處理：逐台相機串接追蹤 + 寫入影片
     # -----------------------------------------------------------------------
     if TRACKING_MODE == 'two_pass':
+        frame_ranges_by_cam = run_temporal_prescan(CAMERAS, output_dir=OUTPUT_DIR) if PRESCAN_ENABLED else None
         print("two_pass 模式：第一遍收集所有候選人軌跡...")
         caps_pass1 = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
-        all_detections, frame_cache = _collect_all_detections(caps_pass1, CAMERAS, model)
+        all_detections, frame_cache = _collect_all_detections(
+            caps_pass1, CAMERAS, model, frame_ranges_by_cam=frame_ranges_by_cam
+        )
         for c in caps_pass1:
             c.release()
         print(f"  收集完成：共 {len(all_detections)} 筆偵測")
-        preset_ids, summaries = _score_and_select_runners(all_detections, CAMERAS)
-        _stitch_target_id(frame_cache, preset_ids, CAMERAS)
+        preset_ids, summaries = _score_and_select_runners(
+            all_detections, CAMERAS, frame_ranges_by_cam=frame_ranges_by_cam
+        )
+        _stitch_target_id(frame_cache, preset_ids, CAMERAS, fps=first_fps)
         _write_two_pass_debug(all_detections, summaries, preset_ids, first_cam_base)
         print("two_pass 模式：第二遍輸出追焦影片（快取模式，跳過 YOLO）...")
         total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
             _process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path,
-                             preset_target_ids=preset_ids, frame_cache=frame_cache)
+                             preset_target_ids=preset_ids, frame_cache=frame_cache,
+                             frame_ranges_by_cam=frame_ranges_by_cam)
     else:
         total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
             _process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
