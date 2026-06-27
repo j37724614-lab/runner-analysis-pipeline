@@ -75,9 +75,10 @@ FONT_PATH = get_font_path()
 # 輸出目錄（檔名依第一台有效相機自動命名：{輸入檔名}_tracked.mp4）
 OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
-# 固定裁剪尺寸（以最快人物中心為基準）
+# fallback 裁剪尺寸（以最快人物中心為基準）
+# 一般分析流程應使用 auto_crop，避免不同解析度或人物大小都被限制在固定尺寸。
 # 建議值：先執行一次看底部「建議 CROP_WIDTH/CROP_HEIGHT」的統計輸出再調整
-# 或在 config 加入 auto_crop: true，讓程式自動以中位數 × 2 決定尺寸
+# 或在 config 加入 auto_crop: true，讓程式依 bbox 統計自動決定正方形尺寸
 CROP_WIDTH  = 200
 CROP_HEIGHT = 260
 AUTO_CROP   = False  # True → 先 dry-run 收集 bbox 統計，自動設定裁剪尺寸
@@ -304,17 +305,20 @@ def _build_camera_from_entry(entry):
     if distance_m is None and src_pts and entry.get('start_meter') is not None:
         distance_m = 20.0
 
-    # 若未手動設 crop 但有 start_line/end_line，自動以四個點的外接矩形 + pre_roll_px 當 crop
+    # 若未手動設 crop 但有 start_line/end_line，自動以四個點的外接矩形建立 YOLO 前處理 ROI。
+    # 上方保留較大的空間，避免近距離或高解析度影片中跑者上半身在 YOLO 前就被裁掉。
     if crop_val is None and start_line is not None and end_line is not None:
         padding = int(entry.get('pre_roll_px', 200))
+        top_padding = int(entry.get('crop_top_padding_px', padding * 3))
+        bottom_padding = int(entry.get('crop_bottom_padding_px', padding))
         all_pts = list(start_line) + list(end_line)
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
         crop_val = (
             int(max(0, min(xs) - padding)),
-            int(max(0, min(ys) - padding)),
+            int(max(0, min(ys) - top_padding)),
             int(max(xs) + padding),
-            int(max(ys) + padding),
+            int(max(ys) + bottom_padding),
         )
 
     return camera(
@@ -1480,6 +1484,36 @@ def _write_two_pass_debug(all_detections, summaries, preset_ids, base_name):
     print(f"  Selected runner: {path}")
 
 
+def _auto_crop_side_from_bbox_sizes(widths, heights):
+    """依 bbox 寬高樣本計算 auto square crop 邊長。"""
+    if not widths or not heights:
+        return None
+    p90_side = max(np.percentile(widths, 90), np.percentile(heights, 90)) * 1.25
+    max_side = max(max(widths), max(heights)) * 1.05
+    return int(np.ceil(max(p90_side, max_side)))
+
+
+def _auto_crop_from_selected_cache(frame_cache, preset_ids):
+    """
+    從 two_pass 已選主跑者 bbox 計算 auto crop。
+
+    呼叫時機應在 _stitch_target_id() 之後，這樣短暫換 ID 或漏偵測後
+    被修補回 target_id 的 bbox 也會納入尺寸統計。
+    """
+    widths = []
+    heights = []
+    for (cam_idx, _frame_idx), detections in frame_cache.items():
+        target_id = preset_ids.get(cam_idx)
+        if target_id is None:
+            continue
+        for det in detections:
+            if int(det.get('track_id', -1)) != int(target_id):
+                continue
+            widths.append(int(det['bx2']) - int(det['bx1']))
+            heights.append(int(det['by2']) - int(det['by1']))
+    return _auto_crop_side_from_bbox_sizes(widths, heights), widths, heights
+
+
 def _process_cameras(caps, cameras, model, out, dry_run=False, frame_map_path=None,
                      preset_target_ids=None, frame_cache=None, frame_ranges_by_cam=None):
     """
@@ -2118,22 +2152,23 @@ def main():
                 )
 
     # -----------------------------------------------------------------------
-    # auto_crop：第一遍 dry-run 收集 bbox 統計，自動決定裁剪尺寸
+    # auto_crop：online 模式用 dry-run 估計尺寸；two_pass 模式改在 Pass 1
+    # 選出主跑者後，使用該主跑者 bbox 統計決定尺寸。
     # -----------------------------------------------------------------------
-    if AUTO_CROP:
+    if TRACKING_MODE != 'two_pass' and AUTO_CROP:
         print("auto_crop 模式：第一遍掃描（分析 bbox 尺寸，不寫影片）...")
         _, _, dry_bw, dry_bh, _, _ = _process_cameras(caps, CAMERAS, model, None, dry_run=True)
         # dry-run 已讀完所有影片，重新開啟
         caps = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
         if dry_bw and dry_bh:
-            CROP_WIDTH  = int(np.median(dry_bw)) * 2
-            CROP_HEIGHT = int(np.median(dry_bh)) * 2
-            print(f"  自動設定裁剪尺寸: {CROP_WIDTH} x {CROP_HEIGHT}（中位數 × 2）\n")
+            crop_side = _auto_crop_side_from_bbox_sizes(dry_bw, dry_bh)
+            CROP_WIDTH = crop_side
+            CROP_HEIGHT = crop_side
+            print(f"  自動設定裁剪尺寸: {CROP_WIDTH} x {CROP_HEIGHT}（auto square）\n")
         else:
             print("  警告：未收集到 bbox 資料，沿用預設尺寸\n")
 
     print(f"輸出路徑: {output_path}")
-    out = cv2.VideoWriter(output_path, fourcc, first_fps, (CROP_WIDTH, CROP_HEIGHT))
 
     # -----------------------------------------------------------------------
     # 正式處理：逐台相機串接追蹤 + 寫入影片
@@ -2153,12 +2188,23 @@ def main():
         )
         _stitch_target_id(frame_cache, preset_ids, CAMERAS, fps=first_fps)
         _write_two_pass_debug(all_detections, summaries, preset_ids, first_cam_base)
+        if AUTO_CROP:
+            crop_side, sel_bw, sel_bh = _auto_crop_from_selected_cache(frame_cache, preset_ids)
+            if crop_side:
+                CROP_WIDTH = crop_side
+                CROP_HEIGHT = crop_side
+                print(f"  two_pass auto_crop: 使用已選主跑者 bbox 設定裁剪尺寸 "
+                      f"{CROP_WIDTH} x {CROP_HEIGHT}（samples={len(sel_bw)}）")
+            else:
+                print("  警告：two_pass auto_crop 未收集到已選主跑者 bbox，沿用目前尺寸")
+        out = cv2.VideoWriter(output_path, fourcc, first_fps, (CROP_WIDTH, CROP_HEIGHT))
         print("two_pass 模式：第二遍輸出追焦影片（快取模式，跳過 YOLO）...")
         total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
             _process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path,
                              preset_target_ids=preset_ids, frame_cache=frame_cache,
                              frame_ranges_by_cam=frame_ranges_by_cam)
     else:
+        out = cv2.VideoWriter(output_path, fourcc, first_fps, (CROP_WIDTH, CROP_HEIGHT))
         total_written, total_skipped, all_bbox_widths, all_bbox_heights, max_bbox_width, max_bbox_height = \
             _process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
 
@@ -2181,9 +2227,13 @@ def main():
     print(f"  平均寬/高: {avg_w} / {avg_h} px")
     print(f"  中位數寬/高: {med_w} / {med_h} px")
     if AUTO_CROP:
-        print(f"  裁剪尺寸已自動套用（中位數 × 2）")
+        print(f"  裁剪尺寸已自動套用（auto square）")
     else:
-        print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {med_w*2} / {med_h*2}  (中位數 × 2)")
+        if all_bbox_widths and all_bbox_heights:
+            p90_side = max(np.percentile(all_bbox_widths, 90), np.percentile(all_bbox_heights, 90)) * 1.25
+            max_side = max(max(all_bbox_widths), max(all_bbox_heights)) * 1.05
+            suggested_side = int(np.ceil(max(p90_side, max_side)))
+            print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {suggested_side} / {suggested_side}  (auto square)")
         print(f"  （提示：config 加入 auto_crop: true 可下次自動套用）")
 
 

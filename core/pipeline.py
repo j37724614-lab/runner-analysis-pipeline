@@ -17,6 +17,7 @@ import json
 import shutil
 import argparse
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
@@ -32,6 +33,49 @@ from scripts.analysis.ankle_step_stride import (
     annotate_step_stride_video,
     run_step_stride_analysis,
 )
+
+
+def _record_timing(timings: list | None, stage: str, started_at: float, **meta) -> float:
+    """Record and print elapsed time for one pipeline stage."""
+    elapsed = time.perf_counter() - started_at
+    row = {
+        "stage": stage,
+        "elapsed_sec": round(elapsed, 4),
+    }
+    if meta:
+        row.update(meta)
+    if timings is not None:
+        timings.append(row)
+    print(f"  ⏱ [TIME] {stage}: {elapsed:.2f}s")
+    return elapsed
+
+
+def _write_timing_report(timings: list, output_dest: str | None) -> str | None:
+    """Write timing_report.json under the analysis output directory."""
+    if not output_dest:
+        return None
+    os.makedirs(output_dest, exist_ok=True)
+    report_path = os.path.join(output_dest, "timing_report.json")
+    total = sum(item.get("elapsed_sec", 0.0) for item in timings)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime_now_iso(),
+                "note": "elapsed_sec is wall-clock time. Parallel stages overlap, so summed elapsed_sec can exceed total runtime.",
+                "timings": timings,
+                "summed_stage_elapsed_sec": round(total, 4),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"  ⏱ [TIME] timing report: {report_path}")
+    return report_path
+
+
+def datetime_now_iso() -> str:
+    """Return local timestamp without adding a hard dependency to timezone packages."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _copy_output_final_to_keypoints_archive(final_pose_dir: str, output_video: str):
@@ -174,7 +218,8 @@ def _import_vis(motion_ag_dir: Path):
 # 各步驟實作函式
 # -----------------------------------------------------------------------
 
-def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -> str:
+def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str,
+                timings: list | None = None) -> str:
     """
     Step 1：執行 YOLO 多相機追蹤與跑者置中裁剪。
     直接調用 core.tracking 模組，不啟用額外子行程。
@@ -182,6 +227,7 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
     print("=" * 60)
     print("Step 1 — 多相機追蹤 + 人物置中裁剪 (Core.Tracking)")
     print("=" * 60)
+    step_started_at = time.perf_counter()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
 
@@ -242,58 +288,107 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str) -
 
     # 載入 YOLO 模型
     from ultralytics import YOLO
+    model_started_at = time.perf_counter()
     model = YOLO(tcr.MODEL_PATH)
     # Warmup 模型
     model.predict(np.zeros((480, 640, 3), dtype=np.uint8), device=tcr.DEVICE, verbose=False)
-
-    # auto_crop 第一遍掃描
-    if tcr.AUTO_CROP:
-        print("auto_crop：第一遍掃描（分析 bbox 大小）...")
-        _, _, dry_bw, dry_bh, _, _ = tcr._process_cameras(caps, CAMERAS, model, None, dry_run=True)
-        caps = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
-        if dry_bw and dry_bh:
-            tcr.CROP_WIDTH  = int(np.median(dry_bw)) * 2
-            tcr.CROP_HEIGHT = int(np.median(dry_bh)) * 2
-            print(f"  自動設定裁剪尺寸: {tcr.CROP_WIDTH} x {tcr.CROP_HEIGHT}")
+    _record_timing(timings, "Step1/load_yolo_model_and_warmup", model_started_at,
+                   model_path=str(tcr.MODEL_PATH))
 
     first_fps = caps[0].get(cv2.CAP_PROP_FPS) or 60.0
-    fourcc    = cv2.VideoWriter_fourcc(*'mp4v')
-    out       = cv2.VideoWriter(output_path, fourcc, first_fps,
-                                (tcr.CROP_WIDTH, tcr.CROP_HEIGHT))
 
     frame_map_name = output_name.replace('.mp4', '_frame_map.csv')
     frame_map_path = os.path.join(output_dir, frame_map_name)
 
+    # online 模式沒有 Pass 1 可先選定主跑者，因此仍用 dry-run 估計 crop size。
+    # two_pass 模式會在 Pass 1 選出主跑者並 stitch 後，改用該主跑者 bbox 決定尺寸。
+    if tcr.TRACKING_MODE != 'two_pass' and tcr.AUTO_CROP:
+        print("auto_crop：第一遍掃描（分析 bbox 大小）...")
+        dryrun_started_at = time.perf_counter()
+        _, _, dry_bw, dry_bh, _, _ = tcr._process_cameras(caps, CAMERAS, model, None, dry_run=True)
+        _record_timing(timings, "Step1/online_auto_crop_dry_run", dryrun_started_at,
+                       bbox_samples=len(dry_bw))
+        caps = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
+        if dry_bw and dry_bh:
+            crop_side = tcr._auto_crop_side_from_bbox_sizes(dry_bw, dry_bh)
+            tcr.CROP_WIDTH = crop_side
+            tcr.CROP_HEIGHT = crop_side
+            print(f"  自動設定裁剪尺寸: {tcr.CROP_WIDTH} x {tcr.CROP_HEIGHT}（auto square）")
+
     if tcr.TRACKING_MODE == 'two_pass':
+        prescan_started_at = time.perf_counter()
         frame_ranges_by_cam = tcr.run_temporal_prescan(CAMERAS, output_dir=output_dir) if tcr.PRESCAN_ENABLED else None
+        _record_timing(timings, "Step1/prescan_person_frames", prescan_started_at,
+                       enabled=bool(tcr.PRESCAN_ENABLED))
         print("two_pass 模式：第一遍收集所有候選人軌跡...")
         caps_pass1 = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
+        pass1_started_at = time.perf_counter()
         all_detections, frame_cache = tcr._collect_all_detections(
             caps_pass1, CAMERAS, model, frame_ranges_by_cam=frame_ranges_by_cam
         )
+        _record_timing(timings, "Step1/two_pass_pass1_collect_detections", pass1_started_at,
+                       detections=len(all_detections), cached_frames=len(frame_cache))
         for c in caps_pass1:
             c.release()
         print(f"  收集完成：共 {len(all_detections)} 筆偵測")
         first_cam_base = os.path.splitext(os.path.basename(CAMERAS[0]['video_path']))[0]
+        select_started_at = time.perf_counter()
         preset_ids, summaries = tcr._score_and_select_runners(
             all_detections, CAMERAS, frame_ranges_by_cam=frame_ranges_by_cam
         )
+        _record_timing(timings, "Step1/two_pass_select_main_runner", select_started_at,
+                       selected_ids={str(k): int(v) for k, v in preset_ids.items()})
+        stitch_started_at = time.perf_counter()
         tcr._stitch_target_id(frame_cache, preset_ids, CAMERAS, fps=first_fps)
+        _record_timing(timings, "Step1/two_pass_stitch_target_id", stitch_started_at)
+        debug_started_at = time.perf_counter()
         tcr._write_two_pass_debug(all_detections, summaries, preset_ids, first_cam_base)
+        _record_timing(timings, "Step1/two_pass_write_debug_csv", debug_started_at)
+        if tcr.AUTO_CROP:
+            crop_started_at = time.perf_counter()
+            crop_side, sel_bw, sel_bh = tcr._auto_crop_from_selected_cache(frame_cache, preset_ids)
+            _record_timing(timings, "Step1/two_pass_auto_crop_from_selected_bbox", crop_started_at,
+                           bbox_samples=len(sel_bw), crop_side=crop_side)
+            if crop_side:
+                tcr.CROP_WIDTH = crop_side
+                tcr.CROP_HEIGHT = crop_side
+                print(f"  two_pass auto_crop: 使用已選主跑者 bbox 設定裁剪尺寸 "
+                      f"{tcr.CROP_WIDTH} x {tcr.CROP_HEIGHT}（samples={len(sel_bw)}）")
+            else:
+                print("  警告：two_pass auto_crop 未收集到已選主跑者 bbox，沿用目前尺寸")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, first_fps,
+                              (tcr.CROP_WIDTH, tcr.CROP_HEIGHT))
         print("two_pass 模式：第二遍輸出追焦影片（快取模式，跳過 YOLO）...")
+        pass2_started_at = time.perf_counter()
         tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path,
                              preset_target_ids=preset_ids, frame_cache=frame_cache,
                              frame_ranges_by_cam=frame_ranges_by_cam)
+        _record_timing(timings, "Step1/two_pass_pass2_write_tracked_video", pass2_started_at,
+                       output_path=output_path,
+                       crop_width=int(tcr.CROP_WIDTH),
+                       crop_height=int(tcr.CROP_HEIGHT))
     else:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, first_fps,
+                              (tcr.CROP_WIDTH, tcr.CROP_HEIGHT))
+        online_started_at = time.perf_counter()
         tcr._process_cameras(caps, CAMERAS, model, out, frame_map_path=frame_map_path)
+        _record_timing(timings, "Step1/online_tracking_write_tracked_video", online_started_at,
+                       output_path=output_path,
+                       crop_width=int(tcr.CROP_WIDTH),
+                       crop_height=int(tcr.CROP_HEIGHT))
     out.release()
 
     print(f"\nStep 1 完成，置中裁剪影片儲存至：{output_path}\n")
+    _record_timing(timings, "Step1/total_tracking", step_started_at,
+                   output_path=output_path)
     return output_path
 
 
 def step2_pose(tracked_video_path: str, output_base_dir: str,
-                only_2d: bool, gpu: str, motion_ag_dir: Path, skip_video: bool = False) -> str:
+                only_2d: bool, gpu: str, motion_ag_dir: Path, skip_video: bool = False,
+                timings: list | None = None) -> str:
     """
     Step 2：進行 2D/3D 姿態估計與關節角度分析。
     """
@@ -333,6 +428,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
     sys.argv = [sys.argv[0]]
     os.chdir(str(motion_ag_dir))
     try:
+        pose_started_at = time.perf_counter()
         run_pose_estimation(
             video_path=abs_video_path,
             output_dir=abs_output_dir,
@@ -341,6 +437,11 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
             bbox_csv=bbox_csv_path,
             skip_video=skip_video,
         )
+        _record_timing(timings, "Step2/pose_estimation_total", pose_started_at,
+                       video_path=abs_video_path,
+                       output_dir=abs_output_dir,
+                       only_2d=bool(only_2d),
+                       skip_video=bool(skip_video))
     finally:
         os.chdir(_saved_cwd)
         sys.argv = _saved_argv
@@ -413,7 +514,7 @@ def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None
 
 def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
                  gpu: str = "0", only_2d: bool = False, skip_track: bool = False,
-                 skip_video: bool = False) -> dict:
+                 skip_video: bool = False, timings: list | None = None) -> dict:
     """
     生物力學與骨架分析完整排程。
     """
@@ -426,7 +527,7 @@ def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
 
     # Step 1: YOLO 多相機追蹤置中裁剪
     if not skip_track:
-        tracked_video = step1_track(cameras, extra_cfg, gpu, output_dir)
+        tracked_video = step1_track(cameras, extra_cfg, gpu, output_dir, timings=timings)
     else:
         print("略過 Step 1，讀取上一次的輸出結果...")
         marker_path = os.path.join(output_dir, ".last_output_name")
@@ -450,7 +551,8 @@ def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
         json.dump(config_dict, f, ensure_ascii=False, indent=2)
 
     # Step 2: 2D/3D 姿態估計
-    pose_dir = step2_pose(tracked_video, output_dir, only_2d, gpu, motion_ag_dir, skip_video=skip_video)
+    pose_dir = step2_pose(tracked_video, output_dir, only_2d, gpu, motion_ag_dir,
+                          skip_video=skip_video, timings=timings)
 
     # Step 3: 折線圖圖表合併
     overlay_video = None
@@ -469,6 +571,17 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     """
     一鍵啟動分析管線：運動表現 (Phase 1) -> 生物力學 (Phase 2) -> 原始影片疊加 (Phase 3) -> 網頁格式轉檔。
     """
+    timings = []
+    analysis_started_at = time.perf_counter()
+    timing_report_path = None
+
+    if (
+        "auto_crop" not in config_dict
+        and "crop_width" not in config_dict
+        and "crop_height" not in config_dict
+    ):
+        config_dict["auto_crop"] = True
+
     cameras = config_dict.get("cameras", [])
     tracking_cameras = []
     for cam in cameras:
@@ -511,6 +624,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         only_2d=only_2d,
         skip_track=skip_track,
         skip_video=True,  # 中間裁剪骨架影片僅用於姿態估計，不輸出
+        timings=timings,
     )
 
     if progress_callback: progress_callback(70)
@@ -522,6 +636,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     # 速度分析：從骨架追蹤產出的 bbox_map.csv 直接計算，無需重跑 YOLO
     tracked_video = result.get('tracked_video')
     if not skip_track and tracked_video:
+        speed_started_at = time.perf_counter()
         video_stem_for_bbox = Path(tracked_video).stem
         bbox_map_path = os.path.join(output_dest, f"{video_stem_for_bbox}_bbox_map.csv")
         # offsets.npz is named after the first camera's video, not the tracked output
@@ -560,6 +675,9 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 print(f"  ▶ 速度計算失敗: {_e}")
         else:
             print(f"  ▶ bbox_map.csv 不存在，速度分析略過: {bbox_map_path}")
+        _record_timing(timings, "Analysis/speed_metrics_from_bbox_map", speed_started_at,
+                       bbox_map_path=bbox_map_path,
+                       metrics_csv=metrics_csv_dest)
     else:
         print("  使用者指定 skip_track，略過速度分析。")
 
@@ -626,24 +744,38 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
             print("【階段三/四a】並行：骨架影片疊加 + 步頻分析")
             print("=" * 60)
             try:
-                with ThreadPoolExecutor(max_workers=2) as _pool:
-                    _fut_overlay = _pool.submit(
-                        overlay_videos,
+                parallel_started_at = time.perf_counter()
+
+                def _run_overlay_with_timing():
+                    overlay_started_at = time.perf_counter()
+                    overlay_videos(
                         cameras=cameras,
                         offsets_npz=offsets_npz,
                         kps_npz=kps_npz,
                         output_video=output_uncropped,
                         config=config_dict,
                     )
-                    _fut_step = _pool.submit(
-                        run_step_stride_analysis,
+                    _record_timing(timings, "Analysis/overlay_original_video", overlay_started_at,
+                                   output_video=output_uncropped)
+
+                def _run_step_stride_with_timing():
+                    step_started_at = time.perf_counter()
+                    step_result = run_step_stride_analysis(
                         config=config_dict,
                         output_dir=output_dest,
                         make_video=False,
                     )
+                    _record_timing(timings, "Analysis/step_stride_analysis", step_started_at,
+                                   detected_steps=step_result.get("detected_steps"))
+                    return step_result
+
+                with ThreadPoolExecutor(max_workers=2) as _pool:
+                    _fut_overlay = _pool.submit(_run_overlay_with_timing)
+                    _fut_step = _pool.submit(_run_step_stride_with_timing)
 
                 _fut_overlay.result()
                 step_analysis = _fut_step.result()
+                _record_timing(timings, "Analysis/overlay_and_step_parallel_block", parallel_started_at)
                 avg_step_length = step_analysis.get("avg_step_length_m")
                 print(f"  ▶ 腳踝位置資料 (CSV): {step_analysis['ankle_csv']}")
                 print(f"  ▶ 步伐事件資料 (CSV): {step_analysis['steps_csv']}")
@@ -658,6 +790,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 print("【階段四b】步伐標注影片合成")
                 print("=" * 60)
                 tmp_uncropped = output_uncropped.replace(".mp4", "_tmp_steps.mp4")
+                annotate_started_at = time.perf_counter()
                 annotate_step_stride_video(
                     input_video=output_uncropped,
                     output_video=tmp_uncropped,
@@ -666,20 +799,31 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     avg_cadence_spm=step_analysis.get("avg_cadence_spm"),
                 )
                 os.replace(tmp_uncropped, output_uncropped)
+                _record_timing(timings, "Analysis/annotate_step_stride_video", annotate_started_at,
+                               output_video=output_uncropped)
 
                 # 轉碼為 H.264 Web 相容格式
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
+                transcode_started_at = time.perf_counter()
                 convert_to_web_compatible_mp4(output_uncropped)
+                _record_timing(timings, "Analysis/transcode_web_compatible_mp4", transcode_started_at,
+                               output_video=output_uncropped)
                 print(f"  ▶ [Core.Pipeline] 網頁串流格式轉檔成功: {output_uncropped}")
+                angle_time_started_at = time.perf_counter()
                 _add_time_to_angles_csv(angle_csv_dest, video_path=output_uncropped)
-                output_final_frames_dir = _export_video_frames(
-                    output_uncropped,
-                    output_dest if output_dest else os.path.dirname(output_uncropped),
-                )
+                _record_timing(timings, "Analysis/update_angles_time_columns", angle_time_started_at,
+                               angles_csv=angle_csv_dest)
+                # Flutter front-end only reads output_final.mp4. Exporting every frame
+                # to PNG is expensive and not needed for the current app flow.
+                print("  ▶ 略過最終影片逐幀 PNG 輸出（前端未使用）")
+                output_final_frames_dir = None
+                archive_started_at = time.perf_counter()
                 archived_output_final = _copy_output_final_to_keypoints_archive(
                     final_pose_dir,
                     output_uncropped,
                 )
+                _record_timing(timings, "Analysis/archive_output_final_video", archive_started_at,
+                               archived_video=str(archived_output_final) if archived_output_final else None)
                 if archived_output_final:
                     print(f"  ▶ 已複製 Web 相容影片到 keypoints archive: {archived_output_final}")
 
@@ -748,11 +892,16 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     if avg_acceleration is None:
         avg_acceleration = 0.0
 
+    _record_timing(timings, "Total/run_analysis", analysis_started_at,
+                   output_dest=output_dest)
+    timing_report_path = _write_timing_report(timings, output_dest)
+
     return {
         "metrics_csv": metrics_csv_dest,
         "angles_csv": angle_csv_dest,
         "uncropped_video": output_uncropped,
         "output_final_frames_dir": output_final_frames_dir,
+        "timing_report": timing_report_path,
         "step_analysis": step_analysis,
         "total_time": total_time,
         "avg_velocity": avg_velocity,

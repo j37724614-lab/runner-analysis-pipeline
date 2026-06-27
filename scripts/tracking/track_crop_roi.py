@@ -76,9 +76,10 @@ FONT_PATH = str(BASE_DIR / "MotionAGFormer" / "ChineseFont.ttf")
 # 輸出目錄（檔名依第一台有效相機自動命名：{輸入檔名}_tracked.mp4）
 OUTPUT_DIR = str(BASE_DIR / "output_cut")
 
-# 固定裁剪尺寸（以最快人物中心為基準）
+# fallback 裁剪尺寸（以最快人物中心為基準）
+# 一般分析流程應使用 auto_crop，避免不同解析度或人物大小都被限制在固定尺寸。
 # 建議值：先執行一次看底部「建議 CROP_WIDTH/CROP_HEIGHT」的統計輸出再調整
-# 或在 config 加入 auto_crop: true，讓程式自動以中位數 × 2 決定尺寸
+# 或在 config 加入 auto_crop: true，讓程式依 bbox 統計自動決定正方形尺寸
 CROP_WIDTH  = 200
 CROP_HEIGHT = 260
 AUTO_CROP   = False  # True → 先 dry-run 收集 bbox 統計，自動設定裁剪尺寸
@@ -1179,9 +1180,12 @@ def main():
         # dry-run 已讀完所有影片，重新開啟
         caps = [cv2.VideoCapture(cam['video_path']) for cam in CAMERAS]
         if dry_bw and dry_bh:
-            CROP_WIDTH  = int(np.median(dry_bw)) * 2
-            CROP_HEIGHT = int(np.median(dry_bh)) * 2
-            print(f"  自動設定裁剪尺寸: {CROP_WIDTH} x {CROP_HEIGHT}（中位數 × 2）\n")
+            p90_side = max(np.percentile(dry_bw, 90), np.percentile(dry_bh, 90)) * 1.25
+            max_side = max(max(dry_bw), max(dry_bh)) * 1.05
+            crop_side = int(np.ceil(max(p90_side, max_side)))
+            CROP_WIDTH = crop_side
+            CROP_HEIGHT = crop_side
+            print(f"  自動設定裁剪尺寸: {CROP_WIDTH} x {CROP_HEIGHT}（auto square）\n")
         else:
             print("  警告：未收集到 bbox 資料，沿用預設尺寸\n")
 
@@ -1213,9 +1217,13 @@ def main():
     print(f"  平均寬/高: {avg_w} / {avg_h} px")
     print(f"  中位數寬/高: {med_w} / {med_h} px")
     if AUTO_CROP:
-        print(f"  裁剪尺寸已自動套用（中位數 × 2）")
+        print(f"  裁剪尺寸已自動套用（auto square）")
     else:
-        print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {med_w*2} / {med_h*2}  (中位數 × 2)")
+        if all_bbox_widths and all_bbox_heights:
+            p90_side = max(np.percentile(all_bbox_widths, 90), np.percentile(all_bbox_heights, 90)) * 1.25
+            max_side = max(max(all_bbox_widths), max(all_bbox_heights)) * 1.05
+            suggested_side = int(np.ceil(max(p90_side, max_side)))
+            print(f"  建議 CROP_WIDTH / CROP_HEIGHT: {suggested_side} / {suggested_side}  (auto square)")
         print(f"  （提示：config 加入 auto_crop: true 可下次自動套用）")
 
 

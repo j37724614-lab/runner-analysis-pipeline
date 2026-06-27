@@ -5,6 +5,8 @@
 *.onnx
 *.weights
 *.pkl
+*.engine
+!models/yolo26x_ultralytics_int8.engine
 
 # ===== 影片 / 圖片 =====
 *.mp4
@@ -20,12 +22,25 @@ __pycache__/
 .ipynb_checkpoints/
 
 # ===== 輸出目錄 =====
+outputs/
+runtime_state/
 output/
+output_*/
 output_cut/*
 !output_cut/.gitkeep
+core_tracking_debug*/
+sequential_tracked/
+video/
+runs/
+keypoints_raw_archive/
 demo/output/
 demo/video/*
 !demo/video/.gitkeep
+MotionAGFormer/demo/video/*
+!MotionAGFormer/demo/video/.gitkeep
+
+# ===== 本機參考資料 / 大型實驗資料 =====
+docs/references/
 
 # ===== 虛擬環境 =====
 .venv/

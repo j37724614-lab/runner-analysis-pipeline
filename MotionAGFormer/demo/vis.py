@@ -22,6 +22,7 @@ import argparse
 import json
 from pathlib import Path
 import os
+import time
 from datetime import datetime
 
 # vis.py 位於 MotionAGFormer/demo/vis.py
@@ -119,8 +120,8 @@ _SG_WINDOW_BY_JOINT = np.array([
     11, 7, 3,  # 1  RHip, RKnee, RAnkle
     11, 7, 3,  # 4  LHip, LKnee, LAnkle
     15, 15, 15, 15,  # 7  Spine, Thorax, Neck_Nose, Head
-    11, 9, 7,  # 11 LShoulder, LElbow, LWrist
-    11, 9, 7,  # 14 RShoulder, RElbow, RWrist
+    13, 15, 13,  # 11 LShoulder, LElbow, LWrist
+    13, 15, 13,  # 14 RShoulder, RElbow, RWrist
 ], dtype=np.int32)
 
 # H36M kinematic tree root-to-leaf (parent, child) — for bone-length normalization.
@@ -521,6 +522,89 @@ def _smooth_keypoints_ema(keypoints, scores, alpha=0.45, conf_threshold=0.35,
     return (smoothed, debug_rows) if return_debug else smoothed
 
 
+
+def _correct_arm_swaps(kp, lookback=7, threshold=0.75):
+    """
+    Detect frames where HRNet swapped anatomical L/R arm labels and correct them.
+
+    For each frame, compare current arm vectors (shoulder→elbow/wrist) against a
+    causal reference built from the last `lookback` already-corrected frames.
+    If swapping labels reduces the mismatch by more than (1-threshold), apply the swap.
+
+    This preserves actual detected motion — only the label assignment is fixed,
+    so the skeleton follows real movement without any interpolation lag.
+
+    threshold=0.75 means: swap only when swap_cost < 75% of no_swap_cost.
+    """
+    L_SH, L_EL, L_WR = 11, 12, 13
+    R_SH, R_EL, R_WR = 14, 15, 16
+
+    T = kp.shape[0]
+    result = kp.copy()
+
+    for t in range(lookback, T):
+        ref = result[t - lookback : t]   # corrected recent history
+
+        l_el_ref = np.median(ref[:, L_EL] - ref[:, L_SH], axis=0)
+        l_wr_ref = np.median(ref[:, L_WR] - ref[:, L_SH], axis=0)
+        r_el_ref = np.median(ref[:, R_EL] - ref[:, R_SH], axis=0)
+        r_wr_ref = np.median(ref[:, R_WR] - ref[:, R_SH], axis=0)
+
+        l_el = kp[t, L_EL] - kp[t, L_SH]
+        l_wr = kp[t, L_WR] - kp[t, L_SH]
+        r_el = kp[t, R_EL] - kp[t, R_SH]
+        r_wr = kp[t, R_WR] - kp[t, R_SH]
+
+        cost_no_swap = (np.linalg.norm(l_el - l_el_ref) + np.linalg.norm(l_wr - l_wr_ref) +
+                        np.linalg.norm(r_el - r_el_ref) + np.linalg.norm(r_wr - r_wr_ref))
+        cost_swap    = (np.linalg.norm(r_el - l_el_ref) + np.linalg.norm(r_wr - l_wr_ref) +
+                        np.linalg.norm(l_el - r_el_ref) + np.linalg.norm(l_wr - r_wr_ref))
+
+        if cost_swap < cost_no_swap * threshold:
+            result[t, L_SH] = kp[t, R_SH]
+            result[t, L_EL] = kp[t, R_EL]
+            result[t, L_WR] = kp[t, R_WR]
+            result[t, R_SH] = kp[t, L_SH]
+            result[t, R_EL] = kp[t, L_EL]
+            result[t, R_WR] = kp[t, L_WR]
+
+    return result
+
+
+def _fill_left_arm_by_mirror(kp, final_bad_all):
+    """
+    For bad left-arm frames, estimate position from mirrored right arm.
+
+    In side-view running, arm swing is anti-phase: the LShoulder→LElbow vector
+    is the horizontal mirror of RShoulder→RElbow (flip x, keep y).
+    Only fills when LShoulder, RShoulder, and the right counterpart are all good.
+
+    Modifies kp in-place; clears bad flag for filled frames.
+    Returns (kp, final_bad_all, mirror_filled) where mirror_filled is (T, J) bool.
+    """
+    ARM_PAIRS = [(12, 15), (13, 16)]  # (LElbow, RElbow), (LWrist, RWrist)
+    L_SHOULDER, R_SHOULDER = 11, 14
+
+    T, J = final_bad_all.shape
+    mirror_filled = np.zeros((T, J), dtype=bool)
+
+    for l_jnt, r_jnt in ARM_PAIRS:
+        for t in np.where(final_bad_all[:, l_jnt])[0]:
+            if (final_bad_all[t, r_jnt] or
+                    final_bad_all[t, L_SHOULDER] or
+                    final_bad_all[t, R_SHOULDER]):
+                continue
+            ls = kp[t, L_SHOULDER]
+            rs = kp[t, R_SHOULDER]
+            rv = kp[t, r_jnt] - rs       # right arm vector
+            kp[t, l_jnt, 0] = ls[0] - rv[0]  # flip x (anti-phase)
+            kp[t, l_jnt, 1] = ls[1] + rv[1]  # keep y
+            final_bad_all[t, l_jnt] = False
+            mirror_filled[t, l_jnt] = True
+
+    return kp, final_bad_all, mirror_filled
+
+
 def _smooth_keypoints_sg(keypoints, scores,
                           conf_threshold=0.50,
                           sg_window=7,
@@ -552,6 +636,7 @@ def _smooth_keypoints_sg(keypoints, scores,
     debug_rows = []
 
     for person_idx in range(M):
+        smoothed[person_idx] = _correct_arm_swaps(smoothed[person_idx])
         kp = smoothed[person_idx]   # (T, J, 2)
         sc = scores[person_idx]     # (T, J)
 
@@ -594,6 +679,9 @@ def _smooth_keypoints_sg(keypoints, scores,
         frame_bad_count = np.sum(point_bad_all, axis=1)
         frame_bad = frame_bad_count >= int(frame_bad_joint_threshold)
 
+        final_bad_all = low_conf_all | bilateral_all | frame_bad[:, None]
+        kp, final_bad_all, mirror_filled_all = _fill_left_arm_by_mirror(kp, final_bad_all)
+
         for joint_idx in range(J):
             traj_x = kp[:, joint_idx, 0].copy()
             traj_y = kp[:, joint_idx, 1].copy()
@@ -603,7 +691,7 @@ def _smooth_keypoints_sg(keypoints, scores,
             bad_mask = low_conf_all[:, joint_idx]
             bilateral = bilateral_all[:, joint_idx]
             thresh = thresh_all[:, joint_idx]
-            final_bad = bad_mask | bilateral | frame_bad
+            final_bad = final_bad_all[:, joint_idx]
 
             # Phase 4: interpolate over bad spans
             good_idx = np.where(~final_bad)[0]
@@ -640,10 +728,12 @@ def _smooth_keypoints_sg(keypoints, scores,
             smoothed[person_idx, :, joint_idx, 1] = traj_y_smooth
 
             if return_debug:
+                mirror_filled = mirror_filled_all[:, joint_idx]
                 update_types = np.where(
-                    frame_bad, 'frame_bad',
-                    np.where(bad_mask, 'low_conf',
-                             np.where(bilateral, 'bilateral_outlier', 'good'))
+                    mirror_filled, 'mirror_arm',
+                    np.where(frame_bad, 'frame_bad',
+                             np.where(bad_mask, 'low_conf',
+                                      np.where(bilateral, 'bilateral_outlier', 'good')))
                 )
                 jumps = jumps_all[:, joint_idx]
                 for t in range(T):
@@ -1365,18 +1455,36 @@ def run_pose_estimation(video_path: str, output_dir: str,
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     os.makedirs(output_dir, exist_ok=True)
 
+    pose_timings = []
+
+    def _record_pose_timing(stage, started_at):
+        elapsed = time.perf_counter() - started_at
+        pose_timings.append({"stage": stage, "elapsed_sec": round(elapsed, 4)})
+        print(f"  ⏱ [TIME] {stage}: {elapsed:.2f}s")
+        return elapsed
+
+    pose_total_started_at = time.perf_counter()
+    pose2d_started_at = time.perf_counter()
     get_pose2D(video_path, output_dir, bbox_csv=bbox_csv)
+    _record_pose_timing("Step2/hrnet_2d_pose", pose2d_started_at)
     if not only_2d:
+        pose3d_started_at = time.perf_counter()
         get_pose3D(video_path, output_dir, skip_video=skip_video)
+        _record_pose_timing("Step2/motionagformer_3d_and_angles", pose3d_started_at)
 
     if not skip_video:
+        video_started_at = time.perf_counter()
         img2video(video_path, output_dir)
         _export_final_video_frames(video_path, output_dir)
         archived_final_videos = _copy_final_videos_to_keypoints_archive(video_path, output_dir)
         for archived_video in archived_final_videos:
             print(f'Final pose video archived to {archived_video}')
         print('Generating demo successful!')
+        _record_pose_timing("Step2/pose_video_render_and_archive", video_started_at)
 
+    _record_pose_timing("Step2/vis_run_pose_estimation_total", pose_total_started_at)
+    with open(os.path.join(output_dir, "pose_timing_report.json"), "w", encoding="utf-8") as f:
+        json.dump({"timings": pose_timings}, f, ensure_ascii=False, indent=2)
     return output_dir
 
 
