@@ -104,6 +104,25 @@ _JOINT_MAX_PX = np.array([
     15.14, 35.21, 50.69,          # RShoulder, RElbow, RWrist
 ], dtype=np.float32)
 
+# Lower/upper guards for per-video parent-relative vector thresholds. These keep
+# short or noisy clips from producing thresholds that are either unusably strict
+# or so loose that real keypoint jumps pass through.
+_VIDEO_VECTOR_THRESHOLD_FLOOR = np.array([
+    6.0, 6.0, 8.0, 12.0,    # Hip, RHip, RKnee, RAnkle
+    6.0, 8.0, 12.0,         # LHip, LKnee, LAnkle
+    6.0, 6.0, 6.0, 6.0,     # Spine, Thorax, Neck_Nose, Head
+    6.0, 8.0, 10.0,         # LShoulder, LElbow, LWrist
+    6.0, 8.0, 10.0,         # RShoulder, RElbow, RWrist
+], dtype=np.float32)
+
+_VIDEO_VECTOR_THRESHOLD_CEIL = np.array([
+    30.0, 35.0, 35.0, 70.0,  # Hip, RHip, RKnee, RAnkle
+    35.0, 35.0, 70.0,        # LHip, LKnee, LAnkle
+    35.0, 35.0, 35.0, 35.0,  # Spine, Thorax, Neck_Nose, Head
+    40.0, 60.0, 80.0,        # LShoulder, LElbow, LWrist
+    40.0, 60.0, 80.0,        # RShoulder, RElbow, RWrist
+], dtype=np.float32)
+
 # Per-joint p99 displacement (px) — kept as a looser reference threshold.
 _JOINT_HARD_PX = np.array([
     16.75, 17.47, 55.29, 80.52,  # Hip, RHip, RKnee, RAnkle
@@ -123,6 +142,59 @@ _SG_WINDOW_BY_JOINT = np.array([
     13, 15, 13,  # 11 LShoulder, LElbow, LWrist
     13, 15, 13,  # 14 RShoulder, RElbow, RWrist
 ], dtype=np.int32)
+
+# Leg joints -> parent joint, in root-to-leaf order. A low-confidence knee/ankle
+# gets its hip->knee / knee->ankle vector interpolated (not its raw x,y) so the
+# limb keeps a plausible swing angle instead of a straight-line cut between the
+# two nearest good frames.
+_LEG_PARENT = {2: 1, 3: 2, 5: 4, 6: 5}  # RKnee<-RHip, RAnkle<-RKnee, LKnee<-LHip, LAnkle<-LKnee
+
+
+def _detect_ankle_crossing(kp, crossing_dist=12.0):
+    """Flag frames where the two ankles sit within `crossing_dist` px of each other.
+
+    At this range HRNet can confidently place one ankle at (or near) the other
+    ankle's true position -- confidence alone won't catch it (see
+    leg_swap_correction.md A-3). Several per-frame "is this vector plausible"
+    checks were tried (linear bracket interpolation, detour-ratio, per-joint
+    swap-cost) and none reliably separated real crossing-error frames from
+    genuinely fast/curved motion at touchdown -- confirmed cases and false
+    positives had overlapping score ranges under every formula tried. Treating
+    proximity alone as the trigger, with no further per-frame judgment, sidesteps
+    that unreliable classification problem entirely.
+    """
+    L_ANKLE, R_ANKLE = 6, 3
+    dist = np.hypot(kp[:, L_ANKLE, 0] - kp[:, R_ANKLE, 0], kp[:, L_ANKLE, 1] - kp[:, R_ANKLE, 1])
+    return dist < crossing_dist
+
+
+def _prefill_ankle_crossing(kp, crossing_dist=12.0):
+    """Bridge both ankles' positions across ankle-crossing frames before this data
+    feeds swap-cost or peak-detection math (see _detect_ankle_crossing).
+
+    Uses each ankle's own knee-relative vector (nearest good frame before/after),
+    consistent with how Phase 4 fills leg joints -- straight-line-cutting the raw
+    x,y would ignore that the knee may be swinging through an arc during the span.
+    """
+    L_KNEE, L_ANKLE = 5, 6
+    R_KNEE, R_ANKLE = 2, 3
+    T = kp.shape[0]
+    bad = _detect_ankle_crossing(kp, crossing_dist)
+    if not bad.any():
+        return kp
+    filled = kp.copy()
+    all_idx = np.arange(T)
+    good = np.where(~bad)[0]
+    if len(good) == 0 or len(good) == T:
+        return kp
+    for ankle_idx, knee_idx in [(L_ANKLE, L_KNEE), (R_ANKLE, R_KNEE)]:
+        rel_x = kp[:, ankle_idx, 0] - kp[:, knee_idx, 0]
+        rel_y = kp[:, ankle_idx, 1] - kp[:, knee_idx, 1]
+        rel_x_fixed = np.interp(all_idx, good, rel_x[good])
+        rel_y_fixed = np.interp(all_idx, good, rel_y[good])
+        filled[:, ankle_idx, 0] = rel_x_fixed + kp[:, knee_idx, 0]
+        filled[:, ankle_idx, 1] = rel_y_fixed + kp[:, knee_idx, 1]
+    return filled
 
 # H36M kinematic tree root-to-leaf (parent, child) — for bone-length normalization.
 _BONES_H36M = [
@@ -571,6 +643,79 @@ def _correct_arm_swaps(kp, lookback=7, threshold=0.75):
     return result
 
 
+def _correct_leg_swaps(kp, lookback=7, threshold=0.75, crossing_dist=12.0):
+    """
+    Detect frames where HRNet swapped anatomical L/R leg labels and correct them.
+
+    Compare current leg vectors (hip->knee/ankle) against a causal reference built
+    from the last `lookback` already-corrected frames. If that comparison is too
+    marginal to clear `threshold`, also check against a forward reference built
+    from the next `lookback` raw (not-yet-corrected) frames — an isolated single-frame
+    swap looks ambiguous against its own (still-uncorrected) history, but the clean
+    frames right after it usually give a much sharper signal.
+
+    The forward check is skipped when the two ankles are already within
+    `crossing_dist` px of each other (mid-stride leg crossing): at that instant
+    both hypotheses are inherently near-degenerate, so a forward-window "signal"
+    is more likely geometry noise than a real HRNet mislabel, and trusting it
+    injects a bad single-frame swap that then drags the downstream SG-smoothing
+    window for several neighboring frames.
+
+    This preserves actual detected motion — only the label assignment is fixed,
+    so the skeleton follows real movement without any interpolation lag.
+
+    threshold=0.75 means: swap only when swap_cost < 75% of no_swap_cost (backward
+    or forward).
+    """
+    L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
+    R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
+
+    T = kp.shape[0]
+    result = kp.copy()
+
+    def swap_cost(ref, l_knee, l_ankle, r_knee, r_ankle):
+        l_knee_ref = np.median(ref[:, L_KNEE] - ref[:, L_HIP], axis=0)
+        l_ankle_ref = np.median(ref[:, L_ANKLE] - ref[:, L_HIP], axis=0)
+        r_knee_ref = np.median(ref[:, R_KNEE] - ref[:, R_HIP], axis=0)
+        r_ankle_ref = np.median(ref[:, R_ANKLE] - ref[:, R_HIP], axis=0)
+
+        cost_no_swap = (np.linalg.norm(l_knee - l_knee_ref) + np.linalg.norm(l_ankle - l_ankle_ref) +
+                        np.linalg.norm(r_knee - r_knee_ref) + np.linalg.norm(r_ankle - r_ankle_ref))
+        cost_swap    = (np.linalg.norm(r_knee - l_knee_ref) + np.linalg.norm(r_ankle - l_ankle_ref) +
+                        np.linalg.norm(l_knee - r_knee_ref) + np.linalg.norm(l_ankle - r_ankle_ref))
+        return cost_no_swap, cost_swap
+
+    for t in range(1, T):
+        l_knee = kp[t, L_KNEE] - kp[t, L_HIP]
+        l_ankle = kp[t, L_ANKLE] - kp[t, L_HIP]
+        r_knee = kp[t, R_KNEE] - kp[t, R_HIP]
+        r_ankle = kp[t, R_ANKLE] - kp[t, R_HIP]
+
+        back_ref = result[max(0, t - lookback) : t]   # corrected recent history (whatever is available)
+        cost_no_swap, cost_swap = swap_cost(back_ref, l_knee, l_ankle, r_knee, r_ankle)
+        do_swap = cost_swap < cost_no_swap * threshold
+
+        # Only consult the forward window when backward itself is marginal (swap at least
+        # tentatively competitive, cost_swap < cost_no_swap). If backward already has a
+        # confident no-swap verdict, trust it — the forward window is raw/uncorrected and
+        # can be mid-motion, so it must not be allowed to overrule a confident backward read.
+        ankles_crossing = np.linalg.norm(kp[t, L_ANKLE] - kp[t, R_ANKLE]) < crossing_dist
+        if not do_swap and cost_swap < cost_no_swap and not ankles_crossing and t + 1 < T:
+            fwd_ref = kp[t + 1 : t + 1 + lookback]   # raw upcoming frames (whatever is available)
+            cost_no_swap_f, cost_swap_f = swap_cost(fwd_ref, l_knee, l_ankle, r_knee, r_ankle)
+            do_swap = cost_swap_f < cost_no_swap_f * threshold
+
+        if do_swap:
+            result[t, L_HIP] = kp[t, R_HIP]
+            result[t, L_KNEE] = kp[t, R_KNEE]
+            result[t, L_ANKLE] = kp[t, R_ANKLE]
+            result[t, R_HIP] = kp[t, L_HIP]
+            result[t, R_KNEE] = kp[t, L_KNEE]
+            result[t, R_ANKLE] = kp[t, L_ANKLE]
+
+    return result
+
+
 def _fill_left_arm_by_mirror(kp, final_bad_all):
     """
     For bad left-arm frames, estimate position from mirrored right arm.
@@ -605,14 +750,168 @@ def _fill_left_arm_by_mirror(kp, final_bad_all):
     return kp, final_bad_all, mirror_filled
 
 
+def _bidirectional_fill_bad_spans(traj_x, traj_y, final_bad, good_idx):
+    """Fill bad frames by interpolating between the nearest good frame before and
+    after each bad span.
+
+    This used to be a pure past-only extrapolation (fit a line through the last
+    few good frames and project forward, never looking at a future good frame).
+    That design was specifically to protect touchdown peak-detection downstream:
+    testing at the time showed any future-frame dependency here could shift which
+    frame `find_peaks` picks as the anchor by exactly one frame, landing it on an
+    ambiguous leg-crossing frame and reintroducing incorrect L/R switches nearby.
+
+    That failure mode is now handled directly by `_detect_ankle_crossing()` /
+    `_prefill_ankle_crossing()` (see leg_swap_correction.md A-3), which bridges
+    ankle-crossing frames regardless of confidence before this function ever runs.
+    With that protection in place, the extra inaccuracy of pure extrapolation
+    (it can't see a swing reversal coming and overshoots until the next good
+    frame snaps it back) is no longer worth paying for -- interpolating between
+    both sides is a better fit to the true (curved, not linear) limb trajectory.
+    """
+    T = len(final_bad)
+    all_idx = np.arange(T)
+    fixed_x = np.interp(all_idx, good_idx, traj_x[good_idx])
+    fixed_y = np.interp(all_idx, good_idx, traj_y[good_idx])
+    return fixed_x, fixed_y
+
+
+def _soft_low_conf_fill_mask(kp, sc, conf_threshold=0.50,
+                             hard_conf_threshold=0.20,
+                             deviation_factor=2.0):
+    """Return low-confidence points that should actually be replaced.
+
+    A low HRNet confidence is not by itself proof that the coordinate is wrong.
+    For moderately low confidence points, keep the raw coordinate when its
+    parent-relative vector is still consistent with the nearest good frames.
+    """
+    T, J = sc.shape
+    fill_mask = sc < hard_conf_threshold
+    suspect = (sc < conf_threshold) & (sc >= hard_conf_threshold)
+    if not suspect.any():
+        return fill_mask
+
+    all_idx = np.arange(T)
+    for joint_idx in range(J):
+        suspect_idx = np.where(suspect[:, joint_idx])[0]
+        if suspect_idx.size == 0:
+            continue
+        if joint_idx in (1, 2, 3, 4, 5, 6):
+            # Moderate low-confidence leg points are identity-sensitive before
+            # anchor DP. A sudden L/R handoff can make the same physical leg look
+            # like a large vector jump under the current label, so do not turn
+            # that into a coordinate fill before the leg identity is resolved.
+            continue
+
+        parent_idx = _LEG_PARENT.get(joint_idx)
+        if parent_idx is not None:
+            good = (
+                (sc[:, joint_idx] >= conf_threshold) &
+                (sc[:, parent_idx] >= conf_threshold)
+            )
+            series = kp[:, joint_idx, :2] - kp[:, parent_idx, :2]
+        else:
+            good = sc[:, joint_idx] >= conf_threshold
+            series = kp[:, joint_idx, :2]
+
+        good_idx = np.flatnonzero(good)
+        if good_idx.size < 2:
+            fill_mask[suspect_idx, joint_idx] = True
+            continue
+
+        interp_x = np.interp(all_idx, good_idx, series[good_idx, 0])
+        interp_y = np.interp(all_idx, good_idx, series[good_idx, 1])
+        deviation = np.hypot(series[:, 0] - interp_x, series[:, 1] - interp_y)
+
+        base_threshold = (
+            float(_VIDEO_VECTOR_THRESHOLD_FLOOR[joint_idx])
+            if parent_idx is not None and joint_idx < len(_VIDEO_VECTOR_THRESHOLD_FLOOR)
+            else float(_JOINT_MAX_PX[joint_idx] if joint_idx < len(_JOINT_MAX_PX) else 45.0)
+        )
+        fill_mask[suspect_idx, joint_idx] = deviation[suspect_idx] > (base_threshold * deviation_factor)
+
+    return fill_mask
+
+
+def _prefill_low_confidence(kp, sc, conf_threshold):
+    """Linearly interpolate truly bad low-confidence frames over raw trajectories.
+
+    Per-channel only (no L/R identity involved yet) so it's safe to run before
+    _correct_arm_swaps/_correct_leg_swaps.
+    """
+    T, J = sc.shape
+    filled = kp.copy()
+    all_idx = np.arange(T)
+    fill_mask = _soft_low_conf_fill_mask(kp, sc, conf_threshold)
+    for j in range(J):
+        good = np.where(~fill_mask[:, j])[0]
+        if len(good) == 0 or len(good) == T:
+            continue
+        filled[:, j, 0] = np.interp(all_idx, good, kp[good, j, 0])
+        filled[:, j, 1] = np.interp(all_idx, good, kp[good, j, 1])
+    return filled
+
+
+def _compute_video_vector_thresholds(kp, sc, conf_threshold=0.50,
+                                     percentile=95.0,
+                                     crossing_dist=12.0,
+                                     min_samples=20):
+    """Estimate per-video thresholds for parent-relative leg-vector jumps.
+
+    The raw HRNet confidence is intentionally used here even if coordinates were
+    prefilled earlier. Low-confidence observations are excluded from the
+    statistics so the threshold describes normal visible motion, not detector
+    failure magnitude.
+    """
+    T, J = sc.shape
+    thresholds = _JOINT_MAX_PX[:J].astype(np.float32, copy=True)
+    sample_counts = np.zeros(J, dtype=np.int32)
+    threshold_source = np.array(['global_px'] * J, dtype=object)
+
+    if T < 2:
+        return thresholds, sample_counts, threshold_source
+
+    crossing = _detect_ankle_crossing(kp, crossing_dist)
+    usable_pair_base = (~crossing[1:]) & (~crossing[:-1])
+
+    for joint_idx, parent_idx in _LEG_PARENT.items():
+        if joint_idx >= J or parent_idx >= J:
+            continue
+
+        pair_good = (
+            usable_pair_base &
+            (sc[1:, joint_idx] >= conf_threshold) &
+            (sc[:-1, joint_idx] >= conf_threshold) &
+            (sc[1:, parent_idx] >= conf_threshold) &
+            (sc[:-1, parent_idx] >= conf_threshold)
+        )
+
+        rel = kp[:, joint_idx, :2] - kp[:, parent_idx, :2]
+        jumps = np.linalg.norm(rel[1:] - rel[:-1], axis=1)
+        values = jumps[pair_good & np.isfinite(jumps)]
+        sample_counts[joint_idx] = int(values.size)
+        if values.size < min_samples:
+            continue
+
+        video_threshold = float(np.percentile(values, percentile))
+        floor = float(_VIDEO_VECTOR_THRESHOLD_FLOOR[joint_idx])
+        ceil = float(_VIDEO_VECTOR_THRESHOLD_CEIL[joint_idx])
+        thresholds[joint_idx] = float(np.clip(video_threshold, floor, ceil))
+        threshold_source[joint_idx] = f'video_vector_p{int(percentile)}'
+
+    return thresholds, sample_counts, threshold_source
+
+
 def _smooth_keypoints_sg(keypoints, scores,
                           conf_threshold=0.50,
                           sg_window=7,
                           sg_polyorder=2,
-                          frame_bad_joint_threshold=8,
+                          frame_bad_joint_threshold=11,
                           bbox_heights=None,
                           bbox_ref_height=None,
-                          return_debug=False):
+                          skip_sg_joints=None,
+                          return_debug=False,
+                          return_status=False):
     """
     離線平滑：confidence 過濾 → 雙側孤立點偵測 → 線性插值 → Savitzky-Golay。
 
@@ -629,16 +928,55 @@ def _smooth_keypoints_sg(keypoints, scores,
     from scipy.signal import savgol_filter
 
     if keypoints.size == 0 or scores.size == 0:
+        if return_debug and return_status:
+            empty_status = {}
+            return keypoints, [], empty_status
         return (keypoints, []) if return_debug else keypoints
 
     smoothed = keypoints.astype(np.float32, copy=True)
     M, T, J = scores.shape
+    skip_sg_joints = set(skip_sg_joints or [])
     debug_rows = []
+    status = {
+        'raw_confidence': scores.astype(np.float32, copy=True),
+        'valid_mask': np.ones((M, T, J), dtype=bool),
+        'needs_fill_mask': np.zeros((M, T, J), dtype=bool),
+        'low_conf_mask': np.zeros((M, T, J), dtype=bool),
+        'bilateral_outlier_mask': np.zeros((M, T, J), dtype=bool),
+        'frame_bad_mask': np.zeros((M, T, J), dtype=bool),
+        'ankle_crossing_mask': np.zeros((M, T, J), dtype=bool),
+        'mirror_filled_mask': np.zeros((M, T, J), dtype=bool),
+        'thresholds': np.zeros((M, T, J), dtype=np.float32),
+        'jumps': np.zeros((M, T, J), dtype=np.float32),
+        'video_thresholds': np.zeros((M, J), dtype=np.float32),
+        'video_threshold_sample_counts': np.zeros((M, J), dtype=np.int32),
+        'threshold_source': np.empty((M, J), dtype=object),
+    }
 
     for person_idx in range(M):
+        # Arm/leg swap correction compares raw per-joint vectors against a recent
+        # history window -- a single low-confidence point feeding that comparison
+        # (e.g. an ankle mid-occlusion) can make "swap" look cheaper than it really
+        # is and flip a frame's L/R identity for no physical reason. Bridge each
+        # joint's own low-confidence spans first so the swap-cost math only ever
+        # sees trustworthy positions. Ankle crossing is repaired after B1, so the
+        # crossing-span interpolation uses labels that B1 has already made more
+        # temporally continuous.
+        smoothed[person_idx] = _prefill_low_confidence(smoothed[person_idx], scores[person_idx], conf_threshold)
         smoothed[person_idx] = _correct_arm_swaps(smoothed[person_idx])
+        smoothed[person_idx] = _correct_leg_swaps(smoothed[person_idx])
+        crossing_prefill = _detect_ankle_crossing(smoothed[person_idx])
+        smoothed[person_idx] = _prefill_ankle_crossing(smoothed[person_idx])
         kp = smoothed[person_idx]   # (T, J, 2)
         sc = scores[person_idx]     # (T, J)
+        video_thresholds, threshold_counts, threshold_source = _compute_video_vector_thresholds(
+            kp,
+            sc,
+            conf_threshold=conf_threshold,
+        )
+        status['video_thresholds'][person_idx] = video_thresholds
+        status['video_threshold_sample_counts'][person_idx] = threshold_counts
+        status['threshold_source'][person_idx] = threshold_source
 
         # Per-frame bbox scale (T,)
         if bbox_heights is not None and bbox_ref_height and bbox_ref_height > 0:
@@ -647,7 +985,8 @@ def _smooth_keypoints_sg(keypoints, scores,
         else:
             scale = np.ones(T, dtype=np.float32)
 
-        low_conf_all = sc < conf_threshold
+        raw_low_conf_all = sc < conf_threshold
+        low_conf_all = _soft_low_conf_fill_mask(kp, sc, conf_threshold)
         bilateral_all = np.zeros((T, J), dtype=bool)
         thresh_all = np.zeros((T, J), dtype=np.float32)
         jumps_all = np.zeros((T, J), dtype=np.float32)
@@ -656,17 +995,36 @@ def _smooth_keypoints_sg(keypoints, scores,
             traj_x = kp[:, joint_idx, 0]
             traj_y = kp[:, joint_idx, 1]
 
-            max_px = float(_JOINT_MAX_PX[joint_idx]) if joint_idx < len(_JOINT_MAX_PX) else 45.0
+            max_px = float(video_thresholds[joint_idx]) if joint_idx < len(video_thresholds) else 45.0
             thresh = max_px * scale
+
+            # Confidence-weighted threshold: a joint's jump-distance threshold has to
+            # stay loose in general (fast joints like ankles legitimately move a lot
+            # between frames), but when this frame's own detection confidence is
+            # below-normal (even if still above the hard low_conf cutoff), the model
+            # itself is less sure of this point -- so require less positional deviation
+            # to flag it as a suspicious jump. conf==1.0 keeps the full threshold;
+            # conf==conf_threshold shrinks it to half.
+            conf_factor = np.clip(sc[:, joint_idx], conf_threshold, 1.0)
+            conf_factor = 0.5 + 0.5 * (conf_factor - conf_threshold) / max(1e-6, 1.0 - conf_threshold)
+            thresh = thresh * conf_factor
             thresh_all[:, joint_idx] = thresh
 
-            x_prev = np.concatenate([[traj_x[0]], traj_x[:-1]])
-            x_next = np.concatenate([traj_x[1:], [traj_x[-1]]])
-            y_prev = np.concatenate([[traj_y[0]], traj_y[:-1]])
-            y_next = np.concatenate([traj_y[1:], [traj_y[-1]]])
+            parent_idx = _LEG_PARENT.get(joint_idx)
+            if parent_idx is not None:
+                base_x = traj_x - kp[:, parent_idx, 0]
+                base_y = traj_y - kp[:, parent_idx, 1]
+            else:
+                base_x = traj_x
+                base_y = traj_y
 
-            d_prev = np.hypot(traj_x - x_prev, traj_y - y_prev)
-            d_next = np.hypot(traj_x - x_next, traj_y - y_next)
+            x_prev = np.concatenate([[base_x[0]], base_x[:-1]])
+            x_next = np.concatenate([base_x[1:], [base_x[-1]]])
+            y_prev = np.concatenate([[base_y[0]], base_y[:-1]])
+            y_next = np.concatenate([base_y[1:], [base_y[-1]]])
+
+            d_prev = np.hypot(base_x - x_prev, base_y - y_prev)
+            d_next = np.hypot(base_x - x_next, base_y - y_next)
             d_span = np.hypot(x_next - x_prev, y_next - y_prev)
 
             bilateral = (d_prev > thresh) & (d_next > thresh) & (d_span < d_prev) & (d_span < d_next)
@@ -680,7 +1038,27 @@ def _smooth_keypoints_sg(keypoints, scores,
         frame_bad = frame_bad_count >= int(frame_bad_joint_threshold)
 
         final_bad_all = low_conf_all | bilateral_all | frame_bad[:, None]
+        crossing_bad = crossing_prefill | _detect_ankle_crossing(kp)
+        # Knee/ankle geometry can look like an outlier before DP simply because
+        # the left/right labels are temporarily wrong. Keep those masks for the
+        # post-DP pass, but do not replace knee/ankle coordinates here unless
+        # they are already hard low-conf/frame-bad. Ankle crossing is the exception:
+        # two ankles within the crossing distance is geometrically invalid, so it
+        # is repaired before DP and kept in the fill mask for diagnostics.
+        final_bad_all[:, 2] &= (low_conf_all[:, 2] | frame_bad)
+        final_bad_all[:, 3] &= (low_conf_all[:, 3] | frame_bad | crossing_bad)
+        final_bad_all[:, 5] &= (low_conf_all[:, 5] | frame_bad)
+        final_bad_all[:, 6] &= (low_conf_all[:, 6] | frame_bad | crossing_bad)
         kp, final_bad_all, mirror_filled_all = _fill_left_arm_by_mirror(kp, final_bad_all)
+        status['low_conf_mask'][person_idx] = raw_low_conf_all
+        status['bilateral_outlier_mask'][person_idx] = bilateral_all
+        status['frame_bad_mask'][person_idx] = frame_bad[:, None]
+        status['ankle_crossing_mask'][person_idx, :, 3] = crossing_bad
+        status['ankle_crossing_mask'][person_idx, :, 6] = crossing_bad
+        status['mirror_filled_mask'][person_idx] = mirror_filled_all
+        status['needs_fill_mask'][person_idx] = final_bad_all
+        status['thresholds'][person_idx] = thresh_all
+        status['jumps'][person_idx] = jumps_all
 
         for joint_idx in range(J):
             traj_x = kp[:, joint_idx, 0].copy()
@@ -696,28 +1074,56 @@ def _smooth_keypoints_sg(keypoints, scores,
             # Phase 4: interpolate over bad spans
             good_idx = np.where(~final_bad)[0]
             if len(good_idx) == 0:
+                status['valid_mask'][person_idx, :, joint_idx] = False
                 if return_debug:
                     for t in range(T):
                         jname = H36M_JOINT_NAMES[joint_idx] if joint_idx < len(H36M_JOINT_NAMES) else str(joint_idx)
-                        debug_rows.append({'person': person_idx, 'frame': t, 'joint': jname,
-                                           'confidence': float(conf[t]),
-                                           'raw_x': float(traj_x[t]), 'raw_y': float(traj_y[t]),
-                                           'smoothed_x': float(traj_x[t]), 'smoothed_y': float(traj_y[t]),
-                                           'jump': 0.0, 'threshold': float(thresh[t]),
-                                           'frame_bad_count': int(frame_bad_count[t]),
-                                           'update_type': 'all_bad'})
+                        debug_rows.append({
+                            'person': person_idx,
+                            'frame': t,
+                            'joint': jname,
+                            'confidence': float(conf[t]),
+                            'raw_x': float(traj_x[t]),
+                            'raw_y': float(traj_y[t]),
+                            'smoothed_x': float(traj_x[t]),
+                            'smoothed_y': float(traj_y[t]),
+                            'jump': 0.0,
+                            'threshold': float(thresh[t]),
+                            'threshold_source': str(threshold_source[joint_idx]),
+                            'video_threshold': float(video_thresholds[joint_idx]),
+                            'threshold_sample_count': int(threshold_counts[joint_idx]),
+                            'valid_after_fill': False,
+                            'frame_bad_count': int(frame_bad_count[t]),
+                            'update_type': 'all_bad',
+                        })
                 continue
 
-            all_idx      = np.arange(T)
-            traj_x_fixed = np.interp(all_idx, good_idx, traj_x[good_idx])
-            traj_y_fixed = np.interp(all_idx, good_idx, traj_y[good_idx])
+            parent_idx = _LEG_PARENT.get(joint_idx)
+            if parent_idx is not None:
+                # Extrapolate the parent->joint vector, not the raw x,y: a straight-line
+                # cut between two good frames ignores that the parent joint (already
+                # resolved above, since parents are earlier in joint_idx order) may
+                # itself be swinging through an arc during the bad span.
+                parent_x = kp[:, parent_idx, 0]
+                parent_y = kp[:, parent_idx, 1]
+                rel_x_fixed, rel_y_fixed = _bidirectional_fill_bad_spans(
+                    traj_x - parent_x, traj_y - parent_y, final_bad, good_idx)
+                traj_x_fixed = rel_x_fixed + parent_x
+                traj_y_fixed = rel_y_fixed + parent_y
+            else:
+                traj_x_fixed, traj_y_fixed = _bidirectional_fill_bad_spans(traj_x, traj_y, final_bad, good_idx)
 
-            # Phase 5: Savitzky-Golay smoothing
+            # Phase 5: Savitzky-Golay smoothing. Leg joints can be deferred until
+            # after anchor DP, otherwise a pre-DP L/R identity boundary can blend
+            # the two real legs into one smoothed trajectory.
             win = int(_SG_WINDOW_BY_JOINT[joint_idx]) if joint_idx < len(_SG_WINDOW_BY_JOINT) else sg_window
             win = min(win, T)
             if win % 2 == 0:
                 win -= 1
-            if win >= sg_polyorder + 2 and T >= win:
+            if joint_idx in skip_sg_joints:
+                traj_x_smooth = traj_x_fixed
+                traj_y_smooth = traj_y_fixed
+            elif win >= sg_polyorder + 2 and T >= win:
                 traj_x_smooth = savgol_filter(traj_x_fixed, win, sg_polyorder, mode='mirror')
                 traj_y_smooth = savgol_filter(traj_y_fixed, win, sg_polyorder, mode='mirror')
             else:
@@ -749,10 +1155,16 @@ def _smooth_keypoints_sg(keypoints, scores,
                         'smoothed_y':  float(traj_y_smooth[t]),
                         'jump':        float(jumps[t]),
                         'threshold':   float(thresh[t]),
+                        'threshold_source': str(threshold_source[joint_idx]),
+                        'video_threshold': float(video_thresholds[joint_idx]),
+                        'threshold_sample_count': int(threshold_counts[joint_idx]),
+                        'valid_after_fill': True,
                         'frame_bad_count': int(frame_bad_count[t]),
                         'update_type': str(update_types[t]),
                     })
 
+    if return_debug and return_status:
+        return smoothed, debug_rows, status
     return (smoothed, debug_rows) if return_debug else smoothed
 
 
@@ -778,7 +1190,7 @@ def _save_hrnet_confidence_csv(scores, valid_frames, output_csv):
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
-def _normalize_bone_lengths_2d(keypoints, blend=0.8):
+def _normalize_bone_lengths_2d(keypoints, blend=0.8, bones=None):
     """Soft-constrain each bone to its per-video median length (root-to-leaf).
     Only adjusts frames deviating >10%. blend=0.8 means 80% pull toward target.
     """
@@ -786,7 +1198,7 @@ def _normalize_bone_lengths_2d(keypoints, blend=0.8):
     result = keypoints.copy()
     for person_idx in range(M):
         kp = result[person_idx]
-        for parent_idx, child_idx in _BONES_H36M:
+        for parent_idx, child_idx in (bones or _BONES_H36M):
             diff = kp[:, child_idx, :2] - kp[:, parent_idx, :2]
             lengths = np.linalg.norm(diff, axis=1)
             valid = lengths > 1.0
@@ -804,7 +1216,7 @@ def _normalize_bone_lengths_2d(keypoints, blend=0.8):
     return result
 
 
-def _apply_anatomical_limits_2d(keypoints):
+def _apply_anatomical_limits_2d(keypoints, limits=None):
     """Prevent impossible 2D joint angles (below anatomical minimum).
     Rotates the distal joint around the joint centre to enforce the minimum angle.
     """
@@ -812,7 +1224,7 @@ def _apply_anatomical_limits_2d(keypoints):
     result = keypoints.copy()
     for person_idx in range(M):
         kp = result[person_idx]
-        for p_idx, j_idx, d_idx, min_deg in _JOINT_ANGLE_LIMITS_2D:
+        for p_idx, j_idx, d_idx, min_deg in (limits or _JOINT_ANGLE_LIMITS_2D):
             p = kp[:, p_idx, :2]
             j = kp[:, j_idx, :2]
             d = kp[:, d_idx, :2]
@@ -840,7 +1252,7 @@ def _apply_anatomical_limits_2d(keypoints):
     return result
 
 
-def show2Dpose(kps, img):
+def show2Dpose(kps, img, foot_kps=None, foot_scores=None):
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
                    [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
                    [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16]]
@@ -859,6 +1271,21 @@ def show2Dpose(kps, img):
         cv2.line(img, (start[0], start[1]), (end[0], end[1]), lcolor if LR[j] else rcolor, thickness)
         cv2.circle(img, (start[0], start[1]), thickness=-1, color=(0, 255, 0), radius=3)
         cv2.circle(img, (end[0], end[1]), thickness=-1, color=(0, 255, 0), radius=3)
+
+    # 腳部點（大腳趾/小腳趾/腳跟 x 左右）：foot_kps 順序為
+    # L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel，連到 H36M 腳踝（左6/右3）。
+    if foot_kps is not None:
+        FOOT_COLOR = (0, 255, 255)
+        RIGHT_ANKLE, LEFT_ANKLE = 3, 6
+        foot_to_ankle = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
+                          (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
+        for fi, ankle_idx in foot_to_ankle:
+            if foot_scores is not None and foot_scores[fi] < 0.3:
+                continue
+            fx, fy = int(foot_kps[fi, 0]), int(foot_kps[fi, 1])
+            ax, ay = int(kps[ankle_idx, 0]), int(kps[ankle_idx, 1])
+            cv2.line(img, (ax, ay), (fx, fy), FOOT_COLOR, 2)
+            cv2.circle(img, (fx, fy), 4, FOOT_COLOR, -1)
 
     return img
 
@@ -913,6 +1340,18 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         gen_output=True,
         bbox_csv=bbox_csv,
     )
+
+    # HRNet 現在輸出 17 個 COCO body 點 + 6 個 COCO-WholeBody 腳部點（大腳趾/小腳趾/腳跟 x 左右）。
+    # MotionAGFormer 3D 模型架構固定 17 關節，所以只有前 17 點會進入既有 pipeline；
+    # 腳部點另外存檔，不參與 H36M 轉換、平滑或 3D lifting。
+    foot_keypoints_raw = None
+    foot_scores_raw = None
+    if keypoints.shape[2] > 17:
+        foot_keypoints_raw = keypoints[:, :, 17:, :].copy()
+        foot_scores_raw = scores[:, :, 17:].copy()
+        keypoints = keypoints[:, :, :17, :]
+        scores = scores[:, :, :17]
+
     keypoints, scores, valid_frames = h36m_coco_format(keypoints, scores)
     raw_keypoints = keypoints.copy()
     raw_scores = scores.copy()
@@ -927,7 +1366,7 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         if bbox_ref_height:
             print(f'Adaptive bbox reference height: {bbox_ref_height:.1f}px')
 
-    keypoints, smoothing_debug_rows = _smooth_keypoints_sg(
+    keypoints, smoothing_debug_rows, keypoint_status = _smooth_keypoints_sg(
         keypoints,
         scores,
         conf_threshold=0.50,
@@ -935,11 +1374,21 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         sg_polyorder=2,
         bbox_heights=bbox_heights,
         bbox_ref_height=bbox_ref_height,
+        skip_sg_joints={1, 2, 3, 4, 5, 6},
         return_debug=True,
+        return_status=True,
     )
 
-    keypoints = _normalize_bone_lengths_2d(keypoints)
-    keypoints = _apply_anatomical_limits_2d(keypoints)
+    non_leg_bones = [
+        bone for bone in _BONES_H36M
+        if not ({bone[0], bone[1]} & {1, 2, 3, 4, 5, 6})
+    ]
+    non_leg_limits = [
+        limit for limit in _JOINT_ANGLE_LIMITS_2D
+        if limit[1] not in {2, 5}
+    ]
+    keypoints = _normalize_bone_lengths_2d(keypoints, bones=non_leg_bones)
+    keypoints = _apply_anatomical_limits_2d(keypoints, limits=non_leg_limits)
 
     # Add conf score to the last dim
     keypoints = np.concatenate((keypoints, scores[..., None]), axis=-1)
@@ -949,6 +1398,38 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
 
     output_npz = os.path.join(output_2d_dir, 'keypoints.npz')
     np.savez_compressed(output_npz, reconstruction=keypoints, valid_frames=valid_frames)
+
+    if foot_keypoints_raw is not None:
+        foot_output_npz = os.path.join(output_2d_dir, 'foot_keypoints.npz')
+        foot_names = np.array(
+            ['L_big_toe', 'L_small_toe', 'L_heel', 'R_big_toe', 'R_small_toe', 'R_heel'])
+        np.savez_compressed(
+            foot_output_npz,
+            keypoints=foot_keypoints_raw,
+            scores=foot_scores_raw,
+            valid_frames=valid_frames,
+            keypoint_names=foot_names,
+        )
+        print(f'Foot keypoints (raw, un-smoothed) saved to {foot_output_npz}')
+    status_output_npz = os.path.join(output_2d_dir, 'keypoint_status.npz')
+    np.savez_compressed(
+        status_output_npz,
+        raw_confidence=keypoint_status['raw_confidence'],
+        valid_mask=keypoint_status['valid_mask'],
+        needs_fill_mask=keypoint_status['needs_fill_mask'],
+        low_conf_mask=keypoint_status['low_conf_mask'],
+        bilateral_outlier_mask=keypoint_status['bilateral_outlier_mask'],
+        frame_bad_mask=keypoint_status['frame_bad_mask'],
+        ankle_crossing_mask=keypoint_status['ankle_crossing_mask'],
+        mirror_filled_mask=keypoint_status['mirror_filled_mask'],
+        thresholds=keypoint_status['thresholds'],
+        jumps=keypoint_status['jumps'],
+        video_thresholds=keypoint_status['video_thresholds'],
+        video_threshold_sample_counts=keypoint_status['video_threshold_sample_counts'],
+        threshold_source=keypoint_status['threshold_source'].astype(str),
+        valid_frames=valid_frames,
+    )
+    print(f'Keypoint status masks saved to {status_output_npz}')
     raw_output_npz = os.path.join(output_2d_dir, 'keypoints_raw.npz')
     raw_keypoints_with_conf = np.concatenate((raw_keypoints, raw_scores[..., None]), axis=-1)
     np.savez_compressed(
@@ -1170,7 +1651,7 @@ def _smooth_angles_butterworth(df, fps, cutoff_hz=10.0, order=4):
             df[col] = filtfilt(b, a, arr)
 
 
-def _smooth_angles_sg(df, fps, polyorder=3):
+def _smooth_angles_sg(df, fps, polyorder=3, exclude_cols=None):
     """FPS-adaptive Savitzky-Golay smoothing on angle columns.
     Fits a local polynomial over ~0.27s window. Preserves peaks better than
     Butterworth at equivalent bandwidth because the passband is flat.
@@ -1180,7 +1661,8 @@ def _smooth_angles_sg(df, fps, polyorder=3):
     win = max(polyorder + 2, int(fps * 0.22))
     if win % 2 == 0:
         win += 1
-    angle_cols = [c for c in df.columns if c != 'frame']
+    exclude_cols = set(exclude_cols or [])
+    angle_cols = [c for c in df.columns if c != 'frame' and c not in exclude_cols]
     for col in angle_cols:
         arr = df[col].to_numpy(dtype=np.float64)
         if len(arr) >= win:
@@ -1249,7 +1731,10 @@ def compute_angles(npz_path, output_dir, fps=30.0):
             correction['joint'] = col
             knee_corrections.append(correction)
 
-    _smooth_angles_sg(df, fps)
+    # Knee angles are sensitive to DP L/R leg-identity transitions. Smoothing the
+    # whole left/right knee series across those boundaries can blend the two legs
+    # and move correct raw 3D knees tens of degrees away from the 2D overlay.
+    _smooth_angles_sg(df, fps, exclude_cols={'left_knee_angle', 'right_knee_angle'})
 
     out_dir = os.path.join(output_dir, 'pred_3D', 'angles')
     os.makedirs(out_dir, exist_ok=True)
@@ -1306,6 +1791,14 @@ def get_pose3D(video_path, output_dir, skip_video=False):
     keypoints   = data['reconstruction']
     valid_frames = np.asarray(data['valid_frames']).flatten().astype(int)
 
+    foot_kpts_path = os.path.join(input_2d_dir, 'foot_keypoints.npz')
+    foot_keypoints = None
+    foot_scores = None
+    if os.path.exists(foot_kpts_path):
+        foot_data = np.load(foot_kpts_path, allow_pickle=True)
+        foot_keypoints = foot_data['keypoints']  # (M, T, 6, 2)
+        foot_scores = foot_data['scores']        # (M, T, 6)
+
     clips, downsample_indices = turn_into_clips(keypoints)
 
     cap = cv2.VideoCapture(video_path)
@@ -1336,7 +1829,9 @@ def get_pose3D(video_path, output_dir, skip_video=False):
             if img is None:
                 continue
             input_2D_raw = keypoints[0][i]
-            image = show2Dpose(input_2D_raw, copy.deepcopy(img))
+            frame_foot_kps = foot_keypoints[0][i] if foot_keypoints is not None else None
+            frame_foot_scores = foot_scores[0][i] if foot_scores is not None else None
+            image = show2Dpose(input_2D_raw, copy.deepcopy(img), frame_foot_kps, frame_foot_scores)
             cv2.imwrite(os.path.join(output_dir_2D, str(('%04d' % i)) + '_2D.png'), image)
 
     cap.release()

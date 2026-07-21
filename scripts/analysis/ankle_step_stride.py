@@ -31,6 +31,222 @@ RIGHT_ANKLE = 3
 LEFT_ANKLE = 6
 TEXT_COLOR = (0, 0, 0)
 
+ANKLE_FIELDS = [
+    "seq_frame", "offset_index", "orig_frame", "time_s", "seq_time_s", "cam",
+    "right_ankle_x", "right_ankle_y", "right_ankle_conf",
+    "left_ankle_x", "left_ankle_y", "left_ankle_conf",
+    "lower_foot", "lower_ankle_x", "lower_ankle_y", "lower_ankle_conf",
+]
+
+
+def _load_keypoint_status_for(keypoints_npz_path):
+    base = Path(keypoints_npz_path).parent
+    for name in ("keypoint_status.npz", "newalgo_keypoint_status.npz"):
+        path = base / name
+        if path.exists():
+            return np.load(path, allow_pickle=True), path
+    return None, None
+
+
+def _resolve_leg_mask_after_swaps(mask, swapped, left_idx, right_idx):
+    resolved = mask.copy()
+    if swapped is None or not np.any(swapped):
+        return resolved
+    resolved[np.ix_(swapped, [right_idx])] = mask[np.ix_(swapped, [left_idx])]
+    resolved[np.ix_(swapped, [left_idx])] = mask[np.ix_(swapped, [right_idx])]
+    return resolved
+
+
+def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
+                           conf_threshold=0.50,
+                           hard_conf_threshold=0.20,
+                           deviation_factor=2.0):
+    """Fill leg bad points after DP has resolved left/right identity.
+
+    DP decides which physical leg each left/right label represents. Knee/ankle
+    low-confidence and outlier frames are therefore filled here, using the
+    DP-resolved parent->joint trajectory, instead of before DP where the same
+    label can still refer to the wrong physical leg.
+    """
+    status, status_path = _load_keypoint_status_for(keypoints_npz_path)
+    if status is None:
+        return None
+
+    R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
+    L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
+    T = recon.shape[1]
+    kp = recon[0, :, :, :2].astype(np.float64, copy=True)
+    raw_conf = status["raw_confidence"][0].astype(np.float64)
+    low_conf = status["low_conf_mask"][0].astype(bool)
+    bilateral = status["bilateral_outlier_mask"][0].astype(bool)
+    crossing = status["ankle_crossing_mask"][0].astype(bool)
+
+    if swapped is None:
+        swapped = np.zeros(T, dtype=bool)
+    swapped = np.asarray(swapped, dtype=bool)
+
+    raw_conf_resolved = raw_conf.copy()
+    if np.any(swapped):
+        for left_idx, right_idx in ((L_KNEE, R_KNEE), (L_ANKLE, R_ANKLE)):
+            raw_conf_resolved[np.ix_(swapped, [right_idx])] = raw_conf[np.ix_(swapped, [left_idx])]
+            raw_conf_resolved[np.ix_(swapped, [left_idx])] = raw_conf[np.ix_(swapped, [right_idx])]
+    for left_idx, right_idx in ((L_KNEE, R_KNEE), (L_ANKLE, R_ANKLE)):
+        low_conf = _resolve_leg_mask_after_swaps(low_conf, swapped, left_idx, right_idx)
+        bilateral = _resolve_leg_mask_after_swaps(bilateral, swapped, left_idx, right_idx)
+        crossing = _resolve_leg_mask_after_swaps(crossing, swapped, left_idx, right_idx)
+
+    post_fill = np.zeros((T, recon.shape[2]), dtype=bool)
+    all_idx = np.arange(T)
+    thresholds = {
+        R_KNEE: 8.0,
+        L_KNEE: 8.0,
+        R_ANKLE: 12.0,
+        L_ANKLE: 12.0,
+    }
+    joint_specs = (
+        (R_KNEE, R_HIP, False),
+        (L_KNEE, L_HIP, False),
+        (R_ANKLE, R_KNEE, True),
+        (L_ANKLE, L_KNEE, True),
+    )
+
+    for joint_idx, parent_idx, use_crossing in joint_specs:
+        base_bad = bilateral[:, joint_idx] | (raw_conf_resolved[:, joint_idx] < hard_conf_threshold)
+        if use_crossing:
+            base_bad = base_bad | crossing[:, joint_idx]
+        moderate_low = (
+            low_conf[:, joint_idx] &
+            (raw_conf_resolved[:, joint_idx] >= hard_conf_threshold) &
+            (raw_conf_resolved[:, joint_idx] < conf_threshold)
+        )
+
+        rel = kp[:, joint_idx] - kp[:, parent_idx]
+        good_for_model = (
+            (raw_conf_resolved[:, joint_idx] >= conf_threshold) &
+            ~bilateral[:, joint_idx] &
+            np.isfinite(rel).all(axis=1)
+        )
+        if use_crossing:
+            good_for_model &= ~crossing[:, joint_idx]
+        good_idx = np.flatnonzero(good_for_model)
+        geometric_bad = np.zeros(T, dtype=bool)
+        if good_idx.size >= 2 and np.any(moderate_low):
+            interp_x = np.interp(all_idx, good_idx, rel[good_idx, 0])
+            interp_y = np.interp(all_idx, good_idx, rel[good_idx, 1])
+            deviation = np.hypot(rel[:, 0] - interp_x, rel[:, 1] - interp_y)
+            geometric_bad = moderate_low & (deviation > thresholds[joint_idx] * deviation_factor)
+
+        fill = base_bad | geometric_bad
+        post_fill[:, joint_idx] = fill
+        good_fill_idx = np.flatnonzero(~fill & np.isfinite(rel).all(axis=1))
+        if good_fill_idx.size < 2 or not np.any(fill):
+            continue
+
+        fixed_rel_x = np.interp(all_idx, good_fill_idx, rel[good_fill_idx, 0])
+        fixed_rel_y = np.interp(all_idx, good_fill_idx, rel[good_fill_idx, 1])
+        kp[fill, joint_idx, 0] = kp[fill, parent_idx, 0] + fixed_rel_x[fill]
+        kp[fill, joint_idx, 1] = kp[fill, parent_idx, 1] + fixed_rel_y[fill]
+
+    recon[0, :, :, :2] = kp
+    out_path = Path(keypoints_npz_path).parent / "post_dp_ankle_fill_mask.npz"
+    np.savez_compressed(
+        out_path,
+        post_dp_leg_fill_mask=post_fill,
+        post_dp_ankle_fill_mask=post_fill,
+        dp_leg_swapped=swapped,
+        source_status_path=str(status_path),
+    )
+    return post_fill
+
+
+def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2, bone_blend=0.8):
+    """Smooth and constrain leg geometry after DP has resolved L/R identity."""
+    leg_joints = (1, 2, 3, 4, 5, 6)
+    sg_windows = {
+        1: 11,  # RHip
+        2: 7,   # RKnee
+        3: 3,   # RAnkle
+        4: 11,  # LHip
+        5: 7,   # LKnee
+        6: 3,   # LAnkle
+    }
+    leg_bones = ((1, 2), (2, 3), (4, 5), (5, 6))
+    knee_limits = ((1, 2, 3, 20.0), (4, 5, 6, 20.0))
+
+    M, T, J, _ = recon.shape
+    kp = recon[:, :, :, :2].astype(np.float64, copy=True)
+
+    for person_idx in range(M):
+        for joint_idx in leg_joints:
+            win = min(int(sg_windows[joint_idx]), T)
+            if win % 2 == 0:
+                win -= 1
+            if win >= sg_polyorder + 2 and T >= win:
+                kp[person_idx, :, joint_idx, 0] = savgol_filter(
+                    kp[person_idx, :, joint_idx, 0],
+                    win,
+                    sg_polyorder,
+                    mode="mirror",
+                )
+                kp[person_idx, :, joint_idx, 1] = savgol_filter(
+                    kp[person_idx, :, joint_idx, 1],
+                    win,
+                    sg_polyorder,
+                    mode="mirror",
+                )
+
+        for parent_idx, child_idx in leg_bones:
+            diff = kp[person_idx, :, child_idx] - kp[person_idx, :, parent_idx]
+            lengths = np.linalg.norm(diff, axis=1)
+            valid = lengths > 1.0
+            if valid.sum() < 2:
+                continue
+            ref_len = float(np.median(lengths[valid]))
+            ratios = np.where(lengths > 1.0, ref_len / lengths, 1.0)
+            adjust = np.abs(ratios - 1.0) > 0.10
+            if not np.any(adjust):
+                continue
+            normalized = kp[person_idx, :, parent_idx] + diff * ratios[:, None]
+            kp[person_idx, adjust, child_idx] = (
+                (1.0 - bone_blend) * kp[person_idx, adjust, child_idx]
+                + bone_blend * normalized[adjust]
+            )
+
+        for p_idx, j_idx, d_idx, min_deg in knee_limits:
+            p = kp[person_idx, :, p_idx]
+            j = kp[person_idx, :, j_idx]
+            d = kp[person_idx, :, d_idx]
+            v1 = p - j
+            v2 = d - j
+            len1 = np.linalg.norm(v1, axis=1)
+            len2 = np.linalg.norm(v2, axis=1)
+            valid = (len1 > 1.0) & (len2 > 1.0)
+            cos_a = np.einsum("ti,ti->t", v1, v2) / np.maximum(len1 * len2, 1e-8)
+            angles = np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
+            needs_fix = valid & (angles < min_deg)
+            for t in np.where(needs_fix)[0]:
+                delta = np.radians(float(min_deg) - float(angles[t]))
+                cross = v1[t, 0] * v2[t, 1] - v1[t, 1] * v2[t, 0]
+                if cross < 0:
+                    delta = -delta
+                cos_d, sin_d = np.cos(delta), np.sin(delta)
+                v2r = np.array([
+                    v2[t, 0] * cos_d - v2[t, 1] * sin_d,
+                    v2[t, 0] * sin_d + v2[t, 1] * cos_d,
+                ])
+                kp[person_idx, t, d_idx] = j[t] + v2r
+
+    recon[:, :, :, :2] = kp
+    return recon
+
+STEP_FIELDS = [
+    "step_index", "seq_frame", "orig_frame", "time_s", "seq_time_s", "cam", "foot",
+    "ankle_x", "ankle_y", "ankle_conf",
+    "track_position_px", "world_x_m", "world_y_m",
+    "step_length_px", "step_length_m",
+    "cadence_spm", "avg_cadence_spm",
+]
+
 
 
 def _parse_line(values):
@@ -529,6 +745,36 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
 
     filtered_candidates = _dedupe_short_contacts(filtered_candidates)
 
+    def _apply_alternating_foot_labels(candidates):
+        # 跑步必定左右交替落地。逐幀計算的 lower_foot 只在單一幀比較左右腳踝
+        # y 座標，容易被雜訊誤判，因此只信任它來決定「第一步」（用峰值附近一
+        # 個小視窗做多數決，降低錨點本身判斷錯誤的機率）。第二步以後一律直接
+        # 取前一步的相反腳，不再重新讀取 lower_foot。落地時間點與
+        # ankle_x/ankle_y（實際偵測到的踝關節位置）完全不變，只修正 foot 這個標籤欄位。
+        if not candidates:
+            return candidates
+
+        anchor_window_radius = max(1, peak_distance // 3)
+        anchor_row_idx = candidates[0]["row_idx"]
+        lo = max(0, anchor_row_idx - anchor_window_radius)
+        hi = min(len(ankle_rows) - 1, anchor_row_idx + anchor_window_radius)
+        votes = [ankle_rows[i]["lower_foot"] for i in range(lo, hi + 1)]
+        left_votes = votes.count("left")
+        right_votes = votes.count("right")
+        if left_votes > right_votes:
+            anchor_foot = "left"
+        elif right_votes > left_votes:
+            anchor_foot = "right"
+        else:
+            anchor_foot = candidates[0]["foot"]  # tie: 保留原本單幀判斷值
+
+        candidates[0]["foot"] = anchor_foot
+        for i in range(1, len(candidates)):
+            candidates[i]["foot"] = "left" if candidates[i - 1]["foot"] == "right" else "right"
+        return candidates
+
+    filtered_candidates = _apply_alternating_foot_labels(filtered_candidates)
+
     events = []
     prev_proj = None
     for step_idx, candidate in enumerate(filtered_candidates, start=1):
@@ -621,6 +867,518 @@ def add_global_cadence(step_events, ankle_rows):
         prev_time = current_time
 
     return summary
+
+
+def apply_anchor_leg_correction(keypoints_npz_path, step_events):
+    """Refine 2D keypoint L/R leg identity using confirmed touchdown events.
+
+    step_events (from detect_steps(), already guaranteed to alternate feet)
+    are used as ground-truth anchors: at each touchdown's seq_frame, the
+    stance (lower) ankle is known to be left or right. Between two
+    consecutive anchors, leg identity is propagated frame-to-frame by
+    least-movement continuity (only two legs to disambiguate, bounded by
+    hard truth on both ends) -- this only refines segments that already
+    have two anchors on both sides; frames before the first anchor or
+    after the last keep whatever identity the pose-estimation stage
+    already assigned (e.g. via cost-based correction).
+
+    Overwrites keypoints_npz_path in place with the refined array and returns
+    a boolean mask where True means that frame's left/right leg identity was
+    swapped. If fewer than 2 step_events exist, returns None (not enough
+    anchors to refine).
+    """
+    if len(step_events) < 2:
+        return None
+
+    L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
+    R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
+    LEG_L, LEG_R = [L_HIP, L_KNEE, L_ANKLE], [R_HIP, R_KNEE, R_ANKLE]
+    vector_weight = 1.0
+    coord_weight = 0.20
+    switch_penalty = 8.0
+    stance_penalty = 90.0
+    anchor_penalty = 1000.0
+    velocity_weight = 1.0
+    y_weight = 0.25
+    knee_angle_weight = 0.4
+    velocity_margin = 3.0
+    knee_angle_margin = 15.0
+    early_switch_until = 0.65
+    early_switch_weight = 50.0
+
+    data = np.load(keypoints_npz_path, allow_pickle=True)
+    recon = data["reconstruction"]  # (M, T, J, C) -- C includes x, y, conf
+    valid_frames = data["valid_frames"]
+
+    kp = recon[0, :, :, :2].astype(np.float64)
+    result = kp.copy()
+
+    T = kp.shape[0]
+    ankle_vel = {"right": np.zeros(T), "left": np.zeros(T)}
+    for t in range(1, T):
+        ankle_vel["right"][t] = np.linalg.norm(kp[t, R_ANKLE] - kp[t - 1, R_ANKLE])
+        ankle_vel["left"][t] = np.linalg.norm(kp[t, L_ANKLE] - kp[t - 1, L_ANKLE])
+    for foot in ("right", "left"):
+        padded = np.pad(ankle_vel[foot], (1, 1), mode="edge")
+        ankle_vel[foot] = np.asarray([
+            np.median(padded[t:t + 3]) for t in range(T)
+        ], dtype=np.float64)
+
+    def _estimate_seq_fps(events):
+        samples = []
+        sorted_events = sorted(events, key=lambda item: int(item["seq_frame"]))
+        for a, b in zip(sorted_events, sorted_events[1:]):
+            frame_delta = int(b["seq_frame"]) - int(a["seq_frame"])
+            if frame_delta <= 0:
+                continue
+            for time_key in ("seq_time_s", "time_s"):
+                if a.get(time_key) is None or b.get(time_key) is None:
+                    continue
+                try:
+                    time_delta = float(b[time_key]) - float(a[time_key])
+                except (TypeError, ValueError):
+                    continue
+                if time_delta > 1e-6:
+                    samples.append(frame_delta / time_delta)
+                    break
+        if not samples:
+            return 60.0
+        fps = float(np.median(samples))
+        if not np.isfinite(fps) or fps <= 0:
+            return 60.0
+        return fps
+
+    seq_fps = _estimate_seq_fps(step_events)
+
+    def _clamp(value, lower, upper):
+        return max(lower, min(upper, value))
+
+    def _other(foot):
+        return "left" if foot == "right" else "right"
+
+    def _stance_extent(anchor_t, other_end_t, foot):
+        # The stance influence range must not depend on the pre-DP left/right
+        # labels, because those labels are exactly what DP is trying to resolve.
+        # Use a fixed fraction of the adjacent touchdown gap, with FPS-scaled
+        # min/max guards so the same seconds are covered at 30/60/120 fps.
+        step = 1 if other_end_t > anchor_t else -1
+        gap = abs(int(other_end_t) - int(anchor_t))
+        if gap <= 1:
+            return anchor_t
+
+        if step > 0:
+            raw_window = int(round(gap * 0.35))
+            min_window = max(1, int(round(seq_fps * 0.04)))
+            max_window = max(min_window, int(round(seq_fps * 0.12)))
+        else:
+            raw_window = int(round(gap * 0.20))
+            min_window = max(1, int(round(seq_fps * 0.02)))
+            max_window = max(min_window, int(round(seq_fps * 0.07)))
+
+        window = _clamp(raw_window, min_window, max_window)
+        window = min(window, gap - 1)
+        return anchor_t + step * window
+
+    def _legs_for_state(t, state):
+        if state:
+            return kp[t, LEG_L], kp[t, LEG_R]
+        return kp[t, LEG_R], kp[t, LEG_L]
+
+    def _leg_vectors(right_leg, left_leg):
+        return np.asarray([
+            right_leg[1] - right_leg[0],
+            right_leg[2] - right_leg[0],
+            left_leg[1] - left_leg[0],
+            left_leg[2] - left_leg[0],
+        ], dtype=np.float64)
+
+    def _knee_angle(leg):
+        v1 = leg[0] - leg[1]
+        v2 = leg[2] - leg[1]
+        denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if denom < 1e-8:
+            return 0.0
+        cos_a = np.dot(v1, v2) / denom
+        return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+
+    def _transition_cost(prev_t, prev_state, t, state):
+        prev_r, prev_l = _legs_for_state(prev_t, prev_state)
+        cur_r, cur_l = _legs_for_state(t, state)
+        vector_cost = np.linalg.norm(
+            _leg_vectors(cur_r, cur_l) - _leg_vectors(prev_r, prev_l),
+            axis=1,
+        ).sum()
+        coord_cost = (
+            np.linalg.norm(cur_r - prev_r, axis=1).sum() +
+            np.linalg.norm(cur_l - prev_l, axis=1).sum()
+        )
+        cost = vector_weight * vector_cost + coord_weight * coord_cost
+        if state != prev_state:
+            cost += switch_penalty
+        return cost
+
+    def _lower_foot_for_state(t, state):
+        right_leg, left_leg = _legs_for_state(t, state)
+        return "right" if right_leg[2, 1] >= left_leg[2, 1] else "left"
+
+    def _foot_mismatch_penalty(t, state, expected_foot, penalty):
+        if _lower_foot_for_state(t, state) == expected_foot:
+            return 0.0
+        right_leg, left_leg = _legs_for_state(t, state)
+        if expected_foot == "right":
+            y_gap = max(0.0, float(left_leg[2, 1] - right_leg[2, 1]))
+        else:
+            y_gap = max(0.0, float(right_leg[2, 1] - left_leg[2, 1]))
+        return penalty + y_gap
+
+    def _stance_evidence_cost(t, state, expected_foot, penalty):
+        right_leg, left_leg = _legs_for_state(t, state)
+        if expected_foot == "right":
+            stance_leg, swing_leg = right_leg, left_leg
+            stance_vel = ankle_vel["right"][t] if not state else ankle_vel["left"][t]
+            swing_vel = ankle_vel["left"][t] if not state else ankle_vel["right"][t]
+        else:
+            stance_leg, swing_leg = left_leg, right_leg
+            stance_vel = ankle_vel["left"][t] if not state else ankle_vel["right"][t]
+            swing_vel = ankle_vel["right"][t] if not state else ankle_vel["left"][t]
+
+        velocity_cost = max(0.0, velocity_margin - float(swing_vel - stance_vel))
+        y_cost = max(0.0, float(swing_leg[2, 1] - stance_leg[2, 1]))
+        angle_gap = _knee_angle(stance_leg) - _knee_angle(swing_leg)
+        angle_cost = max(0.0, knee_angle_margin - angle_gap)
+        return penalty + (
+            velocity_weight * velocity_cost +
+            y_weight * y_cost +
+            knee_angle_weight * angle_cost
+        )
+
+    def _observation_cost(t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start):
+        if t == t_a:
+            return _foot_mismatch_penalty(t, state, foot_a, anchor_penalty)
+        if t == t_b:
+            return _foot_mismatch_penalty(t, state, foot_b, anchor_penalty)
+
+        near_start = t <= post_end
+        near_end = t >= pre_start
+        if near_start and near_end:
+            expected = foot_a if (t - t_a) <= (t_b - t) else foot_b
+            return _stance_evidence_cost(t, state, expected, stance_penalty)
+        if near_start:
+            return _stance_evidence_cost(t, state, foot_a, stance_penalty)
+        if near_end:
+            return _stance_evidence_cost(t, state, foot_b, stance_penalty)
+        return 0.0
+
+    def _switch_timing_cost(t_a, t_b, t, prev_state, state):
+        if state == prev_state:
+            return 0.0
+        span = max(1, t_b - t_a)
+        progress = (t - t_a) / span
+        if progress >= early_switch_until:
+            return 0.0
+        return (early_switch_until - progress) * early_switch_weight
+
+    def _solve_segment_states(t_a, foot_a, t_b, foot_b):
+        post_end = _stance_extent(t_a, t_b, foot_a)
+        pre_start = _stance_extent(t_b, t_a, foot_b)
+
+        frames = list(range(t_a, t_b + 1))
+        dp = np.full((len(frames), 2), np.inf, dtype=np.float64)
+        parent = np.full((len(frames), 2), -1, dtype=np.int8)
+
+        for state in (0, 1):
+            dp[0, state] = _observation_cost(t_a, state, t_a, foot_a, t_b, foot_b, post_end, pre_start)
+
+        for idx in range(1, len(frames)):
+            t = frames[idx]
+            prev_t = frames[idx - 1]
+            for state in (0, 1):
+                obs = _observation_cost(t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start)
+                best_cost = np.inf
+                best_prev = 0
+                for prev_state in (0, 1):
+                    cost = (
+                        dp[idx - 1, prev_state] +
+                        _transition_cost(prev_t, prev_state, t, state) +
+                        obs +
+                        _switch_timing_cost(t_a, t_b, t, prev_state, state)
+                    )
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_prev = prev_state
+                dp[idx, state] = best_cost
+                parent[idx, state] = best_prev
+
+        states = {}
+        state = int(np.argmin(dp[-1]))
+        for idx in range(len(frames) - 1, -1, -1):
+            states[frames[idx]] = state
+            state = int(parent[idx, state]) if idx > 0 else state
+
+        return states
+
+    swapped = np.zeros(T, dtype=bool)
+    anchors = sorted(
+        ((int(e["seq_frame"]), e["foot"]) for e in step_events),
+        key=lambda a: a[0],
+    )
+    for (t_a, foot_a), (t_b, foot_b) in zip(anchors, anchors[1:]):
+        if t_b <= t_a:
+            continue
+        states = _solve_segment_states(t_a, foot_a, t_b, foot_b)
+        for t in range(t_a, t_b + 1):
+            if states.get(t, 0):
+                result[t, LEG_R] = kp[t, LEG_L]
+                result[t, LEG_L] = kp[t, LEG_R]
+                swapped[t] = True
+            else:
+                result[t, LEG_R] = kp[t, LEG_R]
+                result[t, LEG_L] = kp[t, LEG_L]
+
+    recon[0, :, :, :2] = result
+    _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path)
+    _post_dp_smooth_and_limit_legs(recon)
+    np.savez_compressed(keypoints_npz_path, reconstruction=recon, valid_frames=valid_frames)
+    return swapped
+
+
+def apply_leg_swap_to_foot_keypoints(foot_npz_path, swapped_mask):
+    """Apply the same per-frame L/R swap decision from apply_anchor_leg_correction()
+    to the COCO-WholeBody foot points (toe/heel), which live outside keypoints.npz
+    and are otherwise untouched by the body leg-identity DP correction.
+
+    foot_npz_path: path to foot_keypoints.npz (keypoints order: L_big_toe,
+        L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel).
+    swapped_mask: per-frame bool array returned by apply_anchor_leg_correction(),
+        or None if there weren't enough anchors to run the correction.
+
+    No-ops (does not raise) if foot_npz_path doesn't exist or swapped_mask is None,
+    since foot data is optional and the correction may not have run.
+    """
+    if swapped_mask is None or not os.path.exists(foot_npz_path):
+        return
+
+    data = np.load(foot_npz_path, allow_pickle=True)
+    keypoints = data["keypoints"].copy()  # (M, T, 6, 2)
+    scores = data["scores"].copy()        # (M, T, 6)
+    valid_frames = data["valid_frames"]
+    keypoint_names = data["keypoint_names"]
+
+    LEFT = [0, 1, 2]
+    RIGHT = [3, 4, 5]
+    T = keypoints.shape[1]
+    for t in range(min(T, len(swapped_mask))):
+        if swapped_mask[t]:
+            keypoints[:, t, LEFT + RIGHT] = keypoints[:, t, RIGHT + LEFT]
+            scores[:, t, LEFT + RIGHT] = scores[:, t, RIGHT + LEFT]
+
+    np.savez_compressed(
+        foot_npz_path,
+        keypoints=keypoints,
+        scores=scores,
+        valid_frames=valid_frames,
+        keypoint_names=keypoint_names,
+    )
+
+
+def align_foot_keypoints_to_body(foot_npz_path, raw_keypoints_npz_path, keypoints_npz_path, swapped_mask):
+    """Re-anchor foot points to the same post-smoothing/post-DP ankle positions
+    that the body skeleton in keypoints.npz uses, so the two draw consistently.
+
+    Foot points are never smoothed (see apply_leg_swap_to_foot_keypoints's
+    docstring), so a raw foot point can end up tens of pixels from the ankle
+    after apply_anchor_leg_correction()'s post-DP leg smoothing/bone-length
+    fix moves the ankle -- most visible right after a DP swap, where leg
+    smoothing corrects a sudden discontinuity. This does not mean the L/R
+    identity is wrong (compare each foot point against the *raw* ankle it was
+    actually detected next to, not the smoothed one); it just means the two
+    arrays are sitting in different processing stages.
+
+    Fix: express each foot point as an offset from the *raw* ankle it was
+    detected next to (using the same swap decision as
+    apply_leg_swap_to_foot_keypoints so the correct raw ankle is picked even
+    on swapped frames), then re-apply that offset to the *final* smoothed
+    ankle position. This keeps the detected toe/heel geometry relative to the
+    ankle while letting the point follow wherever smoothing/DP moved the leg.
+
+    Must run after apply_leg_swap_to_foot_keypoints() (foot L/R identity
+    already corrected) and after apply_anchor_leg_correction() has returned
+    (keypoints_npz_path already holds the final smoothed body).
+
+    No-ops if swapped_mask is None or any required file is missing.
+    """
+    if swapped_mask is None or not os.path.exists(foot_npz_path):
+        return
+    if not os.path.exists(raw_keypoints_npz_path) or not os.path.exists(keypoints_npz_path):
+        return
+
+    foot_data = np.load(foot_npz_path, allow_pickle=True)
+    keypoints = foot_data["keypoints"].copy()  # (M, T, 6, 2), L/R identity already corrected
+    scores = foot_data["scores"]
+    valid_frames = foot_data["valid_frames"]
+    keypoint_names = foot_data["keypoint_names"]
+
+    raw_body = np.load(raw_keypoints_npz_path, allow_pickle=True)["reconstruction"][0]    # (T, 17, 3)
+    final_body = np.load(keypoints_npz_path, allow_pickle=True)["reconstruction"][0]      # (T, 17, 3)
+
+    L_ANKLE, R_ANKLE = 6, 3
+    LEFT = [0, 1, 2]
+    RIGHT = [3, 4, 5]
+
+    T = min(keypoints.shape[1], raw_body.shape[0], final_body.shape[0], len(swapped_mask))
+    for t in range(T):
+        if swapped_mask[t]:
+            raw_l_ankle, raw_r_ankle = raw_body[t, R_ANKLE, :2], raw_body[t, L_ANKLE, :2]
+        else:
+            raw_l_ankle, raw_r_ankle = raw_body[t, L_ANKLE, :2], raw_body[t, R_ANKLE, :2]
+        final_l_ankle = final_body[t, L_ANKLE, :2]
+        final_r_ankle = final_body[t, R_ANKLE, :2]
+
+        for fi in LEFT:
+            keypoints[:, t, fi] = final_l_ankle + (keypoints[:, t, fi] - raw_l_ankle)
+        for fi in RIGHT:
+            keypoints[:, t, fi] = final_r_ankle + (keypoints[:, t, fi] - raw_r_ankle)
+
+    np.savez_compressed(
+        foot_npz_path,
+        keypoints=keypoints,
+        scores=scores,
+        valid_frames=valid_frames,
+        keypoint_names=keypoint_names,
+    )
+
+
+def refresh_step_analysis_after_leg_correction(
+    step_analysis,
+    config,
+    output_dir,
+    keypoints_npz,
+    offsets_npz,
+    meters_per_pixel=None,
+):
+    """Refresh ankle rows and event coordinates after keypoints were rewritten.
+
+    ``run_step_stride_analysis()`` must run before anchor leg correction because it
+    provides the touchdown anchors. After ``apply_anchor_leg_correction()`` rewrites
+    left/right leg identity in ``keypoints.npz``, the previously computed
+    ``ankle_rows`` still reflect the pre-correction labels. This function keeps the
+    already accepted event timing/foot labels, but regenerates ankle rows and event
+    coordinates from the corrected keypoints so the final overlay and CSVs use one
+    consistent source of truth.
+    """
+    if not step_analysis:
+        return step_analysis
+
+    cameras = config.get("cameras") or []
+    if not cameras:
+        return step_analysis
+
+    video_path = cameras[0].get("video_path")
+    cap = cv2.VideoCapture(video_path) if video_path else None
+    fps = cap.get(cv2.CAP_PROP_FPS) if cap and cap.isOpened() else 60.0
+    if cap:
+        cap.release()
+    fps = fps or 60.0
+
+    args = SimpleNamespace(meters_per_pixel=meters_per_pixel)
+    ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
+    rows_by_seq = {int(row["seq_frame"]): row for row in ankle_rows}
+
+    calibrations = {}
+    for cam_idx, cam in enumerate(cameras):
+        start_line = cam.get("start_line")
+        end_line = cam.get("end_line")
+        if start_line:
+            start_line = [(float(x), float(y)) for x, y in start_line]
+        if end_line:
+            end_line = [(float(x), float(y)) for x, y in end_line]
+        calibrations[cam_idx] = _make_calibration(
+            cam,
+            config,
+            args,
+            start_line,
+            end_line,
+            cam.get("distance_m") or config.get("distance_m"),
+        )
+
+    refreshed_events = []
+    prev_proj_by_cam = {}
+    for event in sorted(step_analysis.get("step_events", []), key=lambda item: int(item["seq_frame"])):
+        seq_frame = int(event["seq_frame"])
+        row = rows_by_seq.get(seq_frame)
+        if row is None:
+            refreshed_events.append(event)
+            continue
+
+        foot = str(event.get("foot", row["lower_foot"]))
+        if foot == "right":
+            ankle_x = row["right_ankle_x"]
+            ankle_y = row["right_ankle_y"]
+            ankle_conf = row["right_ankle_conf"]
+        elif foot == "left":
+            ankle_x = row["left_ankle_x"]
+            ankle_y = row["left_ankle_y"]
+            ankle_conf = row["left_ankle_conf"]
+        else:
+            ankle_x = row["lower_ankle_x"]
+            ankle_y = row["lower_ankle_y"]
+            ankle_conf = row["lower_ankle_conf"]
+
+        cam_idx = int(row["cam"])
+        calibration = calibrations.get(cam_idx) or calibrations.get(0)
+        point = (ankle_x, ankle_y)
+        track_pos = _project(point, calibration) if calibration else None
+        world_x = world_y = None
+        if calibration and calibration.get("mode") == "homography":
+            world_x, world_y = _transform_homography(point, calibration["homography"])
+            step_len_px = None
+            prev_proj = prev_proj_by_cam.get(cam_idx)
+            step_len_m = None if prev_proj is None else abs(track_pos - prev_proj)
+        else:
+            prev_proj = prev_proj_by_cam.get(cam_idx)
+            step_len_px = None if prev_proj is None or track_pos is None else abs(track_pos - prev_proj)
+            mpp = calibration.get("meters_per_pixel") if calibration else None
+            step_len_m = None if step_len_px is None or mpp is None else step_len_px * mpp
+        if track_pos is not None:
+            prev_proj_by_cam[cam_idx] = track_pos
+
+        updated = dict(event)
+        updated.update({
+            "orig_frame": row["orig_frame"],
+            "time_s": row["time_s"],
+            "seq_time_s": row["seq_time_s"],
+            "cam": row["cam"],
+            "ankle_x": ankle_x,
+            "ankle_y": ankle_y,
+            "ankle_conf": ankle_conf,
+            "track_position_px": None if calibration and calibration.get("mode") == "homography" else track_pos,
+            "world_x_m": world_x,
+            "world_y_m": world_y,
+            "step_length_px": step_len_px,
+            "step_length_m": step_len_m,
+        })
+        refreshed_events.append(updated)
+
+    refreshed_events.sort(key=lambda event: int(event["seq_frame"]))
+    avg_cadence_spm = add_global_cadence(refreshed_events, ankle_rows)
+
+    step_lengths = [
+        float(e["step_length_m"])
+        for e in refreshed_events
+        if e.get("step_length_m") is not None
+    ]
+    avg_step_length_m = float(np.mean(step_lengths)) if step_lengths else None
+
+    ankle_csv = step_analysis.get("ankle_csv") or str(Path(output_dir) / "ankle_positions.csv")
+    steps_csv = step_analysis.get("steps_csv") or str(Path(output_dir) / "step_events.csv")
+    write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
+    write_csv(steps_csv, refreshed_events, STEP_FIELDS)
+
+    step_analysis["ankle_rows"] = ankle_rows
+    step_analysis["step_events"] = refreshed_events
+    step_analysis["avg_cadence_spm"] = avg_cadence_spm
+    step_analysis["avg_step_length_m"] = avg_step_length_m
+    return step_analysis
 
 
 def write_csv(path, rows, fieldnames):
@@ -905,21 +1663,8 @@ def run_step_stride_analysis(
     ankle_csv = str(Path(output_dir) / f"{stem}_ankle_positions.csv")
     steps_csv = str(Path(output_dir) / f"{stem}_step_events.csv")
 
-    ankle_fields = [
-        "seq_frame", "offset_index", "orig_frame", "time_s", "seq_time_s", "cam",
-        "right_ankle_x", "right_ankle_y", "right_ankle_conf",
-        "left_ankle_x", "left_ankle_y", "left_ankle_conf",
-        "lower_foot", "lower_ankle_x", "lower_ankle_y", "lower_ankle_conf",
-    ]
-    step_fields = [
-        "step_index", "seq_frame", "orig_frame", "time_s", "seq_time_s", "cam", "foot",
-        "ankle_x", "ankle_y", "ankle_conf",
-        "track_position_px", "world_x_m", "world_y_m",
-        "step_length_px", "step_length_m",
-        "cadence_spm", "avg_cadence_spm",
-    ]
-    write_csv(ankle_csv, ankle_rows, ankle_fields)
-    write_csv(steps_csv, step_events, step_fields)
+    write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
+    write_csv(steps_csv, step_events, STEP_FIELDS)
 
     overlay_video = None
     if make_video:
@@ -1022,21 +1767,8 @@ def main():
     ankle_csv = str(Path(output_dir) / f"{stem}_ankle_positions.csv")
     steps_csv = str(Path(output_dir) / f"{stem}_step_events.csv")
 
-    ankle_fields = [
-        "seq_frame", "offset_index", "orig_frame", "time_s", "seq_time_s", "cam",
-        "right_ankle_x", "right_ankle_y", "right_ankle_conf",
-        "left_ankle_x", "left_ankle_y", "left_ankle_conf",
-        "lower_foot", "lower_ankle_x", "lower_ankle_y", "lower_ankle_conf",
-    ]
-    step_fields = [
-        "step_index", "seq_frame", "orig_frame", "time_s", "seq_time_s", "cam", "foot",
-        "ankle_x", "ankle_y", "ankle_conf",
-        "track_position_px", "world_x_m", "world_y_m",
-        "step_length_px", "step_length_m",
-        "cadence_spm", "avg_cadence_spm",
-    ]
-    write_csv(ankle_csv, ankle_rows, ankle_fields)
-    write_csv(steps_csv, step_events, step_fields)
+    write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
+    write_csv(steps_csv, step_events, STEP_FIELDS)
 
     print(f"Ankle positions: {ankle_csv}")
     print(f"Step events: {steps_csv}")

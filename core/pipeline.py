@@ -4,7 +4,7 @@ core/pipeline.py
 包含完整跑者動作分析 Pipeline 的排程與協調邏輯。
 整合了：
   - Step 1 (track): YOLO 多相機追蹤與置中裁剪 (呼叫 core.tracking)
-  - Step 2 (pose): HRNet / MotionAGFormer 姿態估計與角度計算 (動態載入 vis.py)
+  - Step 2 (pose): HRNet 2D 姿態估計；完整流程會在 2D 左右腿修正後才執行 MotionAGFormer 3D 與角度計算
   - Step 3 (chart): 2D 追焦影片與角度折線圖合併 (呼叫 core.visualization)
   - Phase 3 (overlay): 原始未裁切影片之 2D 骨架與線條疊加 (呼叫 core.overlay)
 
@@ -18,7 +18,6 @@ import shutil
 import argparse
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 import cv2
@@ -30,7 +29,11 @@ from core.visualization import add_angle_overlay
 from core.overlay import overlay_videos
 from core.tracker_impl import compute_speed_from_bbox_map
 from scripts.analysis.ankle_step_stride import (
+    align_foot_keypoints_to_body,
     annotate_step_stride_video,
+    apply_anchor_leg_correction,
+    apply_leg_swap_to_foot_keypoints,
+    refresh_step_analysis_after_leg_correction,
     run_step_stride_analysis,
 )
 
@@ -183,6 +186,87 @@ def _add_time_to_angles_csv(angle_csv_path: str | None, video_path: str | None =
         return None
 
 
+def _write_dp_leg_swap_mask(swapped_mask, output_dir: str | None = None):
+    """Persist which frames had their 2D leg identity swapped by anchor DP."""
+    if swapped_mask is None or not output_dir:
+        return None
+
+    try:
+        swapped = np.asarray(swapped_mask, dtype=bool)
+        swap_csv = os.path.join(output_dir, "dp_leg_identity_swaps.csv")
+        pd.DataFrame({
+            "frame": np.arange(len(swapped), dtype=int),
+            "dp_leg_swapped": swapped,
+        }).to_csv(swap_csv, index=False)
+        print(f"  ▶ DP 左右腿交換紀錄: {swap_csv}")
+        return {
+            "swap_csv": swap_csv,
+            "swapped_frames": int(swapped.sum()),
+        }
+    except Exception as e:
+        print(f"  ▶ 寫出 DP 左右腿交換紀錄失敗: {e}")
+        return None
+
+
+def _align_angle_csv_to_leg_identity(angle_csv_path: str | None, swapped_mask, output_dir: str | None = None):
+    """Fallback: swap left/right leg angle columns wherever DP swapped 2D identity.
+
+    Preferred flow is to run MotionAGFormer 3D + angle computation only after
+    apply_anchor_leg_correction() has already rewritten input_2D/keypoints.npz.
+    In that flow this fallback is not needed because angles are computed from
+    the corrected 2D identities. Keep it available for older outputs where only
+    a pre-DP angles.csv exists.
+    """
+    if not angle_csv_path or swapped_mask is None or not os.path.exists(angle_csv_path):
+        _write_dp_leg_swap_mask(swapped_mask, output_dir)
+        return None
+
+    try:
+        df = pd.read_csv(angle_csv_path)
+        swapped = np.asarray(swapped_mask, dtype=bool)
+        n = min(len(df), len(swapped))
+        if n == 0 or not np.any(swapped[:n]):
+            _write_dp_leg_swap_mask(swapped_mask, output_dir)
+            return None
+
+        leg_angle_pairs = [
+            ("left_knee_angle", "right_knee_angle"),
+            ("left_hip_angle", "right_hip_angle"),
+        ]
+        applied_pairs = []
+        for left_col, right_col in leg_angle_pairs:
+            if left_col not in df.columns or right_col not in df.columns:
+                continue
+            mask = swapped[:n]
+            left_values = df.loc[:n - 1, left_col].copy()
+            df.loc[:n - 1, left_col] = np.where(mask, df.loc[:n - 1, right_col], df.loc[:n - 1, left_col])
+            df.loc[:n - 1, right_col] = np.where(mask, left_values, df.loc[:n - 1, right_col])
+            applied_pairs.append((left_col, right_col))
+
+        if not applied_pairs:
+            return None
+
+        df.to_csv(angle_csv_path, index=False)
+
+        swap_info = _write_dp_leg_swap_mask(swapped_mask, output_dir)
+        swap_csv = swap_info.get("swap_csv") if swap_info else None
+
+        swapped_count = int(swapped[:n].sum())
+        print(
+            "  ▶ 已依 DP 左右腿身份修正同步角度 CSV: "
+            f"{angle_csv_path} (swapped_frames={swapped_count}, pairs={applied_pairs})"
+        )
+        return {
+            "angle_csv": angle_csv_path,
+            "swap_csv": swap_csv,
+            "swapped_frames": swapped_count,
+            "applied_pairs": applied_pairs,
+        }
+    except Exception as e:
+        print(f"  ▶ 同步 DP 左右腿身份到角度 CSV 失敗: {e}")
+        return None
+
+
 # -----------------------------------------------------------------------
 # 延遲 import：只在真正需要時才載入 GPU-heavy 的 3D 重建函式庫
 # -----------------------------------------------------------------------
@@ -212,6 +296,130 @@ def _import_vis(motion_ag_dir: Path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.run_pose_estimation
+
+
+def _import_vis_module(motion_ag_dir: Path):
+    """Import MotionAGFormer/demo/vis.py and return the module object."""
+    import importlib.util
+
+    demo_dir = str(motion_ag_dir / "demo")
+    mag_dir = str(motion_ag_dir)
+
+    if mag_dir not in sys.path:
+        sys.path.insert(0, mag_dir)
+
+    for p in [mag_dir, demo_dir]:
+        if p in sys.path:
+            sys.path.remove(p)
+    sys.path.insert(0, mag_dir)
+    sys.path.insert(0, demo_dir)
+
+    spec = importlib.util.spec_from_file_location(
+        "vis", str(motion_ag_dir / "demo" / "vis.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _rerun_3d_angles_from_corrected_2d(
+    video_path: str,
+    pose_output_dir: str,
+    output_dest: str,
+    gpu: str,
+    motion_ag_dir: Path,
+    timings: list | None = None,
+) -> str | None:
+    """Regenerate pred_3D and angles.csv from the DP-corrected 2D keypoints.npz."""
+    if not video_path or not pose_output_dir or not output_dest:
+        return None
+    kps_npz = os.path.join(pose_output_dir, "input_2D", "keypoints.npz")
+    if not os.path.exists(kps_npz):
+        print(f"  ▶ 無法重算 3D 角度，找不到修正後 keypoints: {kps_npz}")
+        return None
+
+    def _video_size(path: str) -> tuple[float, float]:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return 0.0, 0.0
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0
+        cap.release()
+        return float(width), float(height)
+
+    def _archive_tracked_video() -> str | None:
+        pointer_path = os.path.join(pose_output_dir, "input_2D", "keypoints_raw_archive_dir.txt")
+        if not os.path.exists(pointer_path):
+            return None
+        try:
+            archive_dir = Path(pointer_path).read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
+        candidate = Path(archive_dir) / "cam1_tracked.mp4"
+        return str(candidate) if candidate.exists() else None
+
+    try:
+        recon = np.load(kps_npz, allow_pickle=True)["reconstruction"]
+        xy = recon[0, :, :, :2] if recon.ndim == 4 else recon[:, :, :2]
+        kp_max_x = float(np.nanmax(xy[..., 0]))
+        kp_max_y = float(np.nanmax(xy[..., 1]))
+        video_w, video_h = _video_size(video_path)
+        # keypoints.npz is stored in the tracked/cropped video coordinate system.
+        # If a later manual rerun passes the overview/final 1280x720 video after
+        # cam1_tracked.mp4 has been cleaned up, MotionAGFormer normalizes the 128px
+        # keypoints with 1280px dimensions and produces near-straight 3D knees.
+        if video_w > 0 and video_h > 0 and (kp_max_x < video_w * 0.35 or kp_max_y < video_h * 0.35):
+            archived_video = _archive_tracked_video()
+            if archived_video:
+                archived_w, archived_h = _video_size(archived_video)
+                if archived_w > 0 and archived_h > 0:
+                    print(
+                        "  ▶ 偵測到 3D 重算影片尺寸與 keypoints 座標系不一致，"
+                        f"改用 archive tracked video: {archived_video} "
+                        f"({video_w:.0f}x{video_h:.0f} -> {archived_w:.0f}x{archived_h:.0f})"
+                    )
+                    video_path = archived_video
+            else:
+                print(
+                    "  ▶ 警告：3D 重算影片尺寸可能與 keypoints 座標系不一致，"
+                    f"video={video_w:.0f}x{video_h:.0f}, keypoints max=({kp_max_x:.1f},{kp_max_y:.1f})"
+                )
+    except Exception as e:
+        print(f"  ▶ 檢查 3D 重算影片尺寸失敗，繼續使用原影片: {e}")
+
+    _saved_argv = sys.argv[:]
+    _saved_cwd = os.getcwd()
+    sys.argv = [sys.argv[0]]
+    os.chdir(str(motion_ag_dir))
+    try:
+        started_at = time.perf_counter()
+        vis_mod = _import_vis_module(motion_ag_dir)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+        vis_mod.get_pose3D(video_path, pose_output_dir, skip_video=True)
+        _record_timing(timings, "Analysis/rerun_3d_angles_after_leg_dp", started_at)
+    finally:
+        os.chdir(_saved_cwd)
+        sys.argv = _saved_argv
+
+    angle_csv_orig = os.path.join(
+        pose_output_dir,
+        "pred_3D",
+        "angles",
+        f"{Path(pose_output_dir).name}_angles.csv",
+    )
+    if not os.path.exists(angle_csv_orig):
+        print(f"  ▶ 重算後角度 CSV 不存在: {angle_csv_orig}")
+        return None
+
+    angle_csv_dest = os.path.join(output_dest, "angles.csv")
+    try:
+        shutil.copy2(angle_csv_orig, angle_csv_dest)
+        print(f"  ▶ 已用 DP 修正後 2D keypoints 重算 3D 角度: {angle_csv_dest}")
+        return angle_csv_dest
+    except Exception as e:
+        print(f"  ▶ 複製重算後角度 CSV 失敗: {e}")
+        return angle_csv_orig
 
 
 # -----------------------------------------------------------------------
@@ -407,7 +615,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
 
     # 清理舊資料夾殘留的 PNG，以防新舊影格個數不一致污染影片生成
     import shutil
-    for folder_name in ['pose2D', 'pose3D', 'pose']:
+    for folder_name in ['pose2D', 'pose3D', 'pose', 'pred_3D']:
         folder_path = os.path.join(abs_output_dir, folder_name)
         if os.path.exists(folder_path):
             print(f"  [Step 2] 偵測到舊的 {folder_name} 資料夾，進行清理以避免新舊影格污染...")
@@ -607,11 +815,19 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
     if output_dest:
         os.makedirs(output_dest, exist_ok=True)
         config_dict["output_dir"] = output_dest
-        
+        stale_angle_csv = os.path.join(output_dest, "angles.csv")
+        if os.path.exists(stale_angle_csv):
+            try:
+                os.remove(stale_angle_csv)
+                print(f"  ▶ 已清除舊角度 CSV，等待 DP 後重新產生: {stale_angle_csv}")
+            except Exception as e:
+                print(f"  ▶ 清除舊角度 CSV 失敗，後續將嘗試覆蓋: {e}")
+
     extra_cfg = {k: v for k, v in config_dict.items() if k != "cameras"}
+    motion_ag_dir = REPO_ROOT / "MotionAGFormer"
 
     print("=" * 60)
-    print("【階段一/二】骨架追蹤 + 2D/3D 姿態估計")
+    print("【階段一/二】骨架追蹤 + 2D 姿態估計")
     print("=" * 60)
 
     if progress_callback: progress_callback(5)
@@ -621,7 +837,10 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         extra_cfg=extra_cfg,
         output_dir=output_dest,
         gpu=gpu,
-        only_2d=only_2d,
+        # Full analysis needs step/DP correction before 3D lifting. The first
+        # pose pass therefore always stops at 2D; final 3D/angles are generated
+        # once after apply_anchor_leg_correction() writes corrected keypoints.
+        only_2d=True,
         skip_track=skip_track,
         skip_video=True,  # 中間裁剪骨架影片僅用於姿態估計，不輸出
         timings=timings,
@@ -696,40 +915,14 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
 
     print(f"  ▶ 姿態分析資料夾: {final_pose_dir}")
 
-    # 將角度 CSV 提取到 output 目錄下，命名為 angles.csv
+    # Full analysis intentionally has no pre-DP angle CSV. Final angles are
+    # generated after apply_anchor_leg_correction() writes corrected 2D keypoints.
     angle_csv_dest = None
-    if tracked_video:
-        video_stem = Path(tracked_video).stem
-        angle_csv_orig = os.path.join(final_pose_dir, "pred_3D", "angles", f"{video_stem}_angles.csv")
-        if os.path.exists(angle_csv_orig) and output_dest:
-            angle_csv_dest = os.path.join(output_dest, "angles.csv")
-            try:
-                os.rename(angle_csv_orig, angle_csv_dest)
-                print(f"  ▶ 關節角度資料 (CSV): {angle_csv_dest}")
-                angle_fps = None
-                if cameras and cameras[0].get('video_path'):
-                    cap = cv2.VideoCapture(cameras[0]['video_path'])
-                    if cap.isOpened():
-                        angle_fps = cap.get(cv2.CAP_PROP_FPS) or None
-                    cap.release()
-                _add_time_to_angles_csv(angle_csv_dest, fps=angle_fps)
-            except Exception as e:
-                print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig} (重新命名失敗: {e})")
-        elif os.path.exists(angle_csv_orig):
-            angle_csv_dest = angle_csv_orig
-            print(f"  ▶ 關節角度資料 (CSV): {angle_csv_orig}")
-            angle_fps = None
-            if cameras and cameras[0].get('video_path'):
-                cap = cv2.VideoCapture(cameras[0]['video_path'])
-                if cap.isOpened():
-                    angle_fps = cap.get(cv2.CAP_PROP_FPS) or None
-                cap.release()
-            _add_time_to_angles_csv(angle_csv_dest, fps=angle_fps)
 
     avg_step_length = None
     step_analysis = None
 
-    # 【階段三 + 四a】並行：原比例骨架影片疊加 + 步頻分析
+    # 【階段三 + 四a】依序：步頻分析 -> DP 修正 -> 3D/角度 -> 原比例骨架影片疊加
     output_uncropped = None
     output_final_frames_dir = None
     if cameras:
@@ -741,41 +934,93 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         if os.path.exists(offsets_npz) and os.path.exists(kps_npz):
             if progress_callback: progress_callback(90)
             print("\n" + "=" * 60)
-            print("【階段三/四a】並行：骨架影片疊加 + 步頻分析")
+            print("【階段三/四a】步頻分析 → 骨架左右腳修正 → 骨架影片疊加")
             print("=" * 60)
             try:
-                parallel_started_at = time.perf_counter()
+                block_started_at = time.perf_counter()
 
-                def _run_overlay_with_timing():
-                    overlay_started_at = time.perf_counter()
-                    overlay_videos(
-                        cameras=cameras,
-                        offsets_npz=offsets_npz,
-                        kps_npz=kps_npz,
-                        output_video=output_uncropped,
-                        config=config_dict,
+                step_started_at = time.perf_counter()
+                step_analysis = run_step_stride_analysis(
+                    config=config_dict,
+                    output_dir=output_dest,
+                    make_video=False,
+                )
+                _record_timing(timings, "Analysis/step_stride_analysis", step_started_at,
+                               detected_steps=step_analysis.get("detected_steps"))
+
+                # 用已確定交替的落地點當錨點，回頭修正骨架的左右腳身份，
+                # 疊圖影片才會用到修正後的 keypoints。
+                leg_fix_started_at = time.perf_counter()
+                swapped_mask = apply_anchor_leg_correction(kps_npz, step_analysis["step_events"])
+                _record_timing(timings, "Analysis/apply_anchor_leg_correction", leg_fix_started_at)
+
+                foot_npz = os.path.join(final_pose_dir, "input_2D", "foot_keypoints.npz")
+                apply_leg_swap_to_foot_keypoints(foot_npz, swapped_mask)
+                raw_kps_npz = os.path.join(final_pose_dir, "input_2D", "keypoints_raw.npz")
+                align_foot_keypoints_to_body(foot_npz, raw_kps_npz, kps_npz, swapped_mask)
+
+                swap_info = _write_dp_leg_swap_mask(swapped_mask, output_dest)
+
+                # 3D knee/hip angles must be computed from the same left/right
+                # identity that the final 2D overlay uses. The first pose pass is
+                # intentionally 2D-only; run 3D lift + angle computation once here,
+                # after apply_anchor_leg_correction() has written the corrected
+                # input_2D/keypoints.npz.
+                if not only_2d:
+                    recomputed_angle_csv = _rerun_3d_angles_from_corrected_2d(
+                        video_path=tracked_video,
+                        pose_output_dir=final_pose_dir,
+                        output_dest=output_dest,
+                        gpu=gpu,
+                        motion_ag_dir=motion_ag_dir,
+                        timings=timings,
                     )
-                    _record_timing(timings, "Analysis/overlay_original_video", overlay_started_at,
-                                   output_video=output_uncropped)
+                    if recomputed_angle_csv:
+                        angle_csv_dest = recomputed_angle_csv
+                        angle_fps = None
+                        if cameras and cameras[0].get('video_path'):
+                            cap = cv2.VideoCapture(cameras[0]['video_path'])
+                            if cap.isOpened():
+                                angle_fps = cap.get(cv2.CAP_PROP_FPS) or None
+                            cap.release()
+                        _add_time_to_angles_csv(angle_csv_dest, fps=angle_fps)
+                    else:
+                        angle_sync_started_at = time.perf_counter()
+                        angle_sync = _align_angle_csv_to_leg_identity(
+                            angle_csv_dest,
+                            swapped_mask,
+                            output_dir=output_dest,
+                        )
+                        _record_timing(timings, "Analysis/sync_angle_csv_to_leg_identity_fallback",
+                                       angle_sync_started_at,
+                                       swapped_frames=angle_sync.get("swapped_frames") if angle_sync else 0)
+                elif swap_info:
+                    _record_timing(timings, "Analysis/write_dp_leg_swap_mask", leg_fix_started_at,
+                                   swapped_frames=swap_info.get("swapped_frames", 0))
 
-                def _run_step_stride_with_timing():
-                    step_started_at = time.perf_counter()
-                    step_result = run_step_stride_analysis(
-                        config=config_dict,
-                        output_dir=output_dest,
-                        make_video=False,
-                    )
-                    _record_timing(timings, "Analysis/step_stride_analysis", step_started_at,
-                                   detected_steps=step_result.get("detected_steps"))
-                    return step_result
+                refresh_started_at = time.perf_counter()
+                step_analysis = refresh_step_analysis_after_leg_correction(
+                    step_analysis=step_analysis,
+                    config=config_dict,
+                    output_dir=output_dest,
+                    keypoints_npz=kps_npz,
+                    offsets_npz=offsets_npz,
+                )
+                _record_timing(timings, "Analysis/refresh_step_analysis_after_leg_correction",
+                               refresh_started_at)
 
-                with ThreadPoolExecutor(max_workers=2) as _pool:
-                    _fut_overlay = _pool.submit(_run_overlay_with_timing)
-                    _fut_step = _pool.submit(_run_step_stride_with_timing)
+                overlay_started_at = time.perf_counter()
+                overlay_videos(
+                    cameras=cameras,
+                    offsets_npz=offsets_npz,
+                    kps_npz=kps_npz,
+                    output_video=output_uncropped,
+                    config=config_dict,
+                )
+                _record_timing(timings, "Analysis/overlay_original_video", overlay_started_at,
+                               output_video=output_uncropped)
 
-                _fut_overlay.result()
-                step_analysis = _fut_step.result()
-                _record_timing(timings, "Analysis/overlay_and_step_parallel_block", parallel_started_at)
+                _record_timing(timings, "Analysis/step_and_overlay_block", block_started_at)
                 avg_step_length = step_analysis.get("avg_step_length_m")
                 print(f"  ▶ 腳踝位置資料 (CSV): {step_analysis['ankle_csv']}")
                 print(f"  ▶ 步伐事件資料 (CSV): {step_analysis['steps_csv']}")

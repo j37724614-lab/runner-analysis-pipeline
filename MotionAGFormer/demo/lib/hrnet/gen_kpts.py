@@ -19,7 +19,7 @@ import copy
 from lib.hrnet.lib.utils.utilitys import plot_keypoint, PreProcess, write, load_json
 from lib.hrnet.lib.config import cfg, update_config
 from lib.hrnet.lib.utils.transforms import *
-from lib.hrnet.lib.utils.inference import get_final_preds
+from lib.hrnet.lib.utils.inference import get_final_preds_dark
 from lib.hrnet.lib.models import pose_hrnet
 
 cfg_dir = 'demo/lib/hrnet/experiments/'
@@ -34,11 +34,11 @@ from lib.sort.sort import Sort
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Train keypoints network')
     # general
-    parser.add_argument('--cfg', type=str, default=cfg_dir + 'w48_384x288_adam_lr1e-3.yaml',
+    parser.add_argument('--cfg', type=str, default=cfg_dir + 'w48_384x288_wholebody23_dark.yaml',
                         help='experiment configure file name')
     parser.add_argument('opts', nargs=argparse.REMAINDER, default=None,
                         help="Modify config options using the command-line")
-    parser.add_argument('--modelDir', type=str, default=model_dir + 'pose_hrnet_w48_384x288.pth',
+    parser.add_argument('--modelDir', type=str, default=model_dir + 'pose_hrnet_w48_wholebody23_384x288_dark.pth',
                         help='The model directory')
     parser.add_argument('--det-dim', type=int, default=416,
                         help='The input dimension of the detected image')
@@ -178,11 +178,12 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False, bbox_csv
                 inputs = inputs.cuda()
             output = pose_model(inputs)
 
-            # compute coordinate
-            preds, maxvals = get_final_preds(cfg, output.clone().cpu().numpy(), np.asarray(center), np.asarray(scale))
+            # compute coordinate — DarkPose unbiased decode for all joints (body + foot)
+            preds, maxvals = get_final_preds_dark(
+                cfg, output.clone().cpu().numpy(), np.asarray(center), np.asarray(scale))
 
-        kpts = np.zeros((num_peroson, 17, 2), dtype=np.float32)
-        scores = np.zeros((num_peroson, 17), dtype=np.float32)
+        kpts = np.zeros((num_peroson, cfg.MODEL.NUM_JOINTS, 2), dtype=np.float32)
+        scores = np.zeros((num_peroson, cfg.MODEL.NUM_JOINTS), dtype=np.float32)
         for i, kpt in enumerate(preds):
             kpts[i] = kpt
 
@@ -198,7 +199,7 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False, bbox_csv
         # For now, let's return zeros matching shape to avoid crash downstream, or let caller handle.
         # But caller expects valid data. 
         # Better to raise specific error or return empty arrays that check checks.
-        return np.zeros((num_peroson, 0, 17, 2)), np.zeros((num_peroson, 0, 17))
+        return np.zeros((num_peroson, 0, cfg.MODEL.NUM_JOINTS, 2)), np.zeros((num_peroson, 0, cfg.MODEL.NUM_JOINTS))
 
     keypoints = np.array(kpts_result)
     scores = np.array(scores_result)

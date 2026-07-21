@@ -18,10 +18,14 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # 骨架繪製（H36M 17 關節格式）
 # ---------------------------------------------------------------------------
-def show2Dpose_original(kps, img, offset_x, offset_y):
+def show2Dpose_original(kps, img, offset_x, offset_y, foot_kps=None, foot_scores=None):
     """
     在原始影格上繪製 H36M 17 關節格式的 2D 骨架。
     使用 offsets 修正回正確的相機原始空間座標。
+
+    foot_kps/foot_scores（可選）：COCO-WholeBody 腳部 6 點，順序為
+    L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel，
+    連到 H36M 左(6)/右(3)腳踝，同樣套用 offset 修正回原始空間座標。
     """
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
                    [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
@@ -41,6 +45,19 @@ def show2Dpose_original(kps, img, offset_x, offset_y):
         cv2.line(img, (sx, sy), (ex, ey), lcolor if LR[j] else rcolor, thickness)
         cv2.circle(img, (sx, sy), thickness=-1, color=(0, 255, 0), radius=3)
         cv2.circle(img, (ex, ey), thickness=-1, color=(0, 255, 0), radius=3)
+
+    if foot_kps is not None:
+        FOOT_COLOR = (0, 255, 255)
+        RIGHT_ANKLE, LEFT_ANKLE = 3, 6
+        foot_to_ankle = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
+                          (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
+        for fi, ankle_idx in foot_to_ankle:
+            if foot_scores is not None and foot_scores[fi] < 0.3:
+                continue
+            fx, fy = int(foot_kps[fi, 0] + offset_x), int(foot_kps[fi, 1] + offset_y)
+            ax, ay = int(kps[ankle_idx, 0] + offset_x), int(kps[ankle_idx, 1] + offset_y)
+            cv2.line(img, (ax, ay), (fx, fy), FOOT_COLOR, 2)
+            cv2.circle(img, (fx, fy), 4, FOOT_COLOR, -1)
 
     return img
 
@@ -149,6 +166,19 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
         if v_idx < len(orig_frames):
             kps_map[v_idx] = keypoints[i]
 
+    # ── 讀取腳部 keypoints npz（若存在；舊的 17-only checkpoint 輸出不會有這個檔案）──
+    foot_kps_map = {}
+    foot_scores_map = {}
+    foot_npz = os.path.join(os.path.dirname(kps_npz), 'foot_keypoints.npz')
+    if os.path.exists(foot_npz):
+        foot_data = np.load(foot_npz, allow_pickle=True)
+        foot_keypoints = foot_data['keypoints'][0]   # (valid_frames, 6, 2)
+        foot_scores = foot_data['scores'][0]         # (valid_frames, 6)
+        for i, v_idx in enumerate(valid_frames):
+            if v_idx < len(orig_frames) and i < len(foot_keypoints):
+                foot_kps_map[v_idx] = foot_keypoints[i]
+                foot_scores_map[v_idx] = foot_scores[i]
+
     # ── 依相機分組，找出每台相機需要哪些幀 ──
     # 每台相機只開啟一次 VideoCapture，依序讀取所需幀
     num_cams = max(cam_indices) + 1 if len(cam_indices) > 0 else len(cameras)
@@ -216,7 +246,11 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
             if v_idx in kps_map:
                 kps = kps_map[v_idx]
                 off_x, off_y = offsets[v_idx]
-                frame = show2Dpose_original(kps, frame, off_x, off_y)
+                frame = show2Dpose_original(
+                    kps, frame, off_x, off_y,
+                    foot_kps=foot_kps_map.get(v_idx),
+                    foot_scores=foot_scores_map.get(v_idx),
+                )
 
             out.write(frame)
             pbar.update(1)

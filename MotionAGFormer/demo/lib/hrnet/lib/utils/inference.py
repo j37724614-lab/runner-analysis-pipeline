@@ -12,6 +12,7 @@ import math
 import sys
 import os.path as osp
 import numpy as np
+import cv2
 
 sys.path.insert(0, osp.join(osp.dirname(osp.realpath(__file__)), '..'))
 from utils.transforms import transform_preds
@@ -74,6 +75,73 @@ def get_final_preds(config, batch_heatmaps, center, scale):
     preds = coords.copy()
 
     # Transform back
+    for i in range(coords.shape[0]):
+        preds[i] = transform_preds(
+            coords[i], center[i], scale[i], [heatmap_width, heatmap_height]
+        )
+
+    return preds, maxvals
+
+
+def _dark_gaussian_blur(heatmaps, kernel=11):
+    """Blur each heatmap channel while preserving its peak value (DarkPose pre-step)."""
+    heatmaps = heatmaps.copy()
+    border = (kernel - 1) // 2
+    batch_size, num_joints, height, width = heatmaps.shape
+    for i in range(batch_size):
+        for j in range(num_joints):
+            origin_max = np.max(heatmaps[i, j])
+            if origin_max <= 0:
+                continue
+            dr = np.zeros((height + 2 * border, width + 2 * border), dtype=np.float32)
+            dr[border:-border, border:-border] = heatmaps[i, j]
+            dr = cv2.GaussianBlur(dr, (kernel, kernel), 0)
+            heatmaps[i, j] = dr[border:-border, border:-border]
+            heatmaps[i, j] *= origin_max / np.max(heatmaps[i, j])
+    return heatmaps
+
+
+def _dark_taylor(heatmap, coord):
+    """Sub-pixel refine one (x, y) coord via 2nd-order Taylor expansion of the heatmap."""
+    heatmap_height, heatmap_width = heatmap.shape
+    px, py = int(coord[0]), int(coord[1])
+    if 1 < px < heatmap_width - 2 and 1 < py < heatmap_height - 2:
+        dx = 0.5 * (heatmap[py, px + 1] - heatmap[py, px - 1])
+        dy = 0.5 * (heatmap[py + 1, px] - heatmap[py - 1, px])
+        dxx = 0.25 * (heatmap[py, px + 2] - 2 * heatmap[py, px] + heatmap[py, px - 2])
+        dxy = 0.25 * (heatmap[py + 1, px + 1] - heatmap[py - 1, px + 1]
+                       - heatmap[py + 1, px - 1] + heatmap[py - 1, px - 1])
+        dyy = 0.25 * (heatmap[py + 2, px] - 2 * heatmap[py, px] + heatmap[py - 2, px])
+        derivative = np.array([dx, dy])
+        hessian = np.array([[dxx, dxy], [dxy, dyy]])
+        det = dxx * dyy - dxy ** 2
+        if det != 0:
+            offset = -np.linalg.inv(hessian) @ derivative
+            coord = coord + offset
+    return coord
+
+
+def get_final_preds_dark(config, batch_heatmaps, center, scale, kernel=11):
+    """DarkPose unbiased decoding: Gaussian blur + Taylor-expansion sub-pixel refinement.
+
+    Matches the officially validated post-processing for the HRNet-W48 DarkPose+
+    COCO-WholeBody checkpoint (modulate_kernel=11, unbiased_decoding=True in its
+    source MMPose config).
+    """
+    coords, maxvals = get_max_preds(batch_heatmaps)
+
+    heatmap_height = batch_heatmaps.shape[2]
+    heatmap_width = batch_heatmaps.shape[3]
+
+    blurred = _dark_gaussian_blur(batch_heatmaps, kernel)
+    blurred = np.clip(blurred, 1e-10, 50)
+    log_heatmaps = np.log(blurred)
+
+    for n in range(coords.shape[0]):
+        for p in range(coords.shape[1]):
+            coords[n, p] = _dark_taylor(log_heatmaps[n, p], coords[n, p])
+
+    preds = coords.copy()
     for i in range(coords.shape[0]):
         preds[i] = transform_preds(
             coords[i], center[i], scale[i], [heatmap_width, heatmap_height]
