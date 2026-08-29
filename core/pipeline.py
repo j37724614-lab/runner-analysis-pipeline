@@ -11,23 +11,23 @@ core/pipeline.py
 提供一鍵分析介面 `run_analysis` 與完整排程介面 `run_pipeline`。
 """
 
-import os
-import sys
 import json
+import os
 import shutil
-import argparse
 import subprocess
+import sys
 import time
 from pathlib import Path
-import numpy as np
+
 import cv2
+import numpy as np
 import pandas as pd
 
-from core.utils import REPO_ROOT, convert_to_web_compatible_mp4
 from core import tracking as tcr
-from core.visualization import add_angle_overlay
-from core.overlay import overlay_videos
+from core.overlay import overlay_videos, overlay_videos_per_camera
 from core.tracker_impl import compute_speed_from_bbox_map
+from core.utils import REPO_ROOT, convert_to_web_compatible_mp4
+from core.visualization import add_angle_overlay
 from scripts.analysis.ankle_step_stride import (
     align_foot_keypoints_to_body,
     annotate_step_stride_video,
@@ -35,6 +35,7 @@ from scripts.analysis.ankle_step_stride import (
     apply_leg_swap_to_foot_keypoints,
     refresh_step_analysis_after_leg_correction,
     run_step_stride_analysis,
+    update_leg_swap_metadata,
 )
 
 
@@ -112,6 +113,177 @@ def _copy_output_final_to_keypoints_archive(final_pose_dir: str, output_video: s
     return copied_video
 
 
+def _export_homography_review_videos(
+    cameras,
+    steps_csv: str | None,
+    output_dest: str,
+    timeline_video: str | None = None,
+    schematic_enabled: bool = False,
+    schematic_px_per_meter: float = 75.0,
+    schematic_padding_px: int = 60,
+    full_trial_px_per_meter: float = 30.0,
+) -> list[str]:
+    """Export calibrated camera review plus a stitched full-trial schematic.
+
+    The normal camera overlays remain the source of truth for image-space pose.
+    This companion output is deliberately per camera: it shows the same step
+    anchors in world coordinates with distance labels, without pretending that
+    independently calibrated cameras are one continuous raster image. The
+    final-camera warp remains available for detailed inspection. When all
+    participating cameras have six ground controls, a second output joins them
+    on the pipeline's global distance and frame axes. That full-trial output is
+    schematic by design: only ground-plane coordinates are transformed, never
+    the runner pixels.
+    """
+    if not steps_csv or not os.path.exists(steps_csv):
+        return []
+
+    tool_path = REPO_ROOT / "scripts" / "tools" / "rectify_video_from_cone_points.py"
+    schematic_tool_path = REPO_ROOT / "scripts" / "tools" / "render_schematic_topdown_review.py"
+    outputs = []
+    if not cameras:
+        return outputs
+
+    cam_idx = len(cameras) - 1
+    camera = cameras[cam_idx]
+    src = camera.get("homography_src_points")
+    dst = camera.get("homography_dst_world")
+    video_path = camera.get("video_path")
+    if not video_path or not os.path.exists(video_path) or not isinstance(src, list) or not isinstance(dst, list):
+        return outputs
+    # Flutter's calibrated runway workflow defines six control points.
+    # Requiring the complete set keeps the displayed metre scale consistent
+    # with the same calibration used by step/landing analysis.
+    if len(src) != 6 or len(dst) != 6:
+        return outputs
+
+    points_path = Path(output_dest) / f"topdown_review_cam{cam_idx + 1}_controls.json"
+    points = [
+        {
+            "id": index + 1,
+            "x": float(image_pt[0]),
+            "y": float(image_pt[1]),
+            "world_x_m": float(world_pt[0]),
+            "world_y_m": float(world_pt[1]),
+        }
+        for index, (image_pt, world_pt) in enumerate(zip(src, dst))
+    ]
+    points_path.write_text(json.dumps({"points": points}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    generic_output = Path(output_dest) / "homography_rectified_preview.mp4"
+    final_output = Path(output_dest) / f"cam{cam_idx + 1}_topdown_review.mp4"
+    try:
+        subprocess.run(
+            [
+                sys.executable, str(tool_path),
+                "--video", str(video_path),
+                "--points-json", str(points_path),
+                "--output-dir", str(output_dest),
+                "--control-count", str(len(points)),
+                "--px-per-meter", "100",
+                "--padding-px", "40",
+                "--max-frames", "0",
+                "--step-events-csv", str(steps_csv),
+                "--camera-index", str(cam_idx),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if generic_output.exists():
+            os.replace(generic_output, final_output)
+            outputs.append(str(final_output))
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  ▶ Cam {cam_idx + 1} 俯視回顧影片輸出失敗: {exc}")
+
+    # Optional schematic review: equal-scale runway, projected contacts, and a
+    # fixed-size runner glyph. It is deliberately disabled by default while
+    # the visual treatment is being evaluated in the front-end workflow.
+    if schematic_enabled:
+        metrics_path = Path(output_dest) / "metrics.csv"
+        schematic_output = Path(output_dest) / f"cam{cam_idx + 1}_topdown_schematic_review.mp4"
+        if metrics_path.exists():
+            try:
+                subprocess.run(
+                    [
+                        sys.executable, str(schematic_tool_path),
+                        "--video", str(video_path),
+                        "--points-json", str(points_path),
+                        "--metrics-csv", str(metrics_path),
+                        "--step-events-csv", str(steps_csv),
+                        "--output", str(schematic_output),
+                        "--camera-index", str(cam_idx),
+                        "--px-per-meter", str(schematic_px_per_meter),
+                        "--padding-px", str(schematic_padding_px),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if schematic_output.exists():
+                    outputs.append(str(schematic_output))
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"  ▶ Cam {cam_idx + 1} 俯視示意影片輸出失敗: {exc}")
+        else:
+            print(f"  ▶ 略過 Cam {cam_idx + 1} 俯視示意影片：找不到 {metrics_path}")
+
+    metrics_path = Path(output_dest) / "metrics.csv"
+    timeline_path = Path(timeline_video) if timeline_video else None
+    complete_calibrations = []
+    for index, current_camera in enumerate(cameras):
+        current_src = current_camera.get("homography_src_points")
+        current_dst = current_camera.get("homography_dst_world")
+        if not isinstance(current_src, list) or not isinstance(current_dst, list):
+            complete_calibrations = []
+            break
+        if len(current_src) != 6 or len(current_dst) != 6:
+            complete_calibrations = []
+            break
+        complete_calibrations.append(
+            {
+                "camera_index": index,
+                "image_points": [[float(point[0]), float(point[1])] for point in current_src],
+                "world_points": [[float(point[0]), float(point[1])] for point in current_dst],
+            }
+        )
+
+    if (
+        complete_calibrations
+        and timeline_path is not None
+        and timeline_path.exists()
+        and metrics_path.exists()
+    ):
+        calibrations_path = Path(output_dest) / "trial_topdown_calibrations.json"
+        calibrations_path.write_text(
+            json.dumps({"cameras": complete_calibrations}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        full_trial_output = Path(output_dest) / "trial_topdown_review.mp4"
+        try:
+            subprocess.run(
+                [
+                    sys.executable, str(schematic_tool_path),
+                    "--video", str(timeline_path),
+                    "--calibrations-json", str(calibrations_path),
+                    "--metrics-csv", str(metrics_path),
+                    "--step-events-csv", str(steps_csv),
+                    "--output", str(full_trial_output),
+                    "--px-per-meter", str(full_trial_px_per_meter),
+                    "--padding-px", str(schematic_padding_px),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if full_trial_output.exists():
+                outputs.append(str(full_trial_output))
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  ▶ 完整賽事俯視路徑影片輸出失敗: {exc}")
+    else:
+        print("  ▶ 略過完整賽事俯視路徑：所有鏡頭皆需 6 點校正、metrics 與完整影片")
+    return outputs
+
+
 def _export_video_frames(video_path: str, output_root: str, folder_name: str = "final_video_frames"):
     """Export every frame of a final video as PNG under output_root/folder_name/video_stem."""
     if not video_path or not os.path.exists(video_path):
@@ -181,29 +353,39 @@ def _add_time_to_angles_csv(angle_csv_path: str | None, video_path: str | None =
         df.to_csv(angle_csv_path, index=False)
         print(f"  ▶ 已補齊角度時間欄位: {angle_csv_path} (fps={resolved_fps:.3f})")
         return angle_csv_path
-    except Exception as e:
+    except (OSError, ValueError, TypeError, KeyError, pd.errors.ParserError) as e:
         print(f"  ▶ 補齊角度時間欄位失敗: {e}")
         return None
 
 
-def _write_dp_leg_swap_mask(swapped_mask, output_dir: str | None = None):
-    """Persist which frames had their 2D leg identity swapped by anchor DP."""
+def _write_dp_leg_swap_mask(swapped_mask, output_dir: str | None = None,
+                            pre_dp_swapped_mask=None, anchor_dp_swapped_mask=None):
+    """Persist final raw-to-output swaps and optional component masks."""
     if swapped_mask is None or not output_dir:
         return None
 
     try:
         swapped = np.asarray(swapped_mask, dtype=bool)
         swap_csv = os.path.join(output_dir, "dp_leg_identity_swaps.csv")
-        pd.DataFrame({
+        columns = {
             "frame": np.arange(len(swapped), dtype=int),
             "dp_leg_swapped": swapped,
-        }).to_csv(swap_csv, index=False)
+        }
+        if pre_dp_swapped_mask is not None:
+            pre = np.asarray(pre_dp_swapped_mask, dtype=bool).reshape(-1)
+            columns["pre_dp_leg_swapped"] = np.pad(
+                pre[:len(swapped)], (0, max(0, len(swapped) - len(pre))))
+        if anchor_dp_swapped_mask is not None:
+            anchor = np.asarray(anchor_dp_swapped_mask, dtype=bool).reshape(-1)
+            columns["anchor_dp_leg_swapped"] = np.pad(
+                anchor[:len(swapped)], (0, max(0, len(swapped) - len(anchor))))
+        pd.DataFrame(columns).to_csv(swap_csv, index=False)
         print(f"  ▶ DP 左右腿交換紀錄: {swap_csv}")
         return {
             "swap_csv": swap_csv,
             "swapped_frames": int(swapped.sum()),
         }
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         print(f"  ▶ 寫出 DP 左右腿交換紀錄失敗: {e}")
         return None
 
@@ -262,7 +444,7 @@ def _align_angle_csv_to_leg_identity(angle_csv_path: str | None, swapped_mask, o
             "swapped_frames": swapped_count,
             "applied_pairs": applied_pairs,
         }
-    except Exception as e:
+    except (OSError, ValueError, TypeError, KeyError, pd.errors.ParserError) as e:
         print(f"  ▶ 同步 DP 左右腿身份到角度 CSV 失敗: {e}")
         return None
 
@@ -354,7 +536,7 @@ def _rerun_3d_angles_from_corrected_2d(
             return None
         try:
             archive_dir = Path(pointer_path).read_text(encoding="utf-8").strip()
-        except Exception:
+        except (OSError, UnicodeError):
             return None
         candidate = Path(archive_dir) / "cam1_tracked.mp4"
         return str(candidate) if candidate.exists() else None
@@ -385,7 +567,7 @@ def _rerun_3d_angles_from_corrected_2d(
                     "  ▶ 警告：3D 重算影片尺寸可能與 keypoints 座標系不一致，"
                     f"video={video_w:.0f}x{video_h:.0f}, keypoints max=({kp_max_x:.1f},{kp_max_y:.1f})"
                 )
-    except Exception as e:
+    except (OSError, ValueError, TypeError, KeyError, IndexError, cv2.error) as e:
         print(f"  ▶ 檢查 3D 重算影片尺寸失敗，繼續使用原影片: {e}")
 
     _saved_argv = sys.argv[:]
@@ -417,7 +599,7 @@ def _rerun_3d_angles_from_corrected_2d(
         shutil.copy2(angle_csv_orig, angle_csv_dest)
         print(f"  ▶ 已用 DP 修正後 2D keypoints 重算 3D 角度: {angle_csv_dest}")
         return angle_csv_dest
-    except Exception as e:
+    except OSError as e:
         print(f"  ▶ 複製重算後角度 CSV 失敗: {e}")
         return angle_csv_orig
 
@@ -554,7 +736,7 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str,
         _record_timing(timings, "Step1/two_pass_write_debug_csv", debug_started_at)
         if tcr.AUTO_CROP:
             crop_started_at = time.perf_counter()
-            crop_side, sel_bw, sel_bh = tcr._auto_crop_from_selected_cache(frame_cache, preset_ids)
+            crop_side, sel_bw, _sel_bh = tcr._auto_crop_from_selected_cache(frame_cache, preset_ids)
             _record_timing(timings, "Step1/two_pass_auto_crop_from_selected_bbox", crop_started_at,
                            bbox_samples=len(sel_bw), crop_side=crop_side)
             if crop_side:
@@ -596,7 +778,7 @@ def step1_track(cameras_cfg: list, extra_cfg: dict, gpu: str, output_dir: str,
 
 def step2_pose(tracked_video_path: str, output_base_dir: str,
                 only_2d: bool, gpu: str, motion_ag_dir: Path, skip_video: bool = False,
-                timings: list | None = None) -> str:
+                timings: list | None = None, pose_model_path: str | None = None) -> str:
     """
     Step 2：進行 2D/3D 姿態估計與關節角度分析。
     """
@@ -621,7 +803,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
             print(f"  [Step 2] 偵測到舊的 {folder_name} 資料夾，進行清理以避免新舊影格污染...")
             try:
                 shutil.rmtree(folder_path)
-            except Exception as e:
+            except OSError as e:
                 print(f"  ⚠️  [Step 2] 清理 {folder_name} 失敗: {e}")
 
     print("=" * 60)
@@ -644,6 +826,7 @@ def step2_pose(tracked_video_path: str, output_base_dir: str,
             gpu=gpu,
             bbox_csv=bbox_csv_path,
             skip_video=skip_video,
+            model_path=pose_model_path,
         )
         _record_timing(timings, "Step2/pose_estimation_total", pose_started_at,
                        video_path=abs_video_path,
@@ -672,7 +855,7 @@ def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None
     print("=" * 60)
 
     if not os.path.exists(csv_path):
-        print(f"  ⚠️  [Step 3] 角度 CSV 不存在，略過 Step 3 合併 (可能是 only_2d=True)")
+        print("  ⚠️  [Step 3] 角度 CSV 不存在，略過 Step 3 合併 (可能是 only_2d=True)")
         return None
     if not os.path.exists(video_2d):
         print(f"  ⚠️  [Step 3] 2D 骨架影片不存在: {video_2d}，略過")
@@ -696,7 +879,7 @@ def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None
                 for c in saved_cfg.get('cameras', [])
                 if c.get('video_path')
             ]
-        except Exception as e:
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError) as e:
             print(f"  [Step 3] 無法讀取 config 暫存: {e}")
 
     add_angle_overlay(
@@ -720,7 +903,7 @@ def step3_overlay(pose_output_dir: str, video_stem: str, gpu: str) -> str | None
 # CLI/Python Orchestration API
 # -----------------------------------------------------------------------
 
-def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
+def run_pipeline(cameras: list, extra_cfg: dict | None = None, output_dir: str | None = None,
                  gpu: str = "0", only_2d: bool = False, skip_track: bool = False,
                  skip_video: bool = False, timings: list | None = None) -> dict:
     """
@@ -747,9 +930,9 @@ def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
             # 嘗試搜尋資料夾下的影片
             videos = [f for f in os.listdir(output_dir) if f.endswith(".mp4") and not f.endswith("_2D.mp4")]
             if videos:
-                tracked_video = os.path.join(output_dir, sorted(videos)[0])
+                tracked_video = os.path.join(output_dir, min(videos))
             else:
-                raise FileNotFoundError(f"找不到已追蹤的影片，無法略過 Step 1")
+                raise FileNotFoundError("找不到已追蹤的影片，無法略過 Step 1")
 
     # 保存設定資訊供 Step 3 重構底圖使用
     config_dict = {"cameras": cameras}
@@ -759,8 +942,10 @@ def run_pipeline(cameras: list, extra_cfg: dict = None, output_dir: str = None,
         json.dump(config_dict, f, ensure_ascii=False, indent=2)
 
     # Step 2: 2D/3D 姿態估計
-    pose_dir = step2_pose(tracked_video, output_dir, only_2d, gpu, motion_ag_dir,
-                          skip_video=skip_video, timings=timings)
+    pose_dir = step2_pose(
+        tracked_video, output_dir, only_2d, gpu, motion_ag_dir,
+        skip_video=skip_video, timings=timings,
+        pose_model_path=extra_cfg.get('pose_model_path'))
 
     # Step 3: 折線圖圖表合併
     overlay_video = None
@@ -798,8 +983,24 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
         # speed/distance metrics are based on start/end line scaling.  Keep the
         # tracking path on that calibration so existing velocity outputs do not
         # change when homography is enabled for step length.
+        dst_world = tracking_cam.pop("homography_dst_world", None)
         tracking_cam.pop("homography_src_points", None)
-        tracking_cam.pop("homography_dst_world", None)
+        # 6-point homography cameras only carry start_line/end_line as a
+        # tracking-ROI approximation (synthesized from the two extreme
+        # world_x_m calibration points, see _camera_config_from_homography_
+        # anchors() in the backend); they never set distance_m, since that
+        # would make _make_calibration() prefer this line-projection scale
+        # over the real homography for step length. Without distance_m here
+        # though, compute_speed_from_bbox_map() gets no calibration at all
+        # and the trial's velocity/speed metrics come back empty. Derive an
+        # approximate distance_m from the same world_x_m span, scoped to
+        # this stripped copy only, so speed metrics behave like the 4-point
+        # line-projection case without touching step-length calibration.
+        if tracking_cam.get("distance_m") is None and dst_world and tracking_cam.get("start_line") and tracking_cam.get("end_line"):
+            world_xs = [pt[0] for pt in dst_world]
+            span = max(world_xs) - min(world_xs)
+            if span > 0:
+                tracking_cam["distance_m"] = span
         tracking_cameras.append(tracking_cam)
     if not output_dest:
         output_dest = config_dict.get("output_dest")
@@ -820,7 +1021,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
             try:
                 os.remove(stale_angle_csv)
                 print(f"  ▶ 已清除舊角度 CSV，等待 DP 後重新產生: {stale_angle_csv}")
-            except Exception as e:
+            except OSError as e:
                 print(f"  ▶ 清除舊角度 CSV 失敗，後續將嘗試覆蓋: {e}")
 
     extra_cfg = {k: v for k, v in config_dict.items() if k != "cameras"}
@@ -872,9 +1073,15 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     if _cap.isOpened():
                         fps_val = _cap.get(cv2.CAP_PROP_FPS) or 60.0
                         _cap.release()
+                requested_speed_mode = str(config_dict.get(
+                    "speed_mode",
+                    "homography" if any(c.get("homography_src_points") for c in cameras) else "pixel",
+                )).lower()
                 all_track_data = compute_speed_from_bbox_map(
-                    bbox_map_path, tracking_cameras, fps_override=fps_val,
-                    offsets_npz=offsets_npz_path)
+                    bbox_map_path, cameras, fps_override=fps_val,
+                    offsets_npz=offsets_npz_path,
+                    pixel_cameras_cfg_list=tracking_cameras,
+                    speed_mode=requested_speed_mode)
                 if all_track_data:
                     import csv as _csv_mod
                     with open(metrics_csv_dest, 'w', newline='', encoding='utf-8') as _f:
@@ -884,13 +1091,18 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                                 'dist_m', 'dist_raw_m', 'dist_smooth_m',
                                 'world_x', 'image_point_x', 'image_point_y',
                                 'speed_mps', 'accel_mps2',
+                                'speed_mode_used',
+                                'dist_pixel_m', 'speed_pixel_mps', 'accel_pixel_mps2',
+                                'dist_homography_m', 'speed_homography_mps', 'accel_homography_mps2',
                                 'is_interpolated', 'interp_gap_len', 'speed_confidence'])
                         _w.writeheader()
                         _w.writerows(all_track_data)
                     print(f"  ▶ 速度分析完成，{len(all_track_data)} 幀 → {metrics_csv_dest}")
                 else:
                     print("  ▶ 速度計算未產出資料（無 calibration 資訊或 bbox 不足）")
-            except Exception as _e:
+            # Speed analysis is optional; isolate failures from third-party
+            # numerical and video code so the primary pose result survives.
+            except Exception as _e:  # noqa: BLE001
                 print(f"  ▶ 速度計算失敗: {_e}")
         else:
             print(f"  ▶ bbox_map.csv 不存在，速度分析略過: {bbox_map_path}")
@@ -951,15 +1163,34 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 # 用已確定交替的落地點當錨點，回頭修正骨架的左右腳身份，
                 # 疊圖影片才會用到修正後的 keypoints。
                 leg_fix_started_at = time.perf_counter()
-                swapped_mask = apply_anchor_leg_correction(kps_npz, step_analysis["step_events"])
+                anchor_swapped_mask = apply_anchor_leg_correction(
+                    kps_npz, step_analysis["step_events"])
                 _record_timing(timings, "Analysis/apply_anchor_leg_correction", leg_fix_started_at)
 
+                status_npz = os.path.join(
+                    final_pose_dir, "input_2D", "keypoint_status.npz")
+                pre_dp_swapped_mask = None
+                if os.path.exists(status_npz):
+                    with np.load(status_npz, allow_pickle=True) as status_data:
+                        if "pre_dp_leg_swap_mask" in status_data.files:
+                            pre_dp_swapped_mask = np.asarray(
+                                status_data["pre_dp_leg_swap_mask"], dtype=bool)
+                            if pre_dp_swapped_mask.ndim == 2:
+                                pre_dp_swapped_mask = pre_dp_swapped_mask[0]
+
+                swapped_mask = update_leg_swap_metadata(
+                    kps_npz, pre_dp_swapped_mask, anchor_swapped_mask)
                 foot_npz = os.path.join(final_pose_dir, "input_2D", "foot_keypoints.npz")
                 apply_leg_swap_to_foot_keypoints(foot_npz, swapped_mask)
                 raw_kps_npz = os.path.join(final_pose_dir, "input_2D", "keypoints_raw.npz")
                 align_foot_keypoints_to_body(foot_npz, raw_kps_npz, kps_npz, swapped_mask)
 
-                swap_info = _write_dp_leg_swap_mask(swapped_mask, output_dest)
+                swap_info = _write_dp_leg_swap_mask(
+                    swapped_mask,
+                    output_dest,
+                    pre_dp_swapped_mask=pre_dp_swapped_mask,
+                    anchor_dp_swapped_mask=anchor_swapped_mask,
+                )
 
                 # 3D knee/hip angles must be computed from the same left/right
                 # identity that the final 2D overlay uses. The first pose pass is
@@ -1005,6 +1236,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     output_dir=output_dest,
                     keypoints_npz=kps_npz,
                     offsets_npz=offsets_npz,
+                    foot_npz=foot_npz,
                 )
                 _record_timing(timings, "Analysis/refresh_step_analysis_after_leg_correction",
                                refresh_started_at)
@@ -1047,6 +1279,60 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 _record_timing(timings, "Analysis/annotate_step_stride_video", annotate_started_at,
                                output_video=output_uncropped)
 
+                # 【階段四c】各相機獨立骨架+落地點疊圖影片（給跳遠三鏡頭回放頁面用，
+                # 不是給前端合成影片用的 output_final.mp4，是三支各自獨立的檔案）
+                per_camera_started_at = time.perf_counter()
+                per_camera_output_paths = [
+                    os.path.join(output_dest, f"cam{i + 1}_overlay.mp4")
+                    for i in range(len(cameras))
+                ]
+                try:
+                    overlay_videos_per_camera(
+                        cameras=cameras,
+                        offsets_npz=offsets_npz,
+                        kps_npz=kps_npz,
+                        ankle_rows=step_analysis["ankle_rows"],
+                        step_events=step_analysis["step_events"],
+                        output_paths=per_camera_output_paths,
+                        config=config_dict,
+                    )
+                    for cam_output_path in per_camera_output_paths:
+                        if os.path.exists(cam_output_path):
+                            convert_to_web_compatible_mp4(cam_output_path)
+                    _record_timing(timings, "Analysis/overlay_videos_per_camera", per_camera_started_at,
+                                   output_videos=per_camera_output_paths)
+                # Per-camera review videos are optional and call third-party
+                # video code whose exception types are not part of its API.
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ▶ 各相機獨立疊圖產生失敗（不影響主要分析結果）: {e}")
+
+                # 【階段四d】Homography 場地俯視回顧。僅對完整地面控制點校正的
+                # 相機輸出，避免沒有實際公尺座標的普通跑步 session 顯示
+                # 看似精確、實際上不可靠的俯視圖。
+                topdown_started_at = time.perf_counter()
+                topdown_outputs = _export_homography_review_videos(
+                    cameras=cameras,
+                    steps_csv=step_analysis.get("steps_csv"),
+                    output_dest=output_dest,
+                    timeline_video=output_uncropped,
+                    schematic_enabled=bool(config_dict.get("schematic_topdown_enabled", False)),
+                    schematic_px_per_meter=float(
+                        config_dict.get("schematic_topdown_px_per_meter", 75.0)
+                    ),
+                    schematic_padding_px=int(
+                        config_dict.get("schematic_topdown_padding_px", 60)
+                    ),
+                    full_trial_px_per_meter=float(
+                        config_dict.get("full_trial_topdown_px_per_meter", 30.0)
+                    ),
+                )
+                _record_timing(
+                    timings,
+                    "Analysis/homography_topdown_review_videos",
+                    topdown_started_at,
+                    output_videos=topdown_outputs,
+                )
+
                 # 轉碼為 H.264 Web 相容格式
                 print("\n  ▶ 正在將影片轉換為 Web 播放相容格式...")
                 transcode_started_at = time.perf_counter()
@@ -1078,7 +1364,9 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                     os.remove(tracked_video)
                     print(f"    - 已移除置中裁剪追蹤影片: {tracked_video}")
 
-            except Exception as e:
+            # This optional export stage combines several external video and
+            # analysis modules; its failure must not discard the main result.
+            except Exception as e:  # noqa: BLE001
                 print(f"匯出未裁切影片失敗: {e}")
 
     print("\n" + "=" * 60)
@@ -1104,7 +1392,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 total_time = float((df["absolute_frame"].max() + 1) / fps_val)
                 avg_velocity = float(df["speed_mps"].mean())
                 avg_acceleration = float(df["accel_mps2"].mean())
-        except Exception as e:
+        except (OSError, ValueError, TypeError, KeyError, pd.errors.ParserError) as e:
             print(f"指標計算異常: {e}")
 
     # Fallback: metrics.csv 缺失時從 frame_map CSV 估算 total_time，避免 DB NOT NULL 失敗
@@ -1125,7 +1413,7 @@ def run_analysis(config_dict, gpu="0", only_2d=False, skip_track=False, output_d
                 if not df_fm.empty and "orig_frame" in df_fm.columns:
                     total_time = float((df_fm["orig_frame"].max() + 1) / fps_val)
                     print(f"  [fallback] total_time 從 frame_map 估算: {total_time:.2f}s")
-        except Exception as e:
+        except (OSError, ValueError, TypeError, KeyError, pd.errors.ParserError) as e:
             print(f"  [fallback] total_time 計算異常: {e}")
 
     if total_time is None:

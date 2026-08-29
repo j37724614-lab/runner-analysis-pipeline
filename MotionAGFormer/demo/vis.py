@@ -643,7 +643,8 @@ def _correct_arm_swaps(kp, lookback=7, threshold=0.75):
     return result
 
 
-def _correct_leg_swaps(kp, lookback=7, threshold=0.75, crossing_dist=12.0):
+def _correct_leg_swaps(kp, lookback=7, threshold=0.75, crossing_dist=12.0,
+                       return_swap_mask=False):
     """
     Detect frames where HRNet swapped anatomical L/R leg labels and correct them.
 
@@ -672,6 +673,7 @@ def _correct_leg_swaps(kp, lookback=7, threshold=0.75, crossing_dist=12.0):
 
     T = kp.shape[0]
     result = kp.copy()
+    swap_mask = np.zeros(T, dtype=bool)
 
     def swap_cost(ref, l_knee, l_ankle, r_knee, r_ankle):
         l_knee_ref = np.median(ref[:, L_KNEE] - ref[:, L_HIP], axis=0)
@@ -712,7 +714,10 @@ def _correct_leg_swaps(kp, lookback=7, threshold=0.75, crossing_dist=12.0):
             result[t, R_HIP] = kp[t, L_HIP]
             result[t, R_KNEE] = kp[t, L_KNEE]
             result[t, R_ANKLE] = kp[t, L_ANKLE]
+            swap_mask[t] = True
 
+    if return_swap_mask:
+        return result, swap_mask
     return result
 
 
@@ -852,56 +857,6 @@ def _prefill_low_confidence(kp, sc, conf_threshold):
     return filled
 
 
-def _compute_video_vector_thresholds(kp, sc, conf_threshold=0.50,
-                                     percentile=95.0,
-                                     crossing_dist=12.0,
-                                     min_samples=20):
-    """Estimate per-video thresholds for parent-relative leg-vector jumps.
-
-    The raw HRNet confidence is intentionally used here even if coordinates were
-    prefilled earlier. Low-confidence observations are excluded from the
-    statistics so the threshold describes normal visible motion, not detector
-    failure magnitude.
-    """
-    T, J = sc.shape
-    thresholds = _JOINT_MAX_PX[:J].astype(np.float32, copy=True)
-    sample_counts = np.zeros(J, dtype=np.int32)
-    threshold_source = np.array(['global_px'] * J, dtype=object)
-
-    if T < 2:
-        return thresholds, sample_counts, threshold_source
-
-    crossing = _detect_ankle_crossing(kp, crossing_dist)
-    usable_pair_base = (~crossing[1:]) & (~crossing[:-1])
-
-    for joint_idx, parent_idx in _LEG_PARENT.items():
-        if joint_idx >= J or parent_idx >= J:
-            continue
-
-        pair_good = (
-            usable_pair_base &
-            (sc[1:, joint_idx] >= conf_threshold) &
-            (sc[:-1, joint_idx] >= conf_threshold) &
-            (sc[1:, parent_idx] >= conf_threshold) &
-            (sc[:-1, parent_idx] >= conf_threshold)
-        )
-
-        rel = kp[:, joint_idx, :2] - kp[:, parent_idx, :2]
-        jumps = np.linalg.norm(rel[1:] - rel[:-1], axis=1)
-        values = jumps[pair_good & np.isfinite(jumps)]
-        sample_counts[joint_idx] = int(values.size)
-        if values.size < min_samples:
-            continue
-
-        video_threshold = float(np.percentile(values, percentile))
-        floor = float(_VIDEO_VECTOR_THRESHOLD_FLOOR[joint_idx])
-        ceil = float(_VIDEO_VECTOR_THRESHOLD_CEIL[joint_idx])
-        thresholds[joint_idx] = float(np.clip(video_threshold, floor, ceil))
-        threshold_source[joint_idx] = f'video_vector_p{int(percentile)}'
-
-    return thresholds, sample_counts, threshold_source
-
-
 def _smooth_keypoints_sg(keypoints, scores,
                           conf_threshold=0.50,
                           sg_window=7,
@@ -916,8 +871,9 @@ def _smooth_keypoints_sg(keypoints, scores,
     離線平滑：confidence 過濾 → 雙側孤立點偵測 → 線性插值 → Savitzky-Golay。
 
     Phase 1: 低信心幀標記（conf < conf_threshold）
-    Phase 2: 雙側孤立點偵測 — frame t 若與前後幀距離均超過 _JOINT_MAX_PX（p95），
-             且前後幀彼此距離較小，則視為孤立跳點
+    Phase 2: 非腿部雙側孤立點偵測 — frame t 若與前後幀距離均超過
+             _JOINT_MAX_PX，且前後幀彼此距離較小，則視為孤立跳點。
+             hip/knee/ankle 六點延後至 anchor DP 後才統計與判斷。
     Phase 3: 若同一幀壞點過多，整幀視為不可靠，避免半套錯骨架留下來
     Phase 4: np.interp 線性插值補壞點
     Phase 5: Savitzky-Golay 平滑整段軌跡
@@ -951,6 +907,10 @@ def _smooth_keypoints_sg(keypoints, scores,
         'video_thresholds': np.zeros((M, J), dtype=np.float32),
         'video_threshold_sample_counts': np.zeros((M, J), dtype=np.int32),
         'threshold_source': np.empty((M, J), dtype=object),
+        # Per-frame identity correction applied before the anchor-based DP pass.
+        # Foot side-channel points must include this mask when computing their
+        # final L/R permutation; otherwise body and feet can differ by one swap.
+        'pre_dp_leg_swap_mask': np.zeros((M, T), dtype=bool),
     }
 
     for person_idx in range(M):
@@ -964,16 +924,24 @@ def _smooth_keypoints_sg(keypoints, scores,
         # temporally continuous.
         smoothed[person_idx] = _prefill_low_confidence(smoothed[person_idx], scores[person_idx], conf_threshold)
         smoothed[person_idx] = _correct_arm_swaps(smoothed[person_idx])
-        smoothed[person_idx] = _correct_leg_swaps(smoothed[person_idx])
+        smoothed[person_idx], pre_dp_leg_swap = _correct_leg_swaps(
+            smoothed[person_idx], return_swap_mask=True)
+        status['pre_dp_leg_swap_mask'][person_idx] = pre_dp_leg_swap
         crossing_prefill = _detect_ankle_crossing(smoothed[person_idx])
         smoothed[person_idx] = _prefill_ankle_crossing(smoothed[person_idx])
         kp = smoothed[person_idx]   # (T, J, 2)
         sc = scores[person_idx]     # (T, J)
-        video_thresholds, threshold_counts, threshold_source = _compute_video_vector_thresholds(
-            kp,
-            sc,
-            conf_threshold=conf_threshold,
-        )
+        # Leg identity is not final until the anchor-DP pass.  Computing a
+        # per-video leg threshold or an isolated-jump mask here would turn a
+        # temporary L/R handoff into an apparent coordinate spike.  Keep the
+        # historical thresholds only for non-leg joints and defer every leg
+        # geometry statistic/check to _post_dp_fill_leg_gaps().
+        video_thresholds = _JOINT_MAX_PX[:J].astype(np.float32, copy=True)
+        threshold_counts = np.zeros(J, dtype=np.int32)
+        threshold_source = np.array(['global_px'] * J, dtype=object)
+        for leg_joint_idx in (1, 2, 3, 4, 5, 6):
+            if leg_joint_idx < J:
+                threshold_source[leg_joint_idx] = 'deferred_post_dp'
         status['video_thresholds'][person_idx] = video_thresholds
         status['video_threshold_sample_counts'][person_idx] = threshold_counts
         status['threshold_source'][person_idx] = threshold_source
@@ -995,19 +963,17 @@ def _smooth_keypoints_sg(keypoints, scores,
             traj_x = kp[:, joint_idx, 0]
             traj_y = kp[:, joint_idx, 1]
 
+            if joint_idx in (1, 2, 3, 4, 5, 6):
+                # The complete hip/knee/ankle chain is checked after anchor DP,
+                # on identity-resolved but still unsmoothed coordinates.
+                continue
+
             max_px = float(video_thresholds[joint_idx]) if joint_idx < len(video_thresholds) else 45.0
             thresh = max_px * scale
 
-            # Confidence-weighted threshold: a joint's jump-distance threshold has to
-            # stay loose in general (fast joints like ankles legitimately move a lot
-            # between frames), but when this frame's own detection confidence is
-            # below-normal (even if still above the hard low_conf cutoff), the model
-            # itself is less sure of this point -- so require less positional deviation
-            # to flag it as a suspicious jump. conf==1.0 keeps the full threshold;
-            # conf==conf_threshold shrinks it to half.
-            conf_factor = np.clip(sc[:, joint_idx], conf_threshold, 1.0)
-            conf_factor = 0.5 + 0.5 * (conf_factor - conf_threshold) / max(1e-6, 1.0 - conf_threshold)
-            thresh = thresh * conf_factor
+            # Use one physical pixel allowance for isolated jumps regardless of
+            # confidence. Confidence remains part of sample eligibility and the
+            # separate low-confidence fill rules, not the geometry scale itself.
             thresh_all[:, joint_idx] = thresh
 
             parent_idx = _LEG_PARENT.get(joint_idx)
@@ -1039,9 +1005,9 @@ def _smooth_keypoints_sg(keypoints, scores,
 
         final_bad_all = low_conf_all | bilateral_all | frame_bad[:, None]
         crossing_bad = crossing_prefill | _detect_ankle_crossing(kp)
-        # Knee/ankle geometry can look like an outlier before DP simply because
+        # Leg geometry can look like an outlier before DP simply because
         # the left/right labels are temporarily wrong. Keep those masks for the
-        # post-DP pass, but do not replace knee/ankle coordinates here unless
+        # post-DP pass, but do not replace leg coordinates here unless
         # they are already hard low-conf/frame-bad. Ankle crossing is the exception:
         # two ankles within the crossing distance is geometrically invalid, so it
         # is repaired before DP and kept in the fill mask for diagnostics.
@@ -1275,17 +1241,22 @@ def show2Dpose(kps, img, foot_kps=None, foot_scores=None):
     # 腳部點（大腳趾/小腳趾/腳跟 x 左右）：foot_kps 順序為
     # L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel，連到 H36M 腳踝（左6/右3）。
     if foot_kps is not None:
-        FOOT_COLOR = (0, 255, 255)
+        # The three-point groups have already followed the corrected body L/R
+        # permutation, so coloring by their logical slots keeps visualization
+        # synchronized with leg-swap correction.
+        LEFT_FOOT_COLOR = (0, 255, 255)    # yellow (BGR)
+        RIGHT_FOOT_COLOR = (255, 0, 255)  # magenta (BGR)
         RIGHT_ANKLE, LEFT_ANKLE = 3, 6
         foot_to_ankle = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
                           (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
         for fi, ankle_idx in foot_to_ankle:
             if foot_scores is not None and foot_scores[fi] < 0.3:
                 continue
+            foot_color = LEFT_FOOT_COLOR if fi < 3 else RIGHT_FOOT_COLOR
             fx, fy = int(foot_kps[fi, 0]), int(foot_kps[fi, 1])
             ax, ay = int(kps[ankle_idx, 0]), int(kps[ankle_idx, 1])
-            cv2.line(img, (ax, ay), (fx, fy), FOOT_COLOR, 2)
-            cv2.circle(img, (fx, fy), 4, FOOT_COLOR, -1)
+            cv2.line(img, (ax, ay), (fx, fy), foot_color, 2)
+            cv2.circle(img, (fx, fy), 4, foot_color, -1)
 
     return img
 
@@ -1324,7 +1295,7 @@ def show3Dpose(vals, ax):
     ax.tick_params('z', labelleft=False)
 
 
-def get_pose2D(video_path, output_dir, bbox_csv=None):
+def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None):
     cap = cv2.VideoCapture(video_path)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -1333,12 +1304,15 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
     print('\nGenerating 2D pose...')
     if bbox_csv:
         print(f'Using external bbox CSV: {bbox_csv}')
+    if model_path:
+        print(f'Using HRNet experiment checkpoint: {model_path}')
     keypoints, scores = hrnet_pose(
         video_path,
         det_dim=416,
         num_peroson=1,
         gen_output=True,
         bbox_csv=bbox_csv,
+        model_path=model_path,
     )
 
     # HRNet 現在輸出 17 個 COCO body 點 + 6 個 COCO-WholeBody 腳部點（大腳趾/小腳趾/腳跟 x 左右）。
@@ -1427,6 +1401,15 @@ def get_pose2D(video_path, output_dir, bbox_csv=None):
         video_thresholds=keypoint_status['video_thresholds'],
         video_threshold_sample_counts=keypoint_status['video_threshold_sample_counts'],
         threshold_source=keypoint_status['threshold_source'].astype(str),
+        pre_dp_leg_swap_mask=keypoint_status['pre_dp_leg_swap_mask'],
+        bbox_heights=(
+            np.asarray(bbox_heights, dtype=np.float32)
+            if bbox_heights is not None else np.empty((0,), dtype=np.float32)
+        ),
+        bbox_ref_height=np.asarray(
+            np.nan if bbox_ref_height is None else bbox_ref_height,
+            dtype=np.float32,
+        ),
         valid_frames=valid_frames,
     )
     print(f'Keypoint status masks saved to {status_output_npz}')
@@ -1931,7 +1914,8 @@ def get_pose3D(video_path, output_dir, skip_video=False):
 def run_pose_estimation(video_path: str, output_dir: str,
                         only_2d: bool = False, gpu: str = "0",
                         bbox_csv: str = None,
-                        skip_video: bool = False) -> str:
+                        skip_video: bool = False,
+                        model_path: str = None) -> str:
     """
     執行完整的 2D/3D 姿態估計流程。
 
@@ -1960,7 +1944,7 @@ def run_pose_estimation(video_path: str, output_dir: str,
 
     pose_total_started_at = time.perf_counter()
     pose2d_started_at = time.perf_counter()
-    get_pose2D(video_path, output_dir, bbox_csv=bbox_csv)
+    get_pose2D(video_path, output_dir, bbox_csv=bbox_csv, model_path=model_path)
     _record_pose_timing("Step2/hrnet_2d_pose", pose2d_started_at)
     if not only_2d:
         pose3d_started_at = time.perf_counter()
