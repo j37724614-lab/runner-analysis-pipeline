@@ -30,7 +30,8 @@ RED_RIGHT = (0, 0, 255)
 GREEN_TRUNK = (0, 255, 0)
 BLACK = (0, 0, 0)
 
-FOOT_COLOR = (0, 255, 255)
+LEFT_FOOT_COLOR = (0, 255, 255)    # yellow
+RIGHT_FOOT_COLOR = (255, 0, 255)   # magenta
 RIGHT_ANKLE, LEFT_ANKLE = 3, 6
 FOOT_TO_ANKLE = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
                  (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
@@ -71,8 +72,11 @@ def draw_skeleton(img, kps, ox, oy, foot_kps=None):
         for fi, ankle_idx in FOOT_TO_ANKLE:
             fx, fy = int(fpts[fi, 0]), int(fpts[fi, 1])
             ax, ay = int(pts[ankle_idx, 0]), int(pts[ankle_idx, 1])
-            cv2.line(img, (ax, ay), (fx, fy), FOOT_COLOR, 2)
-            cv2.circle(img, (fx, fy), 4, FOOT_COLOR, -1)
+            color = LEFT_FOOT_COLOR if fi < 3 else RIGHT_FOOT_COLOR
+            cv2.line(img, (ax, ay), (fx, fy), BLACK, 3)
+            cv2.line(img, (ax, ay), (fx, fy), color, 2)
+            cv2.circle(img, (fx, fy), 5, BLACK, -1)
+            cv2.circle(img, (fx, fy), 3, color, -1)
 
     return img
 
@@ -92,7 +96,8 @@ def draw_touchdown_marker(img, cx, cy):
     cv2.rectangle(img, (cx - half, cy - half), (cx + half, cy + half), (0, 255, 255), 1)
 
 
-def make_cell(frame, kps, foot_kps, ox, oy, seq_idx, dp_swapped, fixed, td_label):
+def make_cell(frame, kps, foot_kps, ox, oy, seq_idx, dp_swapped, fixed, td_label,
+              dp_label="DP"):
     pts = kps[:, :2] + np.array([ox, oy])
     all_pts = [pts]
     if foot_kps is not None:
@@ -125,7 +130,7 @@ def make_cell(frame, kps, foot_kps, ox, oy, seq_idx, dp_swapped, fixed, td_label
     if td_label is not None:
         lx2 = draw_label(cell, td_label, lx2, ly, (255, 180, 220), (0, 0, 0))
     if dp_swapped:
-        lx2 = draw_label(cell, "DP", lx2, ly, (255, 120, 0), (255, 255, 255))
+        lx2 = draw_label(cell, dp_label, lx2, ly, (255, 120, 0), (255, 255, 255))
     if fixed:
         lx2 = draw_label(cell, "FIX", lx2, ly, (0, 220, 255), (0, 0, 0))
 
@@ -140,6 +145,15 @@ def main():
     ap.add_argument('--step-events-csv', required=True)
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--prefix', default='newalgo_fullflow_with_feet')
+    ap.add_argument(
+        '--undo-dp-swap',
+        action='store_true',
+        help=(
+            '產生左右身份未套用 DP 的反事實對照圖：對 dp_leg_swapped=True 的幀，'
+            '將最終 body 左右 hip/knee/ankle 與 foot 左右三點再次互換。'
+            '只修改記憶體中的繪圖副本，不改寫任何輸入 NPZ。'
+        ),
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -186,12 +200,28 @@ def main():
         if not ret:
             continue
 
-        foot_kps = foot_all[i] if foot_all is not None else None
+        body_kps = body[i].copy()
+        foot_kps = foot_all[i].copy() if foot_all is not None else None
         dp_swapped = bool(dp_swapped_arr[i]) if i < len(dp_swapped_arr) else False
+        if args.undo_dp_swap and dp_swapped:
+            body_kps[[1, 2, 3, 4, 5, 6]] = body_kps[[4, 5, 6, 1, 2, 3]]
+            if foot_kps is not None:
+                foot_kps[[0, 1, 2, 3, 4, 5]] = foot_kps[[3, 4, 5, 0, 1, 2]]
         fixed = bool(leg_fill_mask[i].any()) if i < len(leg_fill_mask) else False
         td_label = td_by_seq.get(i)
 
-        cell = make_cell(frame, body[i], foot_kps, ox, oy, i, dp_swapped, fixed, td_label)
+        cell = make_cell(
+            frame,
+            body_kps,
+            foot_kps,
+            ox,
+            oy,
+            i,
+            dp_swapped,
+            fixed,
+            td_label,
+            dp_label='NO-DP' if args.undo_dp_swap else 'DP',
+        )
         cells.append(cell)
 
     cap.release()

@@ -4,13 +4,12 @@ run_pipeline.py — 跑者分析完整流程（極簡 CLI 入口，底層由 cor
 此檔案已重構為輕量包裝器，其核心排程引擎已移入 core/ 目錄。
 """
 
-import sys
-import os
-import json
 import argparse
-from pathlib import Path
+import json
+import sys
 
 from core.pipeline import run_pipeline
+
 
 # =======================================================================
 # CLI 參數解析器

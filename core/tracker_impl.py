@@ -901,11 +901,17 @@ def _compute_kf_series(d_raw, fps, init_v=0.0, init_a=0.0,
 
 
 def compute_speed_from_bbox_map(bbox_map_csv, cameras_cfg_list, fps_override=None,
-                                offsets_npz=None):
+                                offsets_npz=None, pixel_cameras_cfg_list=None,
+                                speed_mode='pixel'):
     """
-    Compute speed/acceleration metrics from bbox_map.csv (produced by skeleton
-    tracker) without re-running YOLO.  Returns all_track_data list in the same
-    format as the main() CSV output.
+    Compute dual pixel and homography speed/acceleration metrics from
+    bbox_map.csv without re-running YOLO.
+
+    ``cameras_cfg_list`` retains the original six-point Homography controls.
+    ``pixel_cameras_cfg_list`` is the tracking-safe start/end-line copy used
+    by the legacy pixel calibration. Both paths are always calculated when
+    available; ``speed_mode`` only selects which result is exposed through the
+    backwards-compatible ``speed_mps`` / ``accel_mps2`` columns.
 
     bbox_map.csv stores coordinates in per-frame person-centered crop space.
     offsets_npz (cam1_offsets.npz) contains the (off_x, off_y) per output frame
@@ -931,12 +937,16 @@ def compute_speed_from_bbox_map(bbox_map_csv, cameras_cfg_list, fps_override=Non
         rows_by_cam[k].sort(key=lambda r: int(r['cam_frame']))
 
     cameras = [_build_camera_from_json(c) for c in cameras_cfg_list]
+    pixel_cameras_cfg_list = pixel_cameras_cfg_list or cameras_cfg_list
+    pixel_cameras = [_build_camera_from_json(c) for c in pixel_cameras_cfg_list]
+    use_homography = str(speed_mode).lower() == 'homography'
 
     all_track_data = []
-    cumulative_dist_offset = 0.0
+    pixel_cumulative_dist_offset = 0.0
+    homography_cumulative_dist_offset = 0.0
     absolute_frame_offset = 0
-    last_kf_v = 0.0
-    last_kf_a = 0.0
+    last_pixel_kf_v = last_pixel_kf_a = 0.0
+    last_homography_kf_v = last_homography_kf_a = 0.0
 
     for cam_idx, cam in enumerate(cameras):
         cam_rows = rows_by_cam.get(cam_idx, [])
@@ -955,7 +965,11 @@ def compute_speed_from_bbox_map(bbox_map_csv, cameras_cfg_list, fps_override=Non
         crop_x_offset = cp[0] if cp else 0
         crop_y_offset = cp[1] if cp else 0
 
-        d_raw = []
+        pixel_cam = pixel_cameras[cam_idx] if cam_idx < len(pixel_cameras) else {}
+        pixel_raw = []
+        homography_raw = []
+        world_points = []
+        homography_image_points = []
         interpolated_mask = []
         source_frames = []
 
@@ -970,80 +984,118 @@ def compute_speed_from_bbox_map(bbox_map_csv, cameras_cfg_list, fps_override=Non
             cy_orig = (y1 + y2) / 2.0 + frame_off_y + crop_y_offset
             y2_orig = y2 + frame_off_y + crop_y_offset
 
-            dist_raw = None
-            if cam.get('m_per_pixel') is not None or cam.get('H_matrix') is not None:
-                if cam.get('H_matrix') is not None:
-                    # Evaluate H matrix at the track centerline y rather than y2_orig.
-                    # y2 (bbox bottom) fluctuates frame-to-frame as the runner lifts their
-                    # feet; feeding that noise through H amplifies it into world_x errors.
-                    # The track runs nearly horizontally in the image, so world_x is driven
-                    # almost entirely by cx_orig; using a fixed track-center y keeps the
-                    # mapping stable.
+            # Legacy pixel calibration: bbox centre projected onto the
+            # start/end-line direction and scaled by that known line span.
+            pixel_dist = None
+            if pixel_cam.get('m_per_pixel') is not None:
+                if pixel_cam.get('track_dir') and pixel_cam.get('start_mid'):
+                    proj_px = _project_onto_track(
+                        (cx_orig, cy_orig), pixel_cam['start_mid'], pixel_cam['track_dir'])
+                    pixel_dist = pixel_cumulative_dist_offset + max(
+                        0.0, proj_px * pixel_cam['m_per_pixel'])
+                else:
+                    pixel_dist = pixel_cumulative_dist_offset + max(
+                        0.0, (cx_orig - pixel_cam['start_x']) * pixel_cam['m_per_pixel'])
+
+            # Six-point Homography calibration: use bbox bottom centre, then
+            # constrain it to the image-space runway centreline before mapping
+            # to metres. This rejects vertical bbox jitter without discarding
+            # along-runway progress.
+            homography_dist = None
+            world = None
+            image_point = None
+            if cam.get('H_matrix') is not None:
+                image_point = (cx_orig, y2_orig)
+                if cam.get('start_mid') is not None and cam.get('track_dir') is not None:
+                    image_point = _project_point_to_track_line(
+                        image_point, cam['start_mid'], cam['track_dir'])
+                else:
                     sl, el = cam.get('start_line'), cam.get('end_line')
                     if sl and el:
                         track_y = (sl[0][1] + sl[1][1] + el[0][1] + el[1][1]) / 4.0
-                    else:
-                        track_y = y2_orig
-                    world = _transform_point_homography((cx_orig, track_y), cam['H_matrix'])
-                    if world is not None:
-                        world_x = float(world[0])
-                        start_world_x = cam.get('homography_start_x') or 0.0
-                        local_dist = world_x - start_world_x
-                        if cam.get('distance_m') is not None:
-                            local_dist = min(local_dist, float(cam['distance_m']))
-                        dist_raw = cumulative_dist_offset + max(0.0, local_dist)
-                elif cam.get('track_dir') and cam.get('start_mid'):
-                    proj_px = _project_onto_track(
-                        (cx_orig, cy_orig), cam['start_mid'], cam['track_dir'])
-                    dist_raw = cumulative_dist_offset + max(
-                        0.0, proj_px * cam['m_per_pixel'])
-                else:
-                    dist_raw = cumulative_dist_offset + max(
-                        0.0, (cx_orig - cam['start_x']) * cam['m_per_pixel'])
+                        image_point = (cx_orig, track_y)
+                world = _transform_point_homography(image_point, cam['H_matrix'])
+                if world is not None:
+                    start_world_x = cam.get('homography_start_x') or 0.0
+                    local_dist = float(world[0]) - start_world_x
+                    homography_dist = homography_cumulative_dist_offset + max(0.0, local_dist)
 
-            d_raw.append(dist_raw)
+            pixel_raw.append(pixel_dist)
+            homography_raw.append(homography_dist)
+            world_points.append(world)
+            homography_image_points.append(image_point)
             interpolated_mask.append(bool(int(row.get('is_interpolated', 0))))
             source_frames.append(int(row['source_frame']))
 
-        has_any_metric = any(v is not None for v in d_raw)
-        has_metrics = (
-            (cam.get('m_per_pixel') is not None or cam.get('H_matrix') is not None)
-            and has_any_metric
-        )
-
-        if not has_metrics:
+        pixel_available = any(v is not None for v in pixel_raw)
+        homography_available = any(v is not None for v in homography_raw)
+        if not pixel_available and not homography_available:
             absolute_frame_offset += len(cam_rows)
             continue
 
-        d_raw_for_csv = list(d_raw)
-        missing = sum(v is None for v in d_raw)
-        if missing and has_any_metric:
-            d_raw = _interpolate_missing_numeric(d_raw)
-
         interp_gap_len, speed_confidence = _interpolation_metadata(interpolated_mask)
-        d_smooth, v_smooth, a_arr = _compute_kf_series(
-            d_raw, fps, init_v=last_kf_v, init_a=last_kf_a,
-            measurement_confidence=speed_confidence)
+        def _smooth(raw, available, init_v, init_a):
+            if not available:
+                return None, None, None
+            raw_for_csv = list(raw)
+            values = _interpolate_missing_numeric(raw) if any(v is None for v in raw) else raw
+            smooth, velocity, accel = _compute_kf_series(
+                values, fps, init_v=init_v, init_a=init_a,
+                measurement_confidence=speed_confidence)
+            return raw_for_csv, smooth, (velocity, accel)
 
-        cumulative_dist_offset = float(d_smooth[-1]) if len(d_smooth) > 0 else cumulative_dist_offset
-        last_kf_v = float(v_smooth[-1])
-        last_kf_a = float(a_arr[-1])
+        pixel_for_csv, pixel_smooth, pixel_series = _smooth(
+            pixel_raw, pixel_available, last_pixel_kf_v, last_pixel_kf_a)
+        homo_for_csv, homo_smooth, homo_series = _smooth(
+            homography_raw, homography_available,
+            last_homography_kf_v, last_homography_kf_a)
+        pixel_velocity, pixel_accel = pixel_series if pixel_series else (None, None)
+        homo_velocity, homo_accel = homo_series if homo_series else (None, None)
 
-        for i in range(len(d_smooth)):
-            dist_raw_i = d_raw_for_csv[i] if i < len(d_raw_for_csv) else None
+        if pixel_smooth is not None:
+            pixel_cumulative_dist_offset = float(pixel_smooth[-1])
+            last_pixel_kf_v = float(pixel_velocity[-1])
+            last_pixel_kf_a = float(pixel_accel[-1])
+        if homo_smooth is not None:
+            homography_cumulative_dist_offset = float(homo_smooth[-1])
+            last_homography_kf_v = float(homo_velocity[-1])
+            last_homography_kf_a = float(homo_accel[-1])
+
+        # Explicit homography mode prefers the world-coordinate series, but a
+        # partially calibrated legacy call must still fall back safely rather
+        # than emitting an empty active metric.
+        active_is_homography = homo_smooth is not None and (
+            use_homography or pixel_smooth is None)
+        active_raw = homo_for_csv if active_is_homography else pixel_for_csv
+        active_smooth = homo_smooth if active_is_homography else pixel_smooth
+        active_velocity = homo_velocity if active_is_homography else pixel_velocity
+        active_accel = homo_accel if active_is_homography else pixel_accel
+        active_mode = 'homography' if active_is_homography else 'pixel'
+
+        for i in range(len(cam_rows)):
+            raw_value = active_raw[i] if active_raw is not None else None
+            world = world_points[i]
+            image_point = homography_image_points[i]
             all_track_data.append({
                 'cam':             cam_idx + 1,
                 'cam_frame':       i,
                 'source_frame':    source_frames[i] if i < len(source_frames) else '',
                 'absolute_frame':  absolute_frame_offset + i,
-                'dist_m':          round(float(d_smooth[i]), 3),
-                'dist_raw_m':      round(float(dist_raw_i), 3) if dist_raw_i is not None else '',
-                'dist_smooth_m':   round(float(d_smooth[i]), 3),
-                'world_x':         '',
-                'image_point_x':   '',
-                'image_point_y':   '',
-                'speed_mps':       round(float(v_smooth[i]), 3),
-                'accel_mps2':      round(float(a_arr[i]), 3),
+                'dist_m':          round(float(active_smooth[i]), 3),
+                'dist_raw_m':      round(float(raw_value), 3) if raw_value is not None else '',
+                'dist_smooth_m':   round(float(active_smooth[i]), 3),
+                'world_x':         round(float(world[0]), 6) if world is not None else '',
+                'image_point_x':   round(float(image_point[0]), 3) if image_point is not None else '',
+                'image_point_y':   round(float(image_point[1]), 3) if image_point is not None else '',
+                'speed_mps':       round(float(active_velocity[i]), 3),
+                'accel_mps2':      round(float(active_accel[i]), 3),
+                'speed_mode_used': active_mode,
+                'dist_pixel_m':    round(float(pixel_smooth[i]), 3) if pixel_smooth is not None else '',
+                'speed_pixel_mps': round(float(pixel_velocity[i]), 3) if pixel_velocity is not None else '',
+                'accel_pixel_mps2': round(float(pixel_accel[i]), 3) if pixel_accel is not None else '',
+                'dist_homography_m': round(float(homo_smooth[i]), 3) if homo_smooth is not None else '',
+                'speed_homography_mps': round(float(homo_velocity[i]), 3) if homo_velocity is not None else '',
+                'accel_homography_mps2': round(float(homo_accel[i]), 3) if homo_accel is not None else '',
                 'is_interpolated': int(interpolated_mask[i]) if i < len(interpolated_mask) else 0,
                 'interp_gap_len':  interp_gap_len[i] if i < len(interp_gap_len) else 0,
                 'speed_confidence': round(float(speed_confidence[i]), 3) if i < len(speed_confidence) else 1.0,

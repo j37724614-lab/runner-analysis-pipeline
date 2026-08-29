@@ -57,13 +57,153 @@ def _resolve_leg_mask_after_swaps(mask, swapped, left_idx, right_idx):
     return resolved
 
 
+_POST_DP_LEG_PARENT = {
+    1: 0,  # RHip <- Pelvis
+    2: 1,  # RKnee <- RHip
+    3: 2,  # RAnkle <- RKnee
+    4: 0,  # LHip <- Pelvis
+    5: 4,  # LKnee <- LHip
+    6: 5,  # LAnkle <- LKnee
+}
+
+_POST_DP_LEG_THRESHOLD_FLOOR = {
+    1: 6.0,
+    2: 8.0,
+    3: 12.0,
+    4: 6.0,
+    5: 8.0,
+    6: 12.0,
+}
+
+_POST_DP_LEG_THRESHOLD_CEIL = {
+    1: 35.0,
+    2: 35.0,
+    3: 70.0,
+    4: 35.0,
+    5: 35.0,
+    6: 70.0,
+}
+
+
+def _compute_post_dp_leg_geometry(
+        kp, confidence, crossing_frames=None, bbox_heights=None,
+        bbox_ref_height=None, conf_threshold=0.50, percentile=95.0,
+        min_samples=20):
+    """Compute leg thresholds/outliers after L/R identity has been resolved.
+
+    ``kp`` must be the anchor-DP output before post-DP interpolation, SG
+    smoothing, bone-length normalization, or knee-angle limiting.  All six leg
+    joints are represented relative to their kinematic parent, so runner/crop
+    translation cannot look like a joint spike.
+
+    The primary threshold is the current video's p95 high-confidence
+    parent-relative displacement.  A conservative fixed floor is used when the
+    clip has too few trustworthy samples; the old raw-archive pixel percentile
+    is deliberately not used for legs because it was contaminated by L/R label
+    swaps.
+    """
+    kp = np.asarray(kp, dtype=np.float64)
+    confidence = np.asarray(confidence, dtype=np.float64)
+    T, J = kp.shape[:2]
+    crossing_frames = (
+        np.asarray(crossing_frames, dtype=bool).reshape(-1)
+        if crossing_frames is not None else np.zeros(T, dtype=bool)
+    )
+    if len(crossing_frames) != T:
+        aligned = np.zeros(T, dtype=bool)
+        aligned[:min(T, len(crossing_frames))] = crossing_frames[:T]
+        crossing_frames = aligned
+    scale = np.ones(T, dtype=np.float64)
+    if bbox_heights is not None and bbox_ref_height is not None:
+        heights = np.asarray(bbox_heights, dtype=np.float64).reshape(-1)
+        try:
+            ref_height = float(np.asarray(bbox_ref_height).reshape(-1)[0])
+        except (TypeError, ValueError, IndexError):
+            ref_height = float('nan')
+        if len(heights) and np.isfinite(ref_height) and ref_height > 0:
+            aligned_heights = np.full(T, ref_height, dtype=np.float64)
+            aligned_heights[:min(T, len(heights))] = heights[:T]
+            aligned_heights = np.where(
+                aligned_heights > 0, aligned_heights, ref_height)
+            scale = np.clip(aligned_heights / ref_height, 0.6, 1.8)
+
+    bilateral = np.zeros((T, J), dtype=bool)
+    thresholds = np.zeros(J, dtype=np.float32)
+    sample_counts = np.zeros(J, dtype=np.int32)
+    threshold_source = np.array(['not_leg'] * J, dtype=object)
+    per_frame_thresholds = np.zeros((T, J), dtype=np.float32)
+
+    usable_pair_base = (~crossing_frames[1:]) & (~crossing_frames[:-1])
+    for joint_idx, parent_idx in _POST_DP_LEG_PARENT.items():
+        if joint_idx >= J or parent_idx >= J:
+            continue
+
+        rel = kp[:, joint_idx, :2] - kp[:, parent_idx, :2]
+        jumps = np.linalg.norm(rel[1:] - rel[:-1], axis=1)
+        pair_good = (
+            usable_pair_base &
+            (confidence[1:, joint_idx] >= conf_threshold) &
+            (confidence[:-1, joint_idx] >= conf_threshold) &
+            (confidence[1:, parent_idx] >= conf_threshold) &
+            (confidence[:-1, parent_idx] >= conf_threshold) &
+            np.isfinite(jumps)
+        )
+        values = jumps[pair_good]
+        sample_counts[joint_idx] = int(values.size)
+
+        floor = _POST_DP_LEG_THRESHOLD_FLOOR[joint_idx]
+        ceil = _POST_DP_LEG_THRESHOLD_CEIL[joint_idx]
+        if values.size >= min_samples:
+            base_threshold = float(np.clip(
+                np.percentile(values, percentile), floor, ceil))
+            threshold_source[joint_idx] = f'post_dp_video_vector_p{int(percentile)}'
+        else:
+            base_threshold = float(floor)
+            threshold_source[joint_idx] = 'post_dp_floor_insufficient_samples'
+        thresholds[joint_idx] = base_threshold
+
+        # Isolated-jump geometry must use the same physical pixel allowance at
+        # every confidence level. Confidence controls which samples may teach
+        # the p95 distribution and the separate low-confidence fill rules; it
+        # must not shrink this per-frame geometric threshold.
+        frame_threshold = base_threshold * scale
+        per_frame_thresholds[:, joint_idx] = frame_threshold
+
+        prev_rel = np.concatenate([rel[:1], rel[:-1]], axis=0)
+        next_rel = np.concatenate([rel[1:], rel[-1:]], axis=0)
+        d_prev = np.linalg.norm(rel - prev_rel, axis=1)
+        d_next = np.linalg.norm(rel - next_rel, axis=1)
+        d_span = np.linalg.norm(next_rel - prev_rel, axis=1)
+        isolated = (
+            (d_prev > frame_threshold) &
+            (d_next > frame_threshold) &
+            (d_span < d_prev) &
+            (d_span < d_next)
+        )
+        isolated[0] = False
+        isolated[-1] = False
+        # Crossing geometry is handled explicitly for ankles below; it must not
+        # contaminate the learned motion distribution or become a second reason
+        # to label the same frame as an isolated spike.
+        isolated[crossing_frames] = False
+        bilateral[:, joint_idx] = isolated
+
+    return {
+        'bilateral': bilateral,
+        'thresholds': thresholds,
+        'sample_counts': sample_counts,
+        'threshold_source': threshold_source,
+        'per_frame_thresholds': per_frame_thresholds,
+    }
+
+
 def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
                            conf_threshold=0.50,
                            hard_conf_threshold=0.20,
                            deviation_factor=2.0):
     """Fill leg bad points after DP has resolved left/right identity.
 
-    DP decides which physical leg each left/right label represents. Knee/ankle
+    DP decides which physical leg each left/right label represents. Hip/knee/ankle
     low-confidence and outlier frames are therefore filled here, using the
     DP-resolved parent->joint trajectory, instead of before DP where the same
     label can still refer to the wrong physical leg.
@@ -78,35 +218,61 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
     kp = recon[0, :, :, :2].astype(np.float64, copy=True)
     raw_conf = status["raw_confidence"][0].astype(np.float64)
     low_conf = status["low_conf_mask"][0].astype(bool)
-    bilateral = status["bilateral_outlier_mask"][0].astype(bool)
     crossing = status["ankle_crossing_mask"][0].astype(bool)
 
     if swapped is None:
         swapped = np.zeros(T, dtype=bool)
     swapped = np.asarray(swapped, dtype=bool)
 
+    # Raw confidence predates both the local pre-DP swap correction and anchor
+    # DP.  Align it to the current coordinates with their cumulative XOR parity.
+    pre_swapped = np.zeros(T, dtype=bool)
+    if "pre_dp_leg_swap_mask" in status.files:
+        pre_swapped_raw = np.asarray(
+            status["pre_dp_leg_swap_mask"], dtype=bool)
+        if pre_swapped_raw.ndim == 2:
+            pre_swapped_raw = pre_swapped_raw[0]
+        pre_swapped[:min(T, len(pre_swapped_raw))] = pre_swapped_raw[:T]
+    final_identity_swapped = np.logical_xor(pre_swapped, swapped)
+
     raw_conf_resolved = raw_conf.copy()
-    if np.any(swapped):
-        for left_idx, right_idx in ((L_KNEE, R_KNEE), (L_ANKLE, R_ANKLE)):
-            raw_conf_resolved[np.ix_(swapped, [right_idx])] = raw_conf[np.ix_(swapped, [left_idx])]
-            raw_conf_resolved[np.ix_(swapped, [left_idx])] = raw_conf[np.ix_(swapped, [right_idx])]
-    for left_idx, right_idx in ((L_KNEE, R_KNEE), (L_ANKLE, R_ANKLE)):
-        low_conf = _resolve_leg_mask_after_swaps(low_conf, swapped, left_idx, right_idx)
-        bilateral = _resolve_leg_mask_after_swaps(bilateral, swapped, left_idx, right_idx)
-        crossing = _resolve_leg_mask_after_swaps(crossing, swapped, left_idx, right_idx)
+    for left_idx, right_idx in (
+            (L_HIP, R_HIP), (L_KNEE, R_KNEE), (L_ANKLE, R_ANKLE)):
+        raw_conf_resolved = _resolve_leg_mask_after_swaps(
+            raw_conf_resolved, final_identity_swapped, left_idx, right_idx)
+        low_conf = _resolve_leg_mask_after_swaps(
+            low_conf, final_identity_swapped, left_idx, right_idx)
+
+    # The crossing mask was measured after the local pre-DP identity correction,
+    # so only the anchor-DP permutation is relevant. Both ankle columns normally
+    # carry the same value, but resolve them for completeness.
+    crossing = _resolve_leg_mask_after_swaps(
+        crossing, swapped, L_ANKLE, R_ANKLE)
+    crossing_frames = crossing[:, [R_ANKLE, L_ANKLE]].any(axis=1)
+
+    bbox_heights = status["bbox_heights"] if "bbox_heights" in status.files else None
+    if bbox_heights is not None and np.asarray(bbox_heights).ndim == 2:
+        bbox_heights = np.asarray(bbox_heights)[0]
+    bbox_ref_height = (
+        status["bbox_ref_height"] if "bbox_ref_height" in status.files else None)
+    geometry = _compute_post_dp_leg_geometry(
+        kp,
+        raw_conf_resolved,
+        crossing_frames=crossing_frames,
+        bbox_heights=bbox_heights,
+        bbox_ref_height=bbox_ref_height,
+        conf_threshold=conf_threshold,
+    )
+    bilateral = geometry["bilateral"]
 
     post_fill = np.zeros((T, recon.shape[2]), dtype=bool)
     all_idx = np.arange(T)
-    thresholds = {
-        R_KNEE: 8.0,
-        L_KNEE: 8.0,
-        R_ANKLE: 12.0,
-        L_ANKLE: 12.0,
-    }
     joint_specs = (
+        (R_HIP, 0, False),
         (R_KNEE, R_HIP, False),
-        (L_KNEE, L_HIP, False),
         (R_ANKLE, R_KNEE, True),
+        (L_HIP, 0, False),
+        (L_KNEE, L_HIP, False),
         (L_ANKLE, L_KNEE, True),
     )
 
@@ -134,7 +300,8 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
             interp_x = np.interp(all_idx, good_idx, rel[good_idx, 0])
             interp_y = np.interp(all_idx, good_idx, rel[good_idx, 1])
             deviation = np.hypot(rel[:, 0] - interp_x, rel[:, 1] - interp_y)
-            geometric_bad = moderate_low & (deviation > thresholds[joint_idx] * deviation_factor)
+            geometric_bad = moderate_low & (
+                deviation > geometry["thresholds"][joint_idx] * deviation_factor)
 
         fill = base_bad | geometric_bad
         post_fill[:, joint_idx] = fill
@@ -154,6 +321,11 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
         post_dp_leg_fill_mask=post_fill,
         post_dp_ankle_fill_mask=post_fill,
         dp_leg_swapped=swapped,
+        post_dp_leg_bilateral_outlier_mask=bilateral,
+        post_dp_leg_video_thresholds=geometry["thresholds"],
+        post_dp_leg_threshold_sample_counts=geometry["sample_counts"],
+        post_dp_leg_threshold_source=geometry["threshold_source"].astype(str),
+        post_dp_leg_per_frame_thresholds=geometry["per_frame_thresholds"],
         source_status_path=str(status_path),
     )
     return post_fill
@@ -241,11 +413,48 @@ def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2, bone_blend=0.8):
 
 STEP_FIELDS = [
     "step_index", "seq_frame", "orig_frame", "time_s", "seq_time_s", "cam", "foot",
+    "event_type", "flight_start_frame", "landing_position_source", "landing_score",
     "ankle_x", "ankle_y", "ankle_conf",
+    "contact_joint", "contact_x", "contact_y", "contact_conf", "contact_selection_reason",
+    "heel_valid", "big_toe_valid", "runway_valid", "attachment_valid", "ground_band_valid",
+    "contact_rejection_reason", "contact_valid",
     "track_position_px", "world_x_m", "world_y_m",
     "step_length_px", "step_length_m",
     "cadence_spm", "avg_cadence_spm",
+    "homography_lateral_valid", "homography_y_interpolated",
 ]
+
+CONTACT_CONFIDENCE_THRESHOLD = 0.50
+# A camera's clicked lane quadrilateral can be only a few pixels tall at the
+# far end.  Keep a calibration-tolerant minimum cross-track corridor so a
+# genuine pre-takeoff contact is not rejected solely by small click/perspective
+# offsets.  The runway quadrilateral and foot-to-ankle checks remain required.
+CONTACT_GROUND_BAND_MIN_TOLERANCE = 0.65
+LONG_JUMP_MIN_FLIGHT_SECONDS = 0.20
+LONG_JUMP_MIN_EVENT_GAP_SECONDS = 0.45
+LONG_JUMP_MIN_VERTICAL_EXCURSION_PX = 12.0
+# A running swing can have a small airborne arc too.  It becomes a long-jump
+# flight only when the foot stays away from the ground for this longer period.
+# This guard is intentionally used only by the terminal-camera long-jump path.
+LONG_JUMP_AIRBORNE_MIN_SECONDS = 0.45
+LONG_JUMP_AIRBORNE_RISE_PX = 8.0
+LONG_JUMP_GROUND_RETURN_TOLERANCE_PX = 5.0
+LONG_JUMP_NEIGHBOR_CONFIDENCE = 0.50
+# Sand impact reliably blurs/occludes the ankle heatmap, so confidence drops
+# sharply right at touchdown. Prefer that onset over the single deepest-y
+# frame: the body keeps sinking/settling for a while after contact, so
+# "deepest y" tends to land noticeably after the true touchdown instant.
+LONG_JUMP_IMPACT_CONFIDENCE_THRESHOLD = 0.40
+LONG_JUMP_IMPACT_MIN_RUN = 2
+# Frames borrowed from the *next* camera purely so detect_steps()'s
+# find_peaks() can confirm/reject a touchdown sitting right at this camera's
+# tracked-window boundary; comfortably more than one stride cycle at typical
+# capture fps, without pulling in unrelated later steps.
+STEP_DETECTION_LOOKAHEAD_FRAMES = 20
+_FOOT_CONTACT_INDICES = {
+    "left": {"heel": 2, "big_toe": 0},
+    "right": {"heel": 5, "big_toe": 3},
+}
 
 
 
@@ -443,7 +652,346 @@ def load_ankle_positions(keypoints_npz, offsets_npz, fps):
     return rows
 
 
-def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, prominence=None):
+def load_foot_contact_positions(foot_npz, offsets_npz):
+    """Load WholeBody heel/big-toe points in original-video coordinates.
+
+    ``foot_keypoints.npz`` lives in the same tracked crop coordinates as the
+    body keypoints.  The tracking offsets are therefore applied here, exactly
+    as they are for ankle rows.  The returned mapping is keyed by sequential
+    pose frame and by the already-corrected left/right foot identity.
+    """
+    if not foot_npz or not os.path.exists(foot_npz):
+        return {}
+
+    feet_data = np.load(foot_npz, allow_pickle=True)
+    offsets_data = np.load(offsets_npz, allow_pickle=True)
+    points = feet_data["keypoints"][0]
+    scores = feet_data["scores"][0]
+    valid_frames = np.asarray(feet_data["valid_frames"]).flatten().astype(int)
+    offsets = offsets_data["offsets"]
+    out = {}
+    for seq_frame, offset_idx in enumerate(valid_frames):
+        if seq_frame >= len(points) or offset_idx >= len(offsets):
+            continue
+        off_x, off_y = offsets[offset_idx]
+        per_side = {}
+        for side, indices in _FOOT_CONTACT_INDICES.items():
+            per_side[side] = {}
+            for joint, index in indices.items():
+                point = points[seq_frame, index]
+                score = float(scores[seq_frame, index])
+                per_side[side][joint] = {
+                    "x": float(point[0] + off_x),
+                    "y": float(point[1] + off_y),
+                    "conf": score,
+                }
+        out[int(seq_frame)] = per_side
+    return out
+
+
+def _runway_geometry(camera):
+    """Build a normalized (along-track, cross-track) coordinate system.
+
+    Skipped for homography-calibrated cameras even when start_line/end_line
+    are present: those are synthesized from the two extreme (by world_x_m)
+    calibration points purely so core/tracking.py's prescan/track_roi logic
+    (which is tolerant, with pre_roll/end_roll buffers) behaves like the
+    4-point mode. This quad's along-track band is much stricter (only ~8%
+    overshoot allowed) and assumes start_line/end_line bound the full visible
+    path -- for a long-jump camera the runner legitimately keeps moving past
+    the last calibration marker (into the sand pit), so applying this check
+    here would reject genuine contact points as "outside the runway".
+    """
+    if camera.get("homography_src_points"):
+        return None
+    start, end = camera.get("start_line"), camera.get("end_line")
+    if not start or not end or len(start) != 2 or len(end) != 2:
+        return None
+    polygon = np.asarray([start[0], end[0], end[1], start[1]], dtype=np.float32)
+    transform = cv2.getPerspectiveTransform(
+        polygon, np.asarray([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32))
+    return {"polygon": polygon, "transform": transform}
+
+
+def _runway_local(point, geometry):
+    if geometry is None:
+        return None
+    pts = np.asarray([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+    return cv2.perspectiveTransform(pts, geometry["transform"])[0, 0]
+
+
+# This small margin admits ordinary click/pose noise while rejecting a foot
+# heatmap that has jumped well outside the calibrated ground strip.
+HOMOGRAPHY_PHYSICAL_LATERAL_MARGIN_M = 0.15
+HOMOGRAPHY_TEMPORAL_LATERAL_JUMP_M = 0.25
+# Layer 2 (velocity continuity, see _recompute_contact_event_metrics()): a
+# contact point can sit inside the physical runway yet still be a
+# misdetection if it implies an impossible sprint speed to/from its
+# neighbour. The absolute ceiling is comfortably above elite top speed
+# (~12.4 m/s); the relative multiplier catches slower-but-still-implausible
+# jumps relative to this specific trial's own pace.
+HOMOGRAPHY_VELOCITY_ABS_CEILING_MPS = 13.0
+HOMOGRAPHY_VELOCITY_RELATIVE_MULTIPLIER = 2.5
+
+
+def _homography_lateral_matrix(camera):
+    """Homography matrix for a homography-calibrated camera, or None."""
+    src = camera.get("homography_src_points")
+    dst = camera.get("homography_dst_world")
+    if not src or not dst:
+        return None
+    try:
+        calibration = _homography_calibration(src, dst)
+    except ValueError:
+        return None
+    if calibration is None:
+        return None
+    return calibration["homography"]
+
+
+def _homography_world_y(point, matrix):
+    """Transform a pixel point to its homography world_y, or None."""
+    if matrix is None:
+        return None
+    pts = np.asarray([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+    world = cv2.perspectiveTransform(pts, matrix)[0, 0]
+    return float(world[1])
+
+
+def _validate_homography_lateral(point, context):
+    """Return (valid, world_y) for a pixel point's cross-track position.
+
+    Checked against the session's own calibrated runway bounds (the six
+    clicked control points' world_y span, plus a small margin for ordinary
+    click/pose noise) -- not against a band learned from ankle position.
+    A contact point (heel/toe) legitimately sits at a different world_y than
+    the ankle in the same frame, so comparing a contact point's absolute
+    position to an ankle-derived band rejected every contact point in
+    trials where that offset was large. Temporal (frame-to-frame) speed
+    plausibility is a separate check, in _recompute_contact_event_metrics()'s
+    velocity-continuity pass.
+    """
+    matrix = (context or {}).get("homography_matrix")
+    if matrix is None:
+        return True, None
+    world_y = _homography_world_y(point, matrix)
+    physical_min = (context or {}).get("homography_world_y_min")
+    physical_max = (context or {}).get("homography_world_y_max")
+    if physical_min is None or physical_max is None:
+        return True, world_y
+    physical_ok = (
+        float(physical_min) - HOMOGRAPHY_PHYSICAL_LATERAL_MARGIN_M
+        <= world_y
+        <= float(physical_max) + HOMOGRAPHY_PHYSICAL_LATERAL_MARGIN_M
+    )
+    return physical_ok, world_y
+
+
+def _contact_validation_contexts(cameras, step_events, rows_by_seq, foot_contacts_by_seq):
+    """Learn per-camera runway ground bands and foot/ankle size limits."""
+    homography_matrices = {index: _homography_lateral_matrix(camera) for index, camera in enumerate(cameras)}
+    contexts = {
+        index: {"geometry": _runway_geometry(camera),
+                "homography_matrix": homography_matrices[index],
+                "ground_values": [],
+                "attachment_samples": {"heel": [], "big_toe": []}}
+        for index, camera in enumerate(cameras)
+    }
+    for index, camera in enumerate(cameras):
+        dst = camera.get("homography_dst_world") or []
+        try:
+            ys = [float(point[1]) for point in dst]
+        except (TypeError, ValueError, IndexError):
+            ys = []
+        contexts[index]["homography_world_y_min"] = min(ys) if ys else None
+        contexts[index]["homography_world_y_max"] = max(ys) if ys else None
+    for event in step_events:
+        seq = int(event["seq_frame"])
+        row = rows_by_seq.get(seq)
+        cam = int(event.get("cam", row["cam"] if row else 0))
+        context = contexts.get(cam)
+        if row is None or context is None:
+            continue
+        side = str(event.get("foot", row["lower_foot"])).lower()
+        ankle = (row[f"{side}_ankle_x"], row[f"{side}_ankle_y"])
+        local = _runway_local(ankle, context["geometry"])
+        # Use only plausible ankle touchdown anchors to establish the robust
+        # per-camera ground band; bad foot points must never teach this model.
+        if local is not None and -0.35 <= float(local[1]) <= 1.35:
+            context["ground_values"].append(float(local[1]))
+
+    for seq, per_side in foot_contacts_by_seq.items():
+        row = rows_by_seq.get(seq)
+        if row is None:
+            continue
+        context = contexts.get(int(row["cam"]))
+        if context is None:
+            continue
+        for side, values in per_side.items():
+            ankle = np.asarray([row[f"{side}_ankle_x"], row[f"{side}_ankle_y"]], dtype=float)
+            for joint in ("heel", "big_toe"):
+                candidate = values[joint]
+                if candidate["conf"] < CONTACT_CONFIDENCE_THRESHOLD:
+                    continue
+                point = np.asarray([candidate["x"], candidate["y"]], dtype=float)
+                if np.isfinite(point).all():
+                    context["attachment_samples"][joint].append(float(np.linalg.norm(point - ankle)))
+
+    for context in contexts.values():
+        values = np.asarray(context.pop("ground_values"), dtype=float)
+        if len(values):
+            center = float(np.median(values))
+            mad = float(np.median(np.abs(values - center)))
+            context["ground_center"] = center
+            # A generous 3-MAD band remains resistant to one incorrect foot
+            # detection while accommodating ordinary lane and perspective drift.
+            context["ground_tolerance"] = max(CONTACT_GROUND_BAND_MIN_TOLERANCE, 3.0 * mad)
+        else:
+            context["ground_center"] = None
+            context["ground_tolerance"] = None
+        thresholds = {}
+        for joint, samples in context["attachment_samples"].items():
+            p95 = float(np.percentile(samples, 95)) if samples else 0.0
+            thresholds[joint] = max(12.0 if joint == "heel" else 18.0, p95 * 1.5)
+        context["attachment_thresholds"] = thresholds
+        context.pop("attachment_samples", None)
+    return contexts
+
+
+def _validate_foot_contact(candidate, joint, ankle_x, ankle_y, context):
+    """Return validity flags and auditable rejection reasons for a foot point."""
+    point = (candidate["x"], candidate["y"])
+    reasons = []
+    runway_valid = ground_band_valid = attachment_valid = True
+    geometry = (context or {}).get("geometry")
+    local = _runway_local(point, geometry)
+    if local is not None:
+        # The cone clicks define a nominal lane, but a camera can view a runner
+        # a little above/below that strip.  Keep a calibration-tolerant margin;
+        # the independently learned ground band remains the stricter guard for
+        # a grossly elevated point such as the reported S13 heel.
+        runway_valid = -0.65 <= float(local[1]) <= 1.65 and -0.08 <= float(local[0]) <= 1.08
+        if not runway_valid:
+            reasons.append("outside_runway_quadrilateral")
+        center, tolerance = (context or {}).get("ground_center"), (context or {}).get("ground_tolerance")
+        if center is not None and tolerance is not None:
+            ground_band_valid = abs(float(local[1]) - center) <= tolerance
+            if not ground_band_valid:
+                reasons.append("outside_camera_ground_band")
+
+    distance = float(np.hypot(candidate["x"] - ankle_x, candidate["y"] - ankle_y))
+    threshold = (context or {}).get("attachment_thresholds", {}).get(joint, 12.0)
+    attachment_valid = distance <= threshold
+    if not attachment_valid:
+        reasons.append("foot_too_far_from_same_side_ankle")
+    # A heel selected as a ground contact should not be conspicuously above
+    # the ankle.  When it is, a valid toe or the ankle itself is safer.
+    vertical_tolerance = max(5.0, threshold * 0.25)
+    if candidate["y"] < ankle_y - vertical_tolerance:
+        attachment_valid = False
+        reasons.append("foot_above_ankle_ground_level")
+    return {
+        "valid": runway_valid and ground_band_valid and attachment_valid,
+        "runway_valid": runway_valid,
+        "ground_band_valid": ground_band_valid,
+        "attachment_valid": attachment_valid,
+        "reasons": reasons,
+    }
+
+
+def _validate_ankle_contact(ankle_x, ankle_y, context):
+    """The final ankle fallback must still be on the camera's ground band."""
+    point = (ankle_x, ankle_y)
+    local = _runway_local(point, (context or {}).get("geometry"))
+    reasons = []
+    runway_valid = True
+    ground_valid = True
+    if local is not None:
+        runway_valid = -0.65 <= float(local[1]) <= 1.65 and -0.08 <= float(local[0]) <= 1.08
+        if not runway_valid:
+            reasons.append("ankle_outside_runway_quadrilateral")
+        center, tolerance = (context or {}).get("ground_center"), (context or {}).get("ground_tolerance")
+        ground_valid = center is None or tolerance is None or abs(float(local[1]) - center) <= tolerance
+        if not ground_valid:
+            reasons.append("ankle_outside_camera_ground_band")
+
+    return runway_valid and ground_valid, reasons
+
+
+def select_contact_point(foot, ankle_x, ankle_y, ankle_conf, foot_contacts, context=None):
+    """Choose landing position without changing the ankle-derived event time.
+
+    Priority is heel, then big toe, then ankle.  A point must have finite
+    coordinates and WholeBody confidence >= 0.50 before it can replace the
+    ankle.  The explicit reason is persisted in CSVs for inspection.
+    """
+    side = str(foot).lower()
+    candidates = (foot_contacts or {}).get(side, {})
+    validation = {}
+    for joint in ("heel", "big_toe"):
+        candidate = candidates.get(joint)
+        if candidate is None:
+            validation[joint] = {"valid": False, "reasons": ["point_missing"]}
+            continue
+        x, y, conf = candidate["x"], candidate["y"], candidate["conf"]
+        if not np.isfinite([x, y, conf]).all() or conf < CONTACT_CONFIDENCE_THRESHOLD:
+            validation[joint] = {"valid": False, "reasons": ["confidence_below_0_50"]}
+            continue
+        check = _validate_foot_contact(candidate, joint, ankle_x, ankle_y, context)
+        validation[joint] = check
+        if check["valid"]:
+            return {
+                "contact_joint": f"{side}_{joint}",
+                "contact_x": float(x), "contact_y": float(y),
+                "contact_conf": float(conf),
+                "contact_selection_reason": f"{joint}_confidence_ge_{CONTACT_CONFIDENCE_THRESHOLD:.2f}",
+                "heel_valid": bool(validation.get("heel", {}).get("valid", False)),
+                "big_toe_valid": bool(validation.get("big_toe", {}).get("valid", False)),
+                "runway_valid": bool(check["runway_valid"]),
+                "attachment_valid": bool(check["attachment_valid"]),
+                "ground_band_valid": bool(check["ground_band_valid"]),
+                "contact_rejection_reason": "",
+                "contact_valid": True,
+            }
+    rejected = ";".join(
+        f"{joint}:{'|'.join(data.get('reasons', []))}"
+        for joint, data in validation.items() if not data.get("valid"))
+    ankle_valid, ankle_reasons = _validate_ankle_contact(ankle_x, ankle_y, context)
+    if not ankle_valid:
+        return {
+            "contact_joint": f"{side}_invalid",
+            "contact_x": float(ankle_x), "contact_y": float(ankle_y),
+            "contact_conf": float(ankle_conf),
+            "contact_selection_reason": "all_contact_candidates_rejected",
+            "heel_valid": False, "big_toe_valid": False,
+            "runway_valid": False, "attachment_valid": False, "ground_band_valid": False,
+            "contact_rejection_reason": rejected + ";" + "|".join(ankle_reasons),
+            "contact_valid": False,
+        }
+    return {
+        "contact_joint": f"{side}_ankle",
+        "contact_x": float(ankle_x), "contact_y": float(ankle_y),
+        "contact_conf": float(ankle_conf),
+        "contact_selection_reason": "heel_and_big_toe_rejected_or_unavailable__ankle_fallback",
+        "heel_valid": bool(validation.get("heel", {}).get("valid", False)),
+        "big_toe_valid": bool(validation.get("big_toe", {}).get("valid", False)),
+        "runway_valid": True,
+        "attachment_valid": True,
+        "ground_band_valid": True,
+        "contact_rejection_reason": rejected,
+        "contact_valid": True,
+    }
+
+
+def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, prominence=None,
+                  lookahead_rows=None):
+    """lookahead_rows: a few frames from the *next* camera, appended only so
+    find_peaks() has enough trailing signal to confirm/reject a touchdown
+    sitting right at this camera's tracked-window boundary (a peak with no
+    frames after it in ankle_rows can't be told apart from a still-rising
+    swing). These rows never become candidates themselves -- the next
+    camera's own detect_steps() call is what actually detects them.
+    """
     if not ankle_rows:
         return []
 
@@ -481,10 +1029,13 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
     # frames apart to both be detected, unlike min_step_frames which is calibrated for
     # same-foot intervals and would suppress every other step.
     y = np.array([r["lower_ankle_y"] for r in ankle_rows], dtype=float)
-    y_smooth = smooth(y)
+    lookahead_rows = lookahead_rows or []
+    y_lookahead = np.array([r["lower_ankle_y"] for r in lookahead_rows], dtype=float)
+    y_extended = np.concatenate([y, y_lookahead]) if len(y_lookahead) else y
+    y_smooth = smooth(y_extended)
     lower_prominence = prominence
     if lower_prominence is None:
-        q75, q25 = np.nanpercentile(y_smooth, [75, 25])
+        q75, q25 = np.nanpercentile(y_smooth[:len(y)], [75, 25])
         lower_prominence = max((q75 - q25) * 0.20, 1.5)
 
     peak_distance = max(3, int(fps / 8.0))
@@ -494,6 +1045,12 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
         prominence=lower_prominence,
     )
     prominences = props.get("prominences", np.zeros(len(peaks), dtype=float))
+    # Peaks in the appended lookahead tail belong to the next camera -- they
+    # exist only so find_peaks() has trailing signal to judge a boundary
+    # peak, never to become candidates here (see lookahead_rows docstring).
+    own_mask = peaks < len(y)
+    peaks = peaks[own_mask]
+    prominences = prominences[own_mask]
 
     def _valid_conf(conf, min_conf):
         try:
@@ -1143,14 +1700,16 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
 
 
 def apply_leg_swap_to_foot_keypoints(foot_npz_path, swapped_mask):
-    """Apply the same per-frame L/R swap decision from apply_anchor_leg_correction()
-    to the COCO-WholeBody foot points (toe/heel), which live outside keypoints.npz
-    and are otherwise untouched by the body leg-identity DP correction.
+    """Apply the final raw-to-output L/R permutation to WholeBody foot points.
+
+    The caller must pass the cumulative XOR mask covering both the preprocessing
+    ``_correct_leg_swaps`` pass and ``apply_anchor_leg_correction``.  Passing only
+    the latter desynchronizes feet whenever both body stages swapped the same
+    frame.
 
     foot_npz_path: path to foot_keypoints.npz (keypoints order: L_big_toe,
         L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel).
-    swapped_mask: per-frame bool array returned by apply_anchor_leg_correction(),
-        or None if there weren't enough anchors to run the correction.
+    swapped_mask: per-frame final XOR bool array, or None when no correction ran.
 
     No-ops (does not raise) if foot_npz_path doesn't exist or swapped_mask is None,
     since foot data is optional and the correction may not have run.
@@ -1181,6 +1740,65 @@ def apply_leg_swap_to_foot_keypoints(foot_npz_path, swapped_mask):
     )
 
 
+def combine_leg_swap_masks(pre_dp_swapped_mask, anchor_dp_swapped_mask):
+    """Return the final raw-to-output leg permutation using XOR parity.
+
+    Body legs can be swapped once by ``_correct_leg_swaps`` during 2D
+    preprocessing and again by ``apply_anchor_leg_correction``.  Foot points
+    start in raw WholeBody order, so they must receive the parity of both
+    operations rather than only the anchor-DP mask.
+    """
+    if pre_dp_swapped_mask is None and anchor_dp_swapped_mask is None:
+        return None
+    if pre_dp_swapped_mask is None:
+        return np.asarray(anchor_dp_swapped_mask, dtype=bool).copy()
+    if anchor_dp_swapped_mask is None:
+        return np.asarray(pre_dp_swapped_mask, dtype=bool).copy()
+
+    pre = (
+        np.asarray(pre_dp_swapped_mask, dtype=bool).reshape(-1)
+        if pre_dp_swapped_mask is not None else np.zeros(len(final_mask), dtype=bool)
+    )
+    anchor = (
+        np.asarray(anchor_dp_swapped_mask, dtype=bool).reshape(-1)
+        if anchor_dp_swapped_mask is not None else np.zeros(len(final_mask), dtype=bool)
+    )
+    total = max(len(pre), len(anchor))
+    pre_aligned = np.zeros(total, dtype=bool)
+    anchor_aligned = np.zeros(total, dtype=bool)
+    pre_aligned[:len(pre)] = pre
+    anchor_aligned[:len(anchor)] = anchor
+    return np.logical_xor(pre_aligned, anchor_aligned)
+
+
+def update_leg_swap_metadata(keypoints_npz_path, pre_dp_swapped_mask,
+                             anchor_dp_swapped_mask):
+    """Persist pre/anchor/final masks and return the final XOR mask."""
+    final_mask = combine_leg_swap_masks(
+        pre_dp_swapped_mask, anchor_dp_swapped_mask)
+    if final_mask is None:
+        return None
+
+    mask_path = Path(keypoints_npz_path).parent / "post_dp_ankle_fill_mask.npz"
+    values = {}
+    if mask_path.exists():
+        with np.load(mask_path, allow_pickle=True) as data:
+            values = {name: data[name] for name in data.files}
+
+    pre = np.asarray(pre_dp_swapped_mask, dtype=bool).reshape(-1)
+    anchor = np.asarray(anchor_dp_swapped_mask, dtype=bool).reshape(-1)
+    values.update({
+        "pre_dp_leg_swapped": pre,
+        "anchor_dp_leg_swapped": anchor,
+        "final_leg_swapped": final_mask,
+        # Backward-compatible key consumed by diagnostic sheet tooling.  It now
+        # means the final raw-to-output identity permutation.
+        "dp_leg_swapped": final_mask,
+    })
+    np.savez_compressed(mask_path, **values)
+    return final_mask
+
+
 def align_foot_keypoints_to_body(foot_npz_path, raw_keypoints_npz_path, keypoints_npz_path, swapped_mask):
     """Re-anchor foot points to the same post-smoothing/post-DP ankle positions
     that the body skeleton in keypoints.npz uses, so the two draw consistently.
@@ -1195,7 +1813,7 @@ def align_foot_keypoints_to_body(foot_npz_path, raw_keypoints_npz_path, keypoint
     arrays are sitting in different processing stages.
 
     Fix: express each foot point as an offset from the *raw* ankle it was
-    detected next to (using the same swap decision as
+    detected next to (using the same cumulative XOR decision as
     apply_leg_swap_to_foot_keypoints so the correct raw ankle is picked even
     on swapped frames), then re-apply that offset to the *final* smoothed
     ankle position. This keeps the detected toe/heel geometry relative to the
@@ -1248,15 +1866,559 @@ def align_foot_keypoints_to_body(foot_npz_path, raw_keypoints_npz_path, keypoint
     )
 
 
+def _long_jump_impact_position(rows, peak_index, foot):
+    """Estimate horizontal impact position while retaining the observed impact height.
+
+    At a sand landing the ankle heatmap often collapses exactly at maximum
+    compression.  The raw peak still gives the most useful contact-time and
+    vertical coordinate; its horizontal coordinate is interpolated from the
+    nearest reliable same-side ankle observations when possible.
+    """
+    peak = rows[peak_index]
+    prefix = "right" if foot == "right" else "left"
+    before = after = None
+    for index in range(peak_index - 1, -1, -1):
+        row = rows[index]
+        if float(row[f"{prefix}_ankle_conf"]) >= LONG_JUMP_NEIGHBOR_CONFIDENCE:
+            before = (index, row)
+            break
+    for index in range(peak_index + 1, len(rows)):
+        row = rows[index]
+        if float(row[f"{prefix}_ankle_conf"]) >= LONG_JUMP_NEIGHBOR_CONFIDENCE:
+            after = (index, row)
+            break
+    raw_x = float(peak[f"{prefix}_ankle_x"])
+    raw_y = float(peak[f"{prefix}_ankle_y"])
+    if before is None or after is None:
+        return raw_x, raw_y, "low_confidence_impact_peak"
+    before_index, before_row = before
+    after_index, after_row = after
+    if after_index - before_index > 18:
+        return raw_x, raw_y, "low_confidence_impact_peak"
+    ratio = (peak_index - before_index) / (after_index - before_index)
+    estimated_x = float(before_row[f"{prefix}_ankle_x"]) + ratio * (
+        float(after_row[f"{prefix}_ankle_x"]) - float(before_row[f"{prefix}_ankle_x"]))
+    return estimated_x, raw_y, "trajectory_estimated"
+
+
+def _find_terminal_long_jump_flight(rows, events, fps):
+    """Return one confirmed terminal-camera airborne interval, if present.
+
+    The normal step detector deliberately looks for local *downward* ankle
+    peaks.  During a long jump, the descending foot can create the same peak
+    while it is still in the air.  This helper instead requires the complete
+    pattern ``ground -> sustained rise -> apex -> sustained return to ground``.
+    Therefore events between takeoff and the first ground return are not steps
+    and must be removed rather than moved sideways by homography correction.
+    """
+    if not rows or not events:
+        return None
+
+    min_airborne = max(
+        int(round(float(fps) * LONG_JUMP_AIRBORNE_MIN_SECONDS)),
+        int(round(float(fps) * LONG_JUMP_MIN_FLIGHT_SECONDS)),
+    )
+    row_index = {int(row["seq_frame"]): index for index, row in enumerate(rows)}
+    event_indices = [
+        (event, row_index.get(int(event["seq_frame"])))
+        for event in events
+    ]
+    event_indices = [(event, index) for event, index in event_indices if index is not None]
+    if not event_indices:
+        return None
+
+    best = None
+    for event_pos, (previous, previous_index) in enumerate(event_indices):
+        # A robust local ground height comes from the last few accepted running
+        # contacts, not a single potentially noisy ankle sample.
+        history = event_indices[max(0, event_pos - 2):event_pos + 1]
+        ground_y = float(np.median([
+            float(rows[index]["lower_ankle_y"]) for _, index in history
+        ]))
+        start_limit = min(len(rows), previous_index + int(round(float(fps) * 2.5)))
+        if start_limit - previous_index <= min_airborne:
+            continue
+
+        rise_index = None
+        for index in range(previous_index + 1, start_limit - 1):
+            # Two consecutive points avoid interpreting one HRNet jitter frame
+            # as a takeoff.
+            if (float(rows[index]["lower_ankle_y"]) <= ground_y - LONG_JUMP_AIRBORNE_RISE_PX
+                    and float(rows[index + 1]["lower_ankle_y"]) <= ground_y - LONG_JUMP_AIRBORNE_RISE_PX):
+                rise_index = index
+                break
+        if rise_index is None:
+            continue
+
+        # Find the *first* return to the local ground height.  Do not search
+        # for an apex across the entire remaining camera window: a normal
+        # preceding stride can rise and return before the real takeoff, and
+        # joining those arcs would delete that valid touchdown.
+        return_index = None
+        for index in range(rise_index + 1, start_limit - 1):
+            if (float(rows[index]["lower_ankle_y"]) >= ground_y - LONG_JUMP_GROUND_RETURN_TOLERANCE_PX
+                    and float(rows[index + 1]["lower_ankle_y"]) >= ground_y - LONG_JUMP_GROUND_RETURN_TOLERANCE_PX):
+                return_index = index
+                break
+        if return_index is None:
+            continue
+
+        # A normal running swing returns to ground too quickly to be a long
+        # jump.  Let the next accepted contact start a fresh flight search.
+        if return_index - rise_index < min_airborne:
+            continue
+
+        # The apex belongs strictly to this one airborne arc.
+        y_window = [float(rows[index]["lower_ankle_y"])
+                    for index in range(rise_index, return_index + 1)]
+        apex_index = rise_index + int(np.argmin(y_window))
+        if apex_index <= rise_index:
+            continue
+
+        excursion = ground_y - float(rows[apex_index]["lower_ankle_y"])
+        if excursion < LONG_JUMP_MIN_VERTICAL_EXCURSION_PX:
+            continue
+        score = excursion + (return_index - rise_index) * 0.5
+        candidate = {
+            "previous": previous,
+            "previous_index": previous_index,
+            "flight_start_index": rise_index,
+            "apex_index": apex_index,
+            "return_index": return_index,
+            "ground_y": ground_y,
+            "score": score,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def _long_jump_lowest_impact_index(rows, ground_return_index, fps):
+    """Return the first post-return compression low point of a sand landing.
+
+    The first frame that re-enters the ground band proves touchdown but is
+    commonly early: the ankle continues downward while the athlete compresses
+    into the sand.  In image coordinates that compression is increasing y.
+    Keep following it briefly, stopping at the first clear reversal so recovery
+    motion cannot move the reported landing later.
+    """
+    window_end = min(len(rows), ground_return_index + max(4, int(round(float(fps) * 0.40))))
+    best_index = ground_return_index
+    best_y = float(rows[best_index]["lower_ankle_y"])
+    rising_after_best = 0
+    for index in range(ground_return_index + 1, window_end):
+        value = float(rows[index]["lower_ankle_y"])
+        if value >= best_y:
+            best_index, best_y = index, value
+            rising_after_best = 0
+            continue
+        if best_index > ground_return_index and value < best_y - 1.0:
+            rising_after_best += 1
+            if rising_after_best >= 2:
+                break
+    return best_index
+
+
+def _detect_long_jump_final_landing(ankle_rows, accepted_events, fps):
+    """Find a low-confidence sand impact between two otherwise valid contacts.
+
+    This is deliberately restricted to the final camera.  It detects the
+    long-jump pattern ``ground -> rising ankle -> descending ankle -> impact``
+    and replaces a delayed post-impact regular step with the first impact peak.
+    No manually clicked takeoff or sand zone is required.
+    """
+    if not ankle_rows or not accepted_events:
+        return None
+    terminal_cam = max(int(row["cam"]) for row in ankle_rows)
+    rows = [row for row in ankle_rows if int(row["cam"]) == terminal_cam]
+    events = sorted((event for event in accepted_events if int(event["cam"]) == terminal_cam),
+                    key=lambda event: int(event["seq_frame"]))
+    # One confirmed final-camera running contact is enough to establish a
+    # flight baseline; do not require a false post-takeoff peak to exist.
+    if len(rows) < 8 or len(events) < 1:
+        return None
+
+    # Prefer a complete flight state over the older "large gap between two
+    # detected peaks" heuristic.  The latter can retain a false regular peak
+    # in mid-air; this path explicitly discards all such peaks.
+    flight = _find_terminal_long_jump_flight(rows, events, fps)
+    if flight is not None:
+        impact_index = _long_jump_lowest_impact_index(
+            rows, flight["return_index"], fps)
+        peak = rows[impact_index]
+        foot = str(peak["lower_foot"])
+        contact_x, contact_y, position_source = _long_jump_impact_position(rows, impact_index, foot)
+        return {
+            "seq_frame": int(peak["seq_frame"]),
+            "orig_frame": int(peak["orig_frame"]),
+            "time_s": float(peak["time_s"]),
+            "seq_time_s": float(peak["seq_time_s"]),
+            "cam": int(peak["cam"]),
+            "foot": foot,
+            "event_type": "final_landing",
+            "flight_start_frame": int(rows[flight["flight_start_index"]]["seq_frame"]),
+            "landing_position_source": position_source,
+            "landing_score": float(flight["score"]),
+            "ankle_x": float(peak["lower_ankle_x"]),
+            "ankle_y": float(peak["lower_ankle_y"]),
+            "ankle_conf": float(peak["lower_ankle_conf"]),
+            "contact_joint": f"{foot}_ankle_estimated",
+            "contact_x": contact_x,
+            "contact_y": contact_y,
+            "contact_conf": float(peak["lower_ankle_conf"]),
+            "contact_selection_reason": "long_jump_confirmed_airborne_return",
+            "heel_valid": False,
+            "big_toe_valid": False,
+            "runway_valid": True,
+            "attachment_valid": True,
+            "ground_band_valid": True,
+            "contact_rejection_reason": "",
+            "contact_valid": True,
+            # Keep all ordinary candidates only up to the last confirmed
+            # pre-takeoff contact.  Mid-air peaks are explicitly discarded.
+            "_keep_through_seq": int(flight["previous"]["seq_frame"]),
+        }
+    row_index = {int(row["seq_frame"]): index for index, row in enumerate(rows)}
+    min_gap = max(6, int(round(float(fps) * LONG_JUMP_MIN_EVENT_GAP_SECONDS)))
+    min_flight = max(4, int(round(float(fps) * LONG_JUMP_MIN_FLIGHT_SECONDS)))
+    best = None
+
+    for previous, following in zip(events, events[1:]):
+        previous_index = row_index.get(int(previous["seq_frame"]))
+        following_index = row_index.get(int(following["seq_frame"]))
+        if previous_index is None or following_index is None:
+            continue
+        if following_index - previous_index < min_gap:
+            continue
+        # Ignore the leading endpoint: `previous` is a genuine prior contact,
+        # so its own peak height must stay excluded when measuring vertical
+        # excursion. No trailing buffer: this function only ever runs on the
+        # terminal camera, where no legitimate step can follow an
+        # already-confirmed running step, so `following` (even if the
+        # standard detector mistook the impact itself for a regular step)
+        # can never be a real subsequent contact worth protecting against —
+        # trimming frames near it only risks cutting off the true impact peak.
+        inner_start, inner_end = previous_index + 3, following_index
+        if inner_end <= inner_start:
+            continue
+        # Takeoff = the highest point of the flight arc (min y) anywhere in
+        # this window; searched before impact_index below since it no longer
+        # depends on it.
+        window_rows = rows[inner_start:inner_end + 1]
+        takeoff_index = inner_start + int(np.argmin(
+            [float(row["lower_ankle_y"]) for row in window_rows]
+        ))
+
+        # Preferred candidate: the first sustained confidence collapse after
+        # takeoff (the true touchdown instant, per the module docstring's
+        # "confidence collapse" signature). Falls back to the deepest-y frame
+        # only if the trial never shows a real collapse (clean tracking
+        # throughout), so landings are still detected either way.
+        impact_index = None
+        collapse_run = 0
+        for idx in range(takeoff_index, inner_end + 1):
+            if float(rows[idx]["lower_ankle_conf"]) < LONG_JUMP_IMPACT_CONFIDENCE_THRESHOLD:
+                collapse_run += 1
+                if collapse_run >= LONG_JUMP_IMPACT_MIN_RUN:
+                    impact_index = idx - collapse_run + 1
+                    break
+            else:
+                collapse_run = 0
+
+        if impact_index is not None:
+            peak_index = impact_index
+        else:
+            y_values = np.asarray([float(row["lower_ankle_y"]) for row in window_rows], dtype=float)
+            peak_index = inner_start + int(np.argmax(y_values))
+        peak = rows[peak_index]
+        excursion = float(peak["lower_ankle_y"]) - float(rows[takeoff_index]["lower_ankle_y"])
+        # The peak must follow a genuine airborne dip and return to at least the
+        # preceding contact height.  This excludes ordinary small gait jitter.
+        if peak_index - takeoff_index < min_flight:
+            continue
+        if excursion < LONG_JUMP_MIN_VERTICAL_EXCURSION_PX:
+            continue
+        if float(peak["lower_ankle_y"]) < float(previous["ankle_y"]) - 5.0:
+            continue
+        score = excursion + (following_index - previous_index) * 0.25
+        candidate = {
+            "peak_index": peak_index,
+            "takeoff_index": takeoff_index,
+            "following": following,
+            "score": score,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    if best is None:
+        return None
+    peak = rows[best["peak_index"]]
+    foot = str(peak["lower_foot"])
+    contact_x, contact_y, position_source = _long_jump_impact_position(rows, best["peak_index"], foot)
+    return {
+        "seq_frame": int(peak["seq_frame"]),
+        "orig_frame": int(peak["orig_frame"]),
+        "time_s": float(peak["time_s"]),
+        "seq_time_s": float(peak["seq_time_s"]),
+        "cam": int(peak["cam"]),
+        "foot": foot,
+        "event_type": "final_landing",
+        "flight_start_frame": int(rows[best["takeoff_index"]]["seq_frame"]),
+        "landing_position_source": position_source,
+        "landing_score": float(best["score"]),
+        "ankle_x": float(peak["lower_ankle_x"]),
+        "ankle_y": float(peak["lower_ankle_y"]),
+        "ankle_conf": float(peak["lower_ankle_conf"]),
+        "contact_joint": f"{foot}_ankle_estimated",
+        "contact_x": contact_x,
+        "contact_y": contact_y,
+        "contact_conf": float(peak["lower_ankle_conf"]),
+        "contact_selection_reason": "long_jump_low_confidence_impact_peak",
+        "heel_valid": False,
+        "big_toe_valid": False,
+        "runway_valid": True,
+        "attachment_valid": True,
+        "ground_band_valid": True,
+        "contact_rejection_reason": "",
+        "contact_valid": True,
+        "_replace_after_seq": int(best["following"]["seq_frame"]),
+    }
+
+
+def _recompute_contact_event_metrics(events, calibrations, contexts=None):
+    """Recompute distances after special landing replacement changes event order.
+
+    contexts (from _contact_validation_contexts()) supplies each homography
+    camera's learned plausible world_y band. A point outside it gets its
+    world_x_m/world_y_m/step_length_m left as None rather than displaying an
+    implausible position -- this only affects display/distance for that one
+    event, not whether it stayed in `events` (which _detect_long_jump_final_
+    landing() already used purely by frame position, upstream of this call).
+    """
+    contexts = contexts or {}
+    previous_by_camera = {}
+    previous_global_track_pos_m = None
+    for event in sorted(events, key=lambda item: int(item["seq_frame"])):
+        cam_idx = int(event["cam"])
+        calibration = calibrations.get(cam_idx)
+        point = (float(event["contact_x"]), float(event["contact_y"]))
+        track_pos = _project(point, calibration) if calibration else None
+        previous = previous_by_camera.get(cam_idx)
+        event["track_position_px"] = None if calibration and calibration.get("mode") == "homography" else track_pos
+        event["world_x_m"] = event["world_y_m"] = None
+        event["step_length_px"] = event["step_length_m"] = None
+        if calibration and calibration.get("mode") == "homography":
+            world_x, world_y = _transform_homography(point, calibration["homography"])
+            # Keep the raw projected coordinates even when the lateral value is
+            # rejected.  The along-runway X is still useful for step length;
+            # a later pass replaces only the unreliable cross-track Y.
+            event["_homography_raw_world_x"] = world_x
+            event["_homography_raw_world_y"] = world_y
+            event["homography_y_interpolated"] = False
+            # The learned band comes from regular running-gait steps, which
+            # sit close to the lane centerline; a long-jump landing legitimately
+            # lands off that centerline, so don't hold it to the same band.
+            is_landing = str(event.get("event_type", "")) == "final_landing"
+            lateral_ok, _ = _validate_homography_lateral(point, contexts.get(cam_idx))
+            # Only set for homography-mode events, so the overlay can tell
+            # "line/pixel mode, world coords never applicable" (key absent)
+            # apart from "homography mode, this specific point's world
+            # coordinate was untrustworthy" (explicit False) -- world_x_m
+            # being None alone can't carry that distinction. Must match the
+            # same is_landing exemption as the data below, or the overlay
+            # would mute a landing point whose world coords it still shows.
+            event["homography_lateral_valid"] = lateral_ok or is_landing
+            if lateral_ok or is_landing:
+                event["world_x_m"], event["world_y_m"] = world_x, world_y
+                event["step_length_m"] = None if previous is None else abs(track_pos - previous)
+        elif previous is not None:
+            event["step_length_px"] = abs(track_pos - previous)
+            mpp = calibration.get("meters_per_pixel") if calibration else None
+            event["step_length_m"] = None if mpp is None else event["step_length_px"] * mpp
+
+        # Cross-camera bridge: each camera has its own local origin.  Convert
+        # either a line projection or a Homography local X to the shared whole
+        # runway coordinate before measuring the first step after a cut.
+        track_pos_m = None
+        if calibration and calibration.get("mode") == "homography" and event.get("world_x_m") is not None:
+            track_pos_m = (
+                calibration.get("camera_offset_m", 0.0)
+                + float(event["world_x_m"])
+                - float(calibration.get("world_x_min", 0.0))
+            )
+        elif calibration and calibration.get("mode") == "line" and track_pos is not None:
+            mpp = calibration.get("meters_per_pixel")
+            if mpp is not None:
+                track_pos_m = calibration.get("camera_offset_m", 0.0) + track_pos * mpp
+        if track_pos_m is not None:
+            if event["step_length_m"] is None and previous_global_track_pos_m is not None:
+                event["step_length_m"] = abs(track_pos_m - previous_global_track_pos_m)
+            previous_global_track_pos_m = track_pos_m
+
+        if track_pos is not None:
+            previous_by_camera[cam_idx] = track_pos
+
+    # A point can be inside the physical strip yet still be a one-frame pose
+    # jump. Compare only an interior event with both neighbouring valid events
+    # from the same camera; end points are deliberately left alone because
+    # they have no two-sided temporal evidence.
+    for cam_idx, calibration in calibrations.items():
+        if not calibration or calibration.get("mode") != "homography":
+            continue
+        camera_events = [
+            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            if int(event.get("cam", -1)) == int(cam_idx)
+            and event.get("world_y_m") is not None
+            and str(event.get("event_type", "")) != "final_landing"
+        ]
+        # Snapshot the original world_y values before the loop mutates any of
+        # them -- reading camera_events[...]["world_y_m"] live would crash on
+        # two adjacent rejections (the second one's "previous" neighbour was
+        # just nulled out by the first).
+        original_world_y = [float(event["world_y_m"]) for event in camera_events]
+        for index in range(1, len(camera_events) - 1):
+            previous = original_world_y[index - 1]
+            current = original_world_y[index]
+            following = original_world_y[index + 1]
+            expected = float(np.median([previous, following]))
+            if abs(current - expected) <= HOMOGRAPHY_TEMPORAL_LATERAL_JUMP_M:
+                continue
+            event = camera_events[index]
+            event["homography_lateral_valid"] = False
+            event["world_x_m"] = event["world_y_m"] = None
+            event["step_length_m"] = None
+            prior_reason = str(event.get("contact_rejection_reason") or "")
+            reason = "homography_lateral_temporal_jump"
+            event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
+
+    # A rejected cross-track coordinate does not mean its gait event vanished.
+    # Preserve that event's raw forward X and timestamp, but estimate only Y
+    # from neighbouring trustworthy contacts. This prevents a pose heatmap
+    # jump from becoming either a false map point or a missing step.
+    for cam_idx, calibration in calibrations.items():
+        if not calibration or calibration.get("mode") != "homography":
+            continue
+        camera_events = [
+            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            if int(event.get("cam", -1)) == int(cam_idx)
+            and str(event.get("event_type", "")) != "final_landing"
+        ]
+        valid_indices = [
+            index for index, event in enumerate(camera_events)
+            if event.get("world_y_m") is not None
+        ]
+        for index, event in enumerate(camera_events):
+            if event.get("world_y_m") is not None:
+                continue
+            raw_x = event.get("_homography_raw_world_x")
+            if raw_x is None:
+                continue
+            before = [valid for valid in valid_indices if valid < index]
+            after = [valid for valid in valid_indices if valid > index]
+            prev_event = camera_events[before[-1]] if before else None
+            next_event = camera_events[after[0]] if after else None
+            if prev_event is not None and next_event is not None:
+                prev_x, prev_y = float(prev_event["world_x_m"]), float(prev_event["world_y_m"])
+                next_x, next_y = float(next_event["world_x_m"]), float(next_event["world_y_m"])
+                span_x = next_x - prev_x
+                ratio = (float(raw_x) - prev_x) / span_x if abs(span_x) > 1e-6 else 0.5
+                estimated_y = prev_y + ratio * (next_y - prev_y)
+            elif prev_event is not None:
+                estimated_y = float(prev_event["world_y_m"])
+            elif next_event is not None:
+                estimated_y = float(next_event["world_y_m"])
+            else:
+                continue
+            event["world_x_m"] = float(raw_x)
+            event["world_y_m"] = float(estimated_y)
+            event["homography_lateral_valid"] = True
+            event["homography_y_interpolated"] = True
+            prior_reason = str(event.get("contact_rejection_reason") or "")
+            reason = "homography_y_interpolated"
+            event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
+
+    # Layer 2 (velocity continuity): a contact point can pass the physical
+    # runway-bound check (layer 1, in _validate_homography_lateral()) yet
+    # still be a misdetection if it implies an impossible sprint speed
+    # to/from its neighbour -- e.g. the same distance jump happening in a
+    # much shorter time than a real stride takes. Checked only within a
+    # single camera's own clip: time_s resets at each camera cut, so a
+    # cross-camera pair's elapsed time isn't directly comparable, and a step
+    # spanning a camera cut is deliberately left unchecked by this layer.
+    for cam_idx, calibration in calibrations.items():
+        if not calibration or calibration.get("mode") != "homography":
+            continue
+        camera_events = [
+            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            if int(event.get("cam", -1)) == int(cam_idx)
+            and event.get("world_x_m") is not None
+            and str(event.get("event_type", "")) != "final_landing"
+        ]
+        if len(camera_events) < 2:
+            continue
+        speeds = []
+        for prev_event, cur_event in zip(camera_events, camera_events[1:]):
+            dt = float(cur_event["time_s"]) - float(prev_event["time_s"])
+            dx = float(cur_event["world_x_m"]) - float(prev_event["world_x_m"])
+            speeds.append(abs(dx / dt) if dt > 0 else None)
+        valid_speeds = [speed for speed in speeds if speed is not None]
+        if not valid_speeds:
+            continue
+        median_speed = float(np.median(valid_speeds))
+        for index in range(1, len(camera_events)):
+            speed = speeds[index - 1]
+            if speed is None:
+                continue
+            plausible = (
+                speed <= HOMOGRAPHY_VELOCITY_ABS_CEILING_MPS
+                and abs(speed - median_speed) <= HOMOGRAPHY_VELOCITY_RELATIVE_MULTIPLIER * median_speed
+            )
+            if plausible:
+                continue
+            event = camera_events[index]
+            event["world_x_m"] = event["world_y_m"] = None
+            event["step_length_m"] = None
+            event["homography_lateral_valid"] = False
+            prior_reason = str(event.get("contact_rejection_reason") or "")
+            reason = "homography_velocity_implausible"
+            event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
+
+    # Recalculate Homography step lengths after any geometric/temporal rejection
+    # so no displayed distance is based on a hidden anchor.
+    previous_global_world_x = None
+    for event in sorted(events, key=lambda item: int(item["seq_frame"])):
+        calibration = calibrations.get(int(event.get("cam", 0)))
+        if not calibration or calibration.get("mode") != "homography":
+            continue
+        event["step_length_m"] = None
+        if event.get("world_x_m") is None:
+            continue
+        global_world_x = (
+            float(calibration.get("camera_offset_m", 0.0))
+            + float(event["world_x_m"])
+            - float(calibration.get("world_x_min", 0.0))
+        )
+        if previous_global_world_x is not None:
+            event["step_length_m"] = abs(global_world_x - previous_global_world_x)
+        previous_global_world_x = global_world_x
+
+    # Internal values are used only while reconstructing this event list and
+    # must not leak into the stable CSV schema.
+    for event in events:
+        event.pop("_homography_raw_world_x", None)
+        event.pop("_homography_raw_world_y", None)
+
+
 def refresh_step_analysis_after_leg_correction(
     step_analysis,
     config,
     output_dir,
     keypoints_npz,
     offsets_npz,
+    foot_npz=None,
     meters_per_pixel=None,
 ):
-    """Refresh ankle rows and event coordinates after keypoints were rewritten.
+    """Refresh rows and final contact coordinates after keypoints were rewritten.
 
     ``run_step_stride_analysis()`` must run before anchor leg correction because it
     provides the touchdown anchors. After ``apply_anchor_leg_correction()`` rewrites
@@ -1264,7 +2426,9 @@ def refresh_step_analysis_after_leg_correction(
     ``ankle_rows`` still reflect the pre-correction labels. This function keeps the
     already accepted event timing/foot labels, but regenerates ankle rows and event
     coordinates from the corrected keypoints so the final overlay and CSVs use one
-    consistent source of truth.
+    consistent source of truth.  Touchdown *time* remains the original
+    ankle-peak result.  Its final location follows the contact hierarchy:
+    heel (confidence >= .50), big toe (>= .50), then ankle fallback.
     """
     if not step_analysis:
         return step_analysis
@@ -1283,8 +2447,14 @@ def refresh_step_analysis_after_leg_correction(
     args = SimpleNamespace(meters_per_pixel=meters_per_pixel)
     ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
     rows_by_seq = {int(row["seq_frame"]): row for row in ankle_rows}
+    foot_npz = foot_npz or str(Path(keypoints_npz).parent / "foot_keypoints.npz")
+    foot_contacts_by_seq = load_foot_contact_positions(foot_npz, offsets_npz)
+    contact_contexts = _contact_validation_contexts(
+        cameras, step_analysis.get("step_events", []), rows_by_seq,
+        foot_contacts_by_seq)
 
     calibrations = {}
+    cumulative_offset_m = 0.0
     for cam_idx, cam in enumerate(cameras):
         start_line = cam.get("start_line")
         end_line = cam.get("end_line")
@@ -1292,16 +2462,32 @@ def refresh_step_analysis_after_leg_correction(
             start_line = [(float(x), float(y)) for x, y in start_line]
         if end_line:
             end_line = [(float(x), float(y)) for x, y in end_line]
-        calibrations[cam_idx] = _make_calibration(
+        distance_m = cam.get("distance_m") or config.get("distance_m")
+        calibration = _make_calibration(
             cam,
             config,
             args,
             start_line,
             end_line,
-            cam.get("distance_m") or config.get("distance_m"),
+            distance_m,
         )
+        # Cameras are laid out sequentially along the runway, but both line
+        # calibration and six-point Homography start their local X at zero.
+        # Stack their physical spans into one global track coordinate so the
+        # step that crosses a camera cut (e.g. S6 -> S7) has a real distance.
+        calibration["camera_offset_m"] = cumulative_offset_m
+        if calibration.get("mode") == "homography":
+            camera_span_m = (
+                float(calibration.get("world_x_max", 0.0))
+                - float(calibration.get("world_x_min", 0.0))
+            )
+        else:
+            camera_span_m = float(distance_m) if distance_m is not None else 0.0
+        cumulative_offset_m += max(0.0, camera_span_m)
+        calibrations[cam_idx] = calibration
 
     refreshed_events = []
+    rejected_events = []
     prev_proj_by_cam = {}
     for event in sorted(step_analysis.get("step_events", []), key=lambda item: int(item["seq_frame"])):
         seq_frame = int(event["seq_frame"])
@@ -1326,7 +2512,19 @@ def refresh_step_analysis_after_leg_correction(
 
         cam_idx = int(row["cam"])
         calibration = calibrations.get(cam_idx) or calibrations.get(0)
-        point = (ankle_x, ankle_y)
+        contact = select_contact_point(
+            foot, ankle_x, ankle_y, ankle_conf,
+            foot_contacts_by_seq.get(seq_frame), contact_contexts.get(cam_idx),
+        )
+        if not contact["contact_valid"]:
+            rejected = dict(event)
+            rejected.update({
+                "ankle_x": ankle_x, "ankle_y": ankle_y, "ankle_conf": ankle_conf,
+                **contact,
+            })
+            rejected_events.append(rejected)
+            continue
+        point = (contact["contact_x"], contact["contact_y"])
         track_pos = _project(point, calibration) if calibration else None
         world_x = world_y = None
         if calibration and calibration.get("mode") == "homography":
@@ -1343,6 +2541,10 @@ def refresh_step_analysis_after_leg_correction(
             prev_proj_by_cam[cam_idx] = track_pos
 
         updated = dict(event)
+        updated.setdefault("event_type", "run_step")
+        updated.setdefault("flight_start_frame", None)
+        updated.setdefault("landing_position_source", "")
+        updated.setdefault("landing_score", None)
         updated.update({
             "orig_frame": row["orig_frame"],
             "time_s": row["time_s"],
@@ -1351,6 +2553,7 @@ def refresh_step_analysis_after_leg_correction(
             "ankle_x": ankle_x,
             "ankle_y": ankle_y,
             "ankle_conf": ankle_conf,
+            **contact,
             "track_position_px": None if calibration and calibration.get("mode") == "homography" else track_pos,
             "world_x_m": world_x,
             "world_y_m": world_y,
@@ -1359,7 +2562,104 @@ def refresh_step_analysis_after_leg_correction(
         })
         refreshed_events.append(updated)
 
+    if bool(config.get("long_jump_final_landing", False)):
+        landing = _detect_long_jump_final_landing(ankle_rows, refreshed_events, fps)
+        if landing is not None:
+            terminal_cam = int(landing["cam"])
+            keep_through_seq = landing.get("_keep_through_seq")
+
+            # The initial peak pass happens before DP resolves leg identity.
+            # A valid final-camera touchdown immediately before takeoff can be
+            # absent from that early list even though it is clear in the final
+            # DP-corrected trajectory.  Once a flight has been confirmed, run
+            # one narrow recovery pass only before its last pre-takeoff anchor.
+            # This never creates steps during flight or after sand impact.
+            terminal_rows = [row for row in ankle_rows if int(row["cam"]) == terminal_cam]
+            terminal_calibration = calibrations.get(terminal_cam)
+            existing_terminal_seq = {
+                int(event["seq_frame"]) for event in refreshed_events
+                if int(event["cam"]) == terminal_cam
+            }
+            if terminal_calibration is not None and keep_through_seq is not None:
+                recovered_candidates = detect_steps(
+                    terminal_rows, terminal_calibration, fps=fps)
+                for candidate in recovered_candidates:
+                    seq_frame = int(candidate["seq_frame"])
+                    row = rows_by_seq.get(seq_frame)
+                    if row is None:
+                        continue
+                    if seq_frame > int(keep_through_seq) or seq_frame in existing_terminal_seq:
+                        continue
+                    foot = str(candidate["foot"])
+                    ankle_x = float(candidate["ankle_x"])
+                    ankle_y = float(candidate["ankle_y"])
+                    ankle_conf = float(candidate["ankle_conf"])
+                    contact = select_contact_point(
+                        foot, ankle_x, ankle_y, ankle_conf,
+                        foot_contacts_by_seq.get(seq_frame), contact_contexts.get(terminal_cam),
+                    )
+                    if not contact["contact_valid"]:
+                        continue
+                    recovered = {
+                        "step_index": 0,
+                        "seq_frame": seq_frame,
+                        "orig_frame": int(row["orig_frame"]),
+                        "time_s": float(row["time_s"]),
+                        "seq_time_s": float(row["seq_time_s"]),
+                        "cam": terminal_cam,
+                        "foot": foot,
+                        "event_type": "run_step",
+                        "flight_start_frame": None,
+                        "landing_position_source": "",
+                        "landing_score": None,
+                        "ankle_x": ankle_x,
+                        "ankle_y": ankle_y,
+                        "ankle_conf": ankle_conf,
+                        **contact,
+                        "track_position_px": None,
+                        "world_x_m": None,
+                        "world_y_m": None,
+                        "step_length_px": None,
+                        "step_length_m": None,
+                        "cadence_spm": None,
+                        "avg_cadence_spm": None,
+                    }
+                    recovered["contact_selection_reason"] = (
+                        f"{contact['contact_selection_reason']};"
+                        "terminal_preflight_recovered_after_dp"
+                    )
+                    refreshed_events.append(recovered)
+                    existing_terminal_seq.add(seq_frame)
+
+            # A confirmed flight invalidates *every* ordinary peak after the
+            # last pre-takeoff contact: peaks before impact are mid-air swing
+            # motion, while peaks after impact are recovery motion.  Older
+            # fallback detections only provide _replace_after_seq, so retain
+            # their former post-impact-only behaviour for compatibility.
+            keep_through_seq = landing.pop("_keep_through_seq", None)
+            replace_after_seq = landing.pop("_replace_after_seq", None)
+            refreshed_events = [
+                event for event in refreshed_events
+                if not (int(event["cam"]) == terminal_cam
+                        and (
+                            (keep_through_seq is not None
+                             and int(event["seq_frame"]) > int(keep_through_seq))
+                            or (keep_through_seq is None and replace_after_seq is not None
+                                and int(event["seq_frame"]) >= int(replace_after_seq))
+                        ))
+            ]
+            refreshed_events.append(landing)
+
     refreshed_events.sort(key=lambda event: int(event["seq_frame"]))
+    _recompute_contact_event_metrics(refreshed_events, calibrations, contact_contexts)
+    # seq_frame is already comparable across cameras (cameras are laid out
+    # sequentially along the runway), so refreshed_events above is already in
+    # true trial-wide chronological order. Number steps globally instead of
+    # resetting per camera, so switching cameras mid-trial (in the burned-in
+    # "S{n}" overlay labels and the step_index served to the frontend) keeps
+    # counting up instead of restarting at S1.
+    for idx, event in enumerate(refreshed_events, start=1):
+        event["step_index"] = idx
     avg_cadence_spm = add_global_cadence(refreshed_events, ankle_rows)
 
     step_lengths = [
@@ -1376,6 +2676,7 @@ def refresh_step_analysis_after_leg_correction(
 
     step_analysis["ankle_rows"] = ankle_rows
     step_analysis["step_events"] = refreshed_events
+    step_analysis["rejected_step_events"] = rejected_events
     step_analysis["avg_cadence_spm"] = avg_cadence_spm
     step_analysis["avg_step_length_m"] = avg_step_length_m
     return step_analysis
@@ -1436,6 +2737,20 @@ def _draw_track_lines(frame, start_line=None, end_line=None):
         cv2.line(frame, p0, p1, (255, 200, 100), 3)
 
 
+def _event_contact_display(event):
+    """Return final landing point and a distinguishable marker colour."""
+    joint = str(event.get("contact_joint") or "ankle")
+    x = event.get("contact_x", event.get("ankle_x"))
+    y = event.get("contact_y", event.get("ankle_y"))
+    if "estimated" in joint:
+        return int(x), int(y), (255, 0, 255), "E"    # purple estimated impact
+    if "heel" in joint:
+        return int(x), int(y), (0, 180, 0), "H"       # green
+    if "big_toe" in joint:
+        return int(x), int(y), (0, 165, 255), "T"     # orange
+    return int(x), int(y), (0, 0, 255), "A"            # red ankle fallback
+
+
 def render_overlay(
     video_path,
     ankle_rows,
@@ -1481,17 +2796,20 @@ def render_overlay(
 
         rx, ry = int(row["right_ankle_x"]), int(row["right_ankle_y"])
         lx, ly = int(row["left_ankle_x"]), int(row["left_ankle_y"])
-        cv2.circle(frame, (rx, ry), 5, (0, 0, 255), -1)
-        cv2.circle(frame, (lx, ly), 5, (255, 0, 0), -1)
+        cv2.circle(frame, (rx, ry), 3, (0, 0, 255), -1)
+        cv2.circle(frame, (lx, ly), 3, (255, 0, 0), -1)
 
         event = events_by_frame.get(target_frame)
         if event:
             event_history.append(event)
 
         for past in event_history[-20:]:
-            px, py = int(past["ankle_x"]), int(past["ankle_y"])
-            cv2.circle(frame, (px, py), 8, TEXT_COLOR, 2)
-            label = f"S{past['step_index']}"
+            if past.get("homography_lateral_valid") is False:
+                continue
+            px, py, colour, joint_tag = _event_contact_display(past)
+            cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
+            cv2.circle(frame, (px, py), 3, colour, -1)
+            label = f"S{past['step_index']} {joint_tag}"
             if past["step_length_m"] is not None:
                 label += f" L={past['step_length_m']:.2f}m"
             elif past["step_length_px"] is not None:
@@ -1550,8 +2868,8 @@ def annotate_step_stride_video(
         if row:
             rx, ry = int(row["right_ankle_x"]), int(row["right_ankle_y"])
             lx, ly = int(row["left_ankle_x"]), int(row["left_ankle_y"])
-            cv2.circle(frame, (rx, ry), 5, (0, 0, 255), -1)
-            cv2.circle(frame, (lx, ly), 5, (255, 0, 0), -1)
+            cv2.circle(frame, (rx, ry), 3, (0, 0, 255), -1)
+            cv2.circle(frame, (lx, ly), 3, (255, 0, 0), -1)
 
         event = events_by_seq.get(frame_idx)
         if event:
@@ -1560,9 +2878,10 @@ def annotate_step_stride_video(
 
         cam_history = event_history_by_cam.get(cam_idx, []) if cam_idx is not None else []
         for past in cam_history[-20:]:
-            px, py = int(past["ankle_x"]), int(past["ankle_y"])
-            cv2.circle(frame, (px, py), 8, TEXT_COLOR, 2)
-            label = f"S{past['step_index']}"
+            px, py, colour, joint_tag = _event_contact_display(past)
+            cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
+            cv2.circle(frame, (px, py), 3, colour, -1)
+            label = f"S{past['step_index']} {joint_tag}"
             if past["step_length_m"] is not None:
                 label += f" L={past['step_length_m']:.2f}m"
             elif past["step_length_px"] is not None:
@@ -1648,12 +2967,17 @@ def run_step_stride_analysis(
             current_cam.get("distance_m") or config.get("distance_m"),
         )
         cam_rows = [row for row in ankle_rows if int(row["cam"]) == cam_idx]
+        next_cam_rows = sorted(
+            (row for row in ankle_rows if int(row["cam"]) == cam_idx + 1),
+            key=lambda row: int(row["seq_frame"]),
+        )
         cam_events = detect_steps(
             cam_rows,
             calibration,
             fps=fps,
             min_step_frames=min_step_frames,
             prominence=prominence,
+            lookahead_rows=next_cam_rows[:STEP_DETECTION_LOOKAHEAD_FRAMES],
         )
         step_events.extend(cam_events)
 

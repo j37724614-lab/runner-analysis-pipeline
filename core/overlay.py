@@ -27,15 +27,19 @@ def show2Dpose_original(kps, img, offset_x, offset_y, foot_kps=None, foot_scores
     L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel，
     連到 H36M 左(6)/右(3)腳踝，同樣套用 offset 修正回原始空間座標。
     """
+    # [9, 10] (Neck/Nose -> Head) and [8, 9] (Thorax -> Neck/Nose) intentionally
+    # omitted: both keypoints are unreliable for this checkpoint and jitter
+    # badly, so they're left undrawn rather than rendering distracting
+    # jumping points.
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
-                   [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
+                   [5, 6], [0, 7], [7, 8],
                    [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16]]
 
-    LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
+    LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
 
     lcolor = (255, 0, 0)   # Blue (左側)
     rcolor = (0, 0, 255)   # Red (右側)
-    thickness = 3
+    thickness = 2
 
     for j, c in enumerate(connections):
         start = kps[c[0]]
@@ -43,21 +47,27 @@ def show2Dpose_original(kps, img, offset_x, offset_y, foot_kps=None, foot_scores
         sx, sy = int(start[0] + offset_x), int(start[1] + offset_y)
         ex, ey = int(end[0] + offset_x), int(end[1] + offset_y)
         cv2.line(img, (sx, sy), (ex, ey), lcolor if LR[j] else rcolor, thickness)
-        cv2.circle(img, (sx, sy), thickness=-1, color=(0, 255, 0), radius=3)
-        cv2.circle(img, (ex, ey), thickness=-1, color=(0, 255, 0), radius=3)
+        cv2.circle(img, (sx, sy), thickness=-1, color=(0, 255, 0), radius=2)
+        cv2.circle(img, (ex, ey), thickness=-1, color=(0, 255, 0), radius=2)
 
     if foot_kps is not None:
-        FOOT_COLOR = (0, 255, 255)
+        # Keep foot colors attached to the corrected logical L/R slots.  The
+        # pipeline swaps each three-point foot group together with the body
+        # legs before rendering, so these colors follow the DP-corrected
+        # identity as well.
+        LEFT_FOOT_COLOR = (0, 255, 255)    # yellow (BGR)
+        RIGHT_FOOT_COLOR = (255, 0, 255)  # magenta (BGR)
         RIGHT_ANKLE, LEFT_ANKLE = 3, 6
         foot_to_ankle = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
                           (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
         for fi, ankle_idx in foot_to_ankle:
             if foot_scores is not None and foot_scores[fi] < 0.3:
                 continue
+            foot_color = LEFT_FOOT_COLOR if fi < 3 else RIGHT_FOOT_COLOR
             fx, fy = int(foot_kps[fi, 0] + offset_x), int(foot_kps[fi, 1] + offset_y)
             ax, ay = int(kps[ankle_idx, 0] + offset_x), int(kps[ankle_idx, 1] + offset_y)
-            cv2.line(img, (ax, ay), (fx, fy), FOOT_COLOR, 2)
-            cv2.circle(img, (fx, fy), 4, FOOT_COLOR, -1)
+            cv2.line(img, (ax, ay), (fx, fy), foot_color, 2)
+            cv2.circle(img, (fx, fy), 4, foot_color, -1)
 
     return img
 
@@ -91,8 +101,15 @@ def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8)
 # ---------------------------------------------------------------------------
 # 在影格上畫起終點線與跑道範圍
 # ---------------------------------------------------------------------------
-def _draw_lines(frame, start_line, end_line):
-    """在原始影格上繪製起跑線、終點線以及中間包夾的虛線跑道區間。"""
+def _draw_lines(frame, start_line, end_line, homography_points=None):
+    """在原始影格上繪製起跑線、終點線以及中間包夾的虛線跑道區間。
+
+    4 點線性投影校正的相機有 start_line/end_line，用兩條實線 + 四邊虛線框住
+    中間的跑道範圍。6 點 homography 校正的相機沒有這兩條線（沒有對應的兩線
+    語意），改成把 homography_points（該相機的 6 個校正點，pixel 座標）依序
+    連成一圈虛線多邊形，畫出同樣的「框住跑道範圍」效果，讓兩種校正模式在疊圖
+    影片上的視覺呈現一致。
+    """
     if start_line and end_line:
         p0 = (int(start_line[0][0]), int(start_line[0][1]))
         p3 = (int(start_line[1][0]), int(start_line[1][1]))
@@ -114,6 +131,10 @@ def _draw_lines(frame, start_line, end_line):
         pt2 = (int(end_line[1][0]), int(end_line[1][1]))
         cv2.line(frame, pt1, pt2, (0, 0, 0), 5)
         cv2.line(frame, pt1, pt2, (255, 200, 100), 3)
+    elif homography_points and len(homography_points) >= 2:
+        pts = [(int(p[0]), int(p[1])) for p in homography_points]
+        for a, b in zip(pts, pts[1:] + [pts[0]]):
+            _draw_dashed_line(frame, a, b, (255, 255, 255), thickness=2)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +261,7 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
             cam_cfg = cameras[c_idx] if c_idx < len(cameras) else {}
             start_line = cam_cfg.get('start_line')
             end_line   = cam_cfg.get('end_line')
-            _draw_lines(frame, start_line, end_line)
+            _draw_lines(frame, start_line, end_line, cam_cfg.get('homography_src_points'))
 
             # ── 畫骨架 ──
             if v_idx in kps_map:
@@ -259,6 +280,180 @@ def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
         cap.release()
     out.release()
     print(f"✅ [Core.Overlay] 原影片骨架疊加完成！儲存至: {output_video}")
+
+
+def overlay_videos_per_camera(cameras, offsets_npz, kps_npz, ankle_rows, step_events,
+                               output_paths, config=None):
+    """
+    跟 overlay_videos() 邏輯相同（骨架疊圖），但額外疊上落地點標註（比照
+    scripts/analysis/ankle_step_stride.py::annotate_step_stride_video()），
+    而且每台相機各自輸出一支影片，不拼接成一支。
+
+    Parameters
+    ----------
+    cameras      : list[dict]  每個 dict 含 'video_path', 'start_line', 'end_line'
+    offsets_npz  : str
+    kps_npz      : str
+    ankle_rows   : list[dict]  run_step_stride_analysis() 回傳的逐幀腳踝資料
+    step_events  : list[dict]  run_step_stride_analysis() 回傳的落地事件
+    output_paths : list[str|None]  每台相機的輸出路徑，長度需與相機數一致；
+                                    某相機不需要輸出時該項傳 None。
+    config       : dict|None   同 overlay_videos()
+    """
+    from scripts.analysis.ankle_step_stride import _event_contact_display, TEXT_COLOR
+
+    if config and 'cameras' in config:
+        cfg_cams = config['cameras']
+        merged = []
+        for i, cam in enumerate(cameras):
+            c = dict(cam)
+            if i < len(cfg_cams):
+                c.setdefault('start_line', cfg_cams[i].get('start_line'))
+                c.setdefault('end_line',   cfg_cams[i].get('end_line'))
+            merged.append(c)
+        cameras = merged
+
+    offsets_data = np.load(offsets_npz)
+    offsets     = offsets_data['offsets']
+    orig_frames = offsets_data['orig_frames']
+    if 'cam_indices' in offsets_data:
+        cam_indices = offsets_data['cam_indices'].astype(int)
+    else:
+        cam_indices = np.zeros(len(orig_frames), dtype=int)
+
+    kps_data   = np.load(kps_npz, allow_pickle=True)
+    keypoints  = kps_data['reconstruction'][0]
+    valid_frames = np.asarray(kps_data['valid_frames']).flatten().astype(int)
+    kps_map = {}
+    for i, v_idx in enumerate(valid_frames):
+        if v_idx < len(orig_frames):
+            kps_map[v_idx] = keypoints[i]
+
+    foot_kps_map = {}
+    foot_scores_map = {}
+    foot_npz = os.path.join(os.path.dirname(kps_npz), 'foot_keypoints.npz')
+    if os.path.exists(foot_npz):
+        foot_data = np.load(foot_npz, allow_pickle=True)
+        foot_keypoints = foot_data['keypoints'][0]
+        foot_scores = foot_data['scores'][0]
+        for i, v_idx in enumerate(valid_frames):
+            if v_idx < len(orig_frames) and i < len(foot_keypoints):
+                foot_kps_map[v_idx] = foot_keypoints[i]
+                foot_scores_map[v_idx] = foot_scores[i]
+
+    rows_by_seq = {int(r["seq_frame"]): r for r in ankle_rows}
+    events_by_seq = {int(e["seq_frame"]): e for e in step_events}
+    event_history_by_cam = {}
+
+    num_cams = max(cam_indices) + 1 if len(cam_indices) > 0 else len(cameras)
+
+    writers = {}
+    for c_idx in range(num_cams):
+        out_path = output_paths[c_idx] if c_idx < len(output_paths) else None
+        if not out_path:
+            continue
+        video_path = cameras[c_idx].get('video_path') if c_idx < len(cameras) else None
+        if not video_path or not os.path.exists(video_path):
+            print(f"  ⚠️  找不到相機 {c_idx} 的影片，略過該相機的疊圖輸出: {video_path}")
+            continue
+        cap_probe = cv2.VideoCapture(video_path)
+        w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap_probe.get(cv2.CAP_PROP_FPS) or 30.0
+        cap_probe.release()
+        writers[c_idx] = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    print(f"[Core.Overlay] 正在輸出各相機獨立骨架+落地點疊圖影片（相機數: {len(writers)}）")
+
+    current_cam_idx = -1
+    cap = None
+    current_frame_pos = 0
+
+    with tqdm(total=len(orig_frames), desc="Per-camera overlaying") as pbar:
+        for v_idx in range(len(orig_frames)):
+            c_idx = int(cam_indices[v_idx])
+            orig_idx = int(orig_frames[v_idx])
+
+            if c_idx not in writers:
+                pbar.update(1)
+                continue
+
+            if c_idx != current_cam_idx:
+                if cap is not None:
+                    cap.release()
+                video_path = cameras[c_idx].get('video_path')
+                cap = cv2.VideoCapture(video_path)
+                current_cam_idx = c_idx
+                current_frame_pos = 0
+
+            ret = False
+            while current_frame_pos <= orig_idx:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                current_frame_pos += 1
+            if not ret:
+                pbar.update(1)
+                continue
+
+            cam_cfg = cameras[c_idx] if c_idx < len(cameras) else {}
+            _draw_lines(frame, cam_cfg.get('start_line'), cam_cfg.get('end_line'), cam_cfg.get('homography_src_points'))
+
+            if v_idx in kps_map:
+                kps = kps_map[v_idx]
+                off_x, off_y = offsets[v_idx]
+                frame = show2Dpose_original(
+                    kps, frame, off_x, off_y,
+                    foot_kps=foot_kps_map.get(v_idx),
+                    foot_scores=foot_scores_map.get(v_idx),
+                )
+
+            row = rows_by_seq.get(v_idx)
+            if row:
+                rx, ry = int(row["right_ankle_x"]), int(row["right_ankle_y"])
+                lx, ly = int(row["left_ankle_x"]), int(row["left_ankle_y"])
+                cv2.circle(frame, (rx, ry), 3, (0, 0, 255), -1)
+                cv2.circle(frame, (lx, ly), 3, (255, 0, 0), -1)
+
+            event = events_by_seq.get(v_idx)
+            if event:
+                event_history_by_cam.setdefault(c_idx, []).append(event)
+            cam_history = event_history_by_cam.get(c_idx, [])
+            for past in cam_history[-20:]:
+                # homography_lateral_valid is only set (True/False) for
+                # homography-calibrated cameras (see _recompute_contact_
+                # event_metrics()); False means this point's world
+                # coordinate was flagged as an outlier -- skip drawing it
+                # entirely rather than showing an untrustworthy position.
+                if past.get("homography_lateral_valid") is False:
+                    continue
+                px, py, colour, joint_tag = _event_contact_display(past)
+                cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
+                cv2.circle(frame, (px, py), 3, colour, -1)
+                label = f"S{past['step_index']} {joint_tag}"
+                if past["step_length_m"] is not None:
+                    label += f" L={past['step_length_m']:.2f}m"
+                elif past["step_length_px"] is not None:
+                    label += f" L={past['step_length_px']:.0f}px"
+                label_y = py + 43 if (past['step_index'] % 2 == 1) else py + 70
+                cv2.putText(frame, label, (px + 8, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 2, cv2.LINE_AA)
+
+            if row:
+                cv2.putText(frame, f"Time: {row['seq_time_s']:.2f}s", (30, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
+            total_steps = sum(len(h) for h in event_history_by_cam.values())
+            cv2.putText(frame, f"Steps: {total_steps}", (30, 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
+
+            writers[c_idx].write(frame)
+            pbar.update(1)
+
+    if cap is not None:
+        cap.release()
+    for w in writers.values():
+        w.release()
+    print(f"✅ [Core.Overlay] 各相機獨立疊圖完成，共 {len(writers)} 支影片")
 
 
 # ---------------------------------------------------------------------------

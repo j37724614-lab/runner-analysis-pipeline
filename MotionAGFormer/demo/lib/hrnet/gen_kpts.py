@@ -24,6 +24,14 @@ from lib.hrnet.lib.models import pose_hrnet
 
 cfg_dir = 'demo/lib/hrnet/experiments/'
 model_dir = 'demo/lib/checkpoint/'
+# The deployment default intentionally points to the best runner-domain
+# candidate selected from the jump-broadcast / pilot300 experiments.  Keep
+# this absolute path derived from this file so pipeline callers are not
+# affected by their current working directory.
+DEFAULT_WHOLEBODY23_MODEL = osp.abspath(osp.join(
+    osp.dirname(__file__), '..', '..', '..', '..',
+    'data', 'runner_wholebody23', 'exports',
+    'pose_hrnet_w48_wholebody23_384x288_dark_jump_broadcast_long_triple_pilot300_headonly_epoch3.pth'))
 
 # Loading human detector model
 from lib.yolov3.human_detector import load_model as yolo_model
@@ -38,7 +46,7 @@ def parse_args(argv=None):
                         help='experiment configure file name')
     parser.add_argument('opts', nargs=argparse.REMAINDER, default=None,
                         help="Modify config options using the command-line")
-    parser.add_argument('--modelDir', type=str, default=model_dir + 'pose_hrnet_w48_wholebody23_384x288_dark.pth',
+    parser.add_argument('--modelDir', type=str, default=DEFAULT_WHOLEBODY23_MODEL,
                         help='The model directory')
     parser.add_argument('--det-dim', type=int, default=416,
                         help='The input dimension of the detected image')
@@ -100,11 +108,16 @@ def _load_bbox_map(bbox_csv):
     return bbox_map
 
 
-def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False, bbox_csv=None):
+def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
+                   bbox_csv=None, model_path=None):
     # Updating configuration
     args = parse_args([])
     args.det_dim = det_dim
     args.num_person = num_peroson
+    # Optional experiment override.  The default remains the production
+    # WholeBody23 checkpoint so existing callers are unaffected.
+    if model_path:
+        args.modelDir = os.path.abspath(model_path)
     reset_config(args)
 
     cap = cv2.VideoCapture(video)
