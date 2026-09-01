@@ -18,13 +18,14 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import yaml
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
 
 
 RIGHT_ANKLE = 3
@@ -983,217 +984,240 @@ def select_contact_point(foot, ankle_x, ankle_y, ankle_conf, foot_contacts, cont
     }
 
 
-def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, prominence=None,
-                  lookahead_rows=None):
-    """lookahead_rows: a few frames from the *next* camera, appended only so
-    find_peaks() has enough trailing signal to confirm/reject a touchdown
-    sitting right at this camera's tracked-window boundary (a peak with no
-    frames after it in ankle_rows can't be told apart from a still-rising
-    swing). These rows never become candidates themselves -- the next
-    camera's own detect_steps() call is what actually detects them.
-    """
-    if not ankle_rows:
-        return []
+@dataclass(frozen=True)
+class _PeakContext:
+    """Per-call scalar context shared by the step-detection stages."""
 
-    # Estimate FPS from ankle_rows timestamps if not provided.
-    if fps is None and len(ankle_rows) >= 2:
+    calibration: dict
+    fps: float
+    peak_distance: int
+    min_step_frames: int
+    min_touchdown_gap_frames: int
+    raw_prominence: float
+
+
+def _estimate_fps_from_rows(ankle_rows):
+    """Estimate FPS from ankle_rows timestamps; falls back to 30.0."""
+    if len(ankle_rows) >= 2:
         t0 = float(ankle_rows[0]['seq_time_s'])
         t1 = float(ankle_rows[-1]['seq_time_s'])
-        n  = len(ankle_rows)
-        fps = (n - 1) / (t1 - t0) if t1 > t0 else 30.0
-    fps = fps or 30.0
+        if t1 > t0:
+            return (len(ankle_rows) - 1) / (t1 - t0)
+    return 30.0
 
-    if min_step_frames is None:
-        # Minimum frames between consecutive touchdowns based on fps.
-        # Assumes max cadence ~4.5 steps/s per foot (270 spm).
-        min_step_frames = max(4, int(fps / 4.5))
-    min_touchdown_gap_frames = max(3, min_step_frames // 2)
 
-    def smooth(values):
-        from scipy.signal import butter, filtfilt
-        n = len(values)
-        if n < 13:
-            return values
-        # Low-pass Butterworth at 6 Hz removes skeleton jitter while preserving
-        # step peaks (~2-4 Hz). Used only for peak detection; reported ankle
-        # coordinates always come from the original rows.
-        cutoff_hz = 6.0
-        nyq = fps / 2.0
-        if cutoff_hz >= nyq:
-            return values
-        b, a = butter(4, cutoff_hz / nyq, btype='low')
-        return filtfilt(b, a, values)
+def _lowpass_touchdown_signal(values, fps):
+    """Low-pass Butterworth at 6 Hz: removes skeleton jitter while preserving
+    step peaks (~2-4 Hz). Used only for peak detection; reported ankle
+    coordinates always come from the original rows."""
+    if len(values) < 13:
+        return values
+    cutoff_hz = 6.0
+    nyq = fps / 2.0
+    if cutoff_hz >= nyq:
+        return values
+    b, a = butter(4, cutoff_hz / nyq, btype='low')
+    return filtfilt(b, a, values)
 
-    # Use combined lower_ankle_y signal so detection is robust to left/right label swaps.
-    # distance = fps/8 (~7 at 60fps) allows alternating-foot peaks spaced ~fps/cadence/2
-    # frames apart to both be detected, unlike min_step_frames which is calibrated for
-    # same-foot intervals and would suppress every other step.
-    y = np.array([r["lower_ankle_y"] for r in ankle_rows], dtype=float)
-    lookahead_rows = lookahead_rows or []
-    y_lookahead = np.array([r["lower_ankle_y"] for r in lookahead_rows], dtype=float)
+
+def _valid_touchdown_conf(conf, min_conf):
+    try:
+        value = float(conf)
+    except (TypeError, ValueError):
+        return False
+    return np.isnan(value) or value >= min_conf
+
+
+def _candidate_within_calibrated_range(candidate, calibration):
+    if calibration.get("mode") != "homography":
+        return True
+    world_x = _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
+    x_min = calibration.get("world_x_min")
+    x_max = calibration.get("world_x_max")
+    if x_min is None or x_max is None:
+        return True
+    margin_m = 0.5
+    return float(x_min) - margin_m <= world_x <= float(x_max) + margin_m
+
+
+def _candidate_from_peak(ankle_rows, calibration, peak_idx, peak_prominence, source):
+    row = ankle_rows[int(peak_idx)]
+    conf = row["lower_ankle_conf"]
+    if not _valid_touchdown_conf(conf, 0.30):
+        return None
+    # Foot label: whichever ankle is lower at this frame (lower_foot is pre-computed).
+    candidate = {
+        "row_idx": int(peak_idx),
+        "row": row,
+        "foot": row["lower_foot"],
+        "ankle_x": row["lower_ankle_x"],
+        "ankle_y": row["lower_ankle_y"],
+        "ankle_conf": conf,
+        "prominence": float(peak_prominence),
+        "source": source,
+    }
+    if _candidate_within_calibrated_range(candidate, calibration):
+        return candidate
+    return None
+
+
+def _candidate_track_pos(candidate, calibration):
+    return _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
+
+
+def _candidate_score(candidate):
+    return (candidate["prominence"], candidate["ankle_conf"], candidate["ankle_y"])
+
+
+def _detect_smoothed_touchdown_candidates(ankle_rows, y, y_lookahead, prominence, ctx):
+    """Smooth the combined lower-ankle-y signal, run find_peaks(), and turn the
+    peaks that belong to this camera into touchdown candidates.
+
+    A distance of fps/8 (~7 at 60fps) lets alternating-foot peaks spaced
+    ~fps/cadence/2 frames apart both be detected, unlike min_step_frames which
+    is calibrated for same-foot intervals and would suppress every other step.
+    """
     y_extended = np.concatenate([y, y_lookahead]) if len(y_lookahead) else y
-    y_smooth = smooth(y_extended)
+    y_smooth = _lowpass_touchdown_signal(y_extended, ctx.fps)
     lower_prominence = prominence
     if lower_prominence is None:
         q75, q25 = np.nanpercentile(y_smooth[:len(y)], [75, 25])
         lower_prominence = max((q75 - q25) * 0.20, 1.5)
 
-    peak_distance = max(3, int(fps / 8.0))
     peaks, props = find_peaks(
         y_smooth,
-        distance=peak_distance,
+        distance=ctx.peak_distance,
         prominence=lower_prominence,
     )
     prominences = props.get("prominences", np.zeros(len(peaks), dtype=float))
     # Peaks in the appended lookahead tail belong to the next camera -- they
     # exist only so find_peaks() has trailing signal to judge a boundary
-    # peak, never to become candidates here (see lookahead_rows docstring).
+    # peak, never to become candidates here (see detect_steps' docstring).
     own_mask = peaks < len(y)
     peaks = peaks[own_mask]
     prominences = prominences[own_mask]
 
-    def _valid_conf(conf, min_conf):
-        try:
-            value = float(conf)
-        except (TypeError, ValueError):
-            return False
-        return np.isnan(value) or value >= min_conf
-
-    def _inside_calibrated_range(candidate):
-        if calibration.get("mode") != "homography":
-            return True
-        world_x = _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
-        x_min = calibration.get("world_x_min")
-        x_max = calibration.get("world_x_max")
-        if x_min is None or x_max is None:
-            return True
-        margin_m = 0.5
-        return float(x_min) - margin_m <= world_x <= float(x_max) + margin_m
-
-    def _candidate_from_peak(peak_idx, peak_prominence, source):
-        row = ankle_rows[int(peak_idx)]
-        conf = row["lower_ankle_conf"]
-        if not _valid_conf(conf, 0.30):
-            return None
-        # Foot label: whichever ankle is lower at this frame (lower_foot is pre-computed).
-        candidate = {
-            "row_idx": int(peak_idx),
-            "row": row,
-            "foot": row["lower_foot"],
-            "ankle_x": row["lower_ankle_x"],
-            "ankle_y": row["lower_ankle_y"],
-            "ankle_conf": conf,
-            "prominence": float(peak_prominence),
-            "source": source,
-        }
-        return candidate if _inside_calibrated_range(candidate) else None
-
     candidates = []
     for peak_idx, peak_prominence in zip(peaks, prominences):
-        candidate = _candidate_from_peak(peak_idx, peak_prominence, "smooth")
+        candidate = _candidate_from_peak(
+            ankle_rows, ctx.calibration, peak_idx, peak_prominence, "smooth"
+        )
         if candidate is not None:
             candidates.append(candidate)
+    return candidates
 
-    filtered_candidates = []
+
+def _suppress_close_touchdowns(candidates, min_touchdown_gap_frames):
+    """Drop touchdowns closer than min_touchdown_gap_frames, keeping the
+    higher-scoring one of each too-close pair."""
+    filtered = []
     for candidate in candidates:
-        if not filtered_candidates:
-            filtered_candidates.append(candidate)
+        if not filtered:
+            filtered.append(candidate)
             continue
-
-        previous = filtered_candidates[-1]
+        previous = filtered[-1]
         frame_gap = int(candidate["row"]["seq_frame"]) - int(previous["row"]["seq_frame"])
         if frame_gap < min_touchdown_gap_frames:
-            prev_score = (previous["prominence"], previous["ankle_conf"], previous["ankle_y"])
-            cand_score = (candidate["prominence"], candidate["ankle_conf"], candidate["ankle_y"])
-            if cand_score > prev_score:
-                filtered_candidates[-1] = candidate
+            if _candidate_score(candidate) > _candidate_score(previous):
+                filtered[-1] = candidate
         else:
-            filtered_candidates.append(candidate)
+            filtered.append(candidate)
+    return filtered
 
-    # Rescue narrow raw peaks that the low-pass filter may suppress.
-    # This is intentionally conservative: raw peaks are only considered inside
-    # unusually large time gaps or unusually large track-position gaps between
-    # smooth detections, and still must pass confidence, prominence, timing,
-    # and track-position checks.
-    raw_q75, raw_q25 = np.nanpercentile(y, [75, 25])
-    raw_prominence = max((raw_q75 - raw_q25) * 0.20, 1.5)
+
+def _large_step_rescue_threshold(candidates, calibration):
+    if len(candidates) < 3:
+        return None
+
+    positions = [_candidate_track_pos(candidate, calibration) for candidate in candidates]
+    step_lengths = [
+        abs(positions[i] - positions[i - 1])
+        for i in range(1, len(positions))
+    ]
+    typical_step = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
+    thresholds = []
+    if typical_step > 1e-6:
+        thresholds.append(typical_step * 1.6)
+
+    # If calibration is available, also treat implausibly long human steps
+    # as a signal that an intermediate touchdown may have been missed.
+    large_step_m = 2.46
+    if calibration.get("mode") == "homography":
+        thresholds.append(large_step_m)
+    else:
+        meters_per_pixel = calibration.get("meters_per_pixel")
+        if meters_per_pixel:
+            thresholds.append(large_step_m / float(meters_per_pixel))
+
+    return min(thresholds) if thresholds else None
+
+
+def _rescue_position_is_between(prev_candidate, rescue_candidate, next_candidate, calibration):
+    prev_pos = _candidate_track_pos(prev_candidate, calibration)
+    next_pos = _candidate_track_pos(next_candidate, calibration)
+    rescue_pos = _candidate_track_pos(rescue_candidate, calibration)
+    span = abs(next_pos - prev_pos)
+    if span <= 1e-6:
+        return True
+    min_margin = 0.20 if calibration.get("mode") == "homography" else 20.0
+    margin = max(min_margin, span * 0.25)
+    return min(prev_pos, next_pos) - margin <= rescue_pos <= max(prev_pos, next_pos) + margin
+
+
+def _rescue_height_is_plausible(prev_candidate, rescue_candidate, next_candidate, raw_prominence):
+    # A raw rescue peak should be near the landing height of the surrounding
+    # contacts. Peaks much higher in the image are usually ankle jitter,
+    # even if they are local maxima in the raw signal.
+    surrounding_y = min(float(prev_candidate["ankle_y"]), float(next_candidate["ankle_y"]))
+    return float(rescue_candidate["ankle_y"]) >= surrounding_y - raw_prominence
+
+
+def _rescue_split_is_plausible(prev_candidate, rescue_candidate, next_candidate, calibration):
+    prev_pos = _candidate_track_pos(prev_candidate, calibration)
+    next_pos = _candidate_track_pos(next_candidate, calibration)
+    rescue_pos = _candidate_track_pos(rescue_candidate, calibration)
+    span = abs(next_pos - prev_pos)
+    if span <= 1e-6:
+        return True
+    before = abs(rescue_pos - prev_pos)
+    after = abs(next_pos - rescue_pos)
+    return min(before, after) >= span * 0.25
+
+
+def _rescue_raw_peaks_in_large_gaps(filtered_candidates, ankle_rows, y, ctx):
+    """Rescue narrow raw peaks that the low-pass filter may suppress.
+
+    This is intentionally conservative: raw peaks are only considered inside
+    unusually large time gaps or unusually large track-position gaps between
+    smooth detections, and still must pass confidence, prominence, timing,
+    and track-position checks.
+    """
     raw_peaks, raw_props = find_peaks(
         y,
-        distance=peak_distance,
-        prominence=raw_prominence,
+        distance=ctx.peak_distance,
+        prominence=ctx.raw_prominence,
     )
     raw_prominences = {
         int(peak): float(prom)
         for peak, prom in zip(raw_peaks, raw_props.get("prominences", []))
     }
     smooth_peak_indexes = {c["row_idx"] for c in filtered_candidates}
-    rescue_gap_frames = max(min_step_frames + peak_distance, int(round(min_step_frames * 1.8)))
+    rescue_gap_frames = max(
+        ctx.min_step_frames + ctx.peak_distance,
+        int(round(ctx.min_step_frames * 1.8)),
+    )
+    large_step_rescue_threshold = _large_step_rescue_threshold(
+        filtered_candidates, ctx.calibration
+    )
+
     rescued_candidates = []
-
-    def _track_pos(candidate):
-        return _project((candidate["ankle_x"], candidate["ankle_y"]), calibration)
-
-    def _large_step_rescue_threshold(candidates):
-        if len(candidates) < 3:
-            return None
-
-        positions = [_track_pos(candidate) for candidate in candidates]
-        step_lengths = [
-            abs(positions[i] - positions[i - 1])
-            for i in range(1, len(positions))
-        ]
-        typical_step = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
-        thresholds = []
-        if typical_step > 1e-6:
-            thresholds.append(typical_step * 1.6)
-
-        # If calibration is available, also treat implausibly long human steps
-        # as a signal that an intermediate touchdown may have been missed.
-        large_step_m = 2.46
-        if calibration.get("mode") == "homography":
-            thresholds.append(large_step_m)
-        else:
-            meters_per_pixel = calibration.get("meters_per_pixel")
-            if meters_per_pixel:
-                thresholds.append(large_step_m / float(meters_per_pixel))
-
-        return min(thresholds) if thresholds else None
-
-    def _position_is_between(prev_candidate, rescue_candidate, next_candidate):
-        prev_pos = _track_pos(prev_candidate)
-        next_pos = _track_pos(next_candidate)
-        rescue_pos = _track_pos(rescue_candidate)
-        span = abs(next_pos - prev_pos)
-        if span <= 1e-6:
-            return True
-        min_margin = 0.20 if calibration.get("mode") == "homography" else 20.0
-        margin = max(min_margin, span * 0.25)
-        return min(prev_pos, next_pos) - margin <= rescue_pos <= max(prev_pos, next_pos) + margin
-
-    def _rescue_height_is_plausible(prev_candidate, rescue_candidate, next_candidate):
-        # A raw rescue peak should be near the landing height of the surrounding
-        # contacts. Peaks much higher in the image are usually ankle jitter,
-        # even if they are local maxima in the raw signal.
-        surrounding_y = min(float(prev_candidate["ankle_y"]), float(next_candidate["ankle_y"]))
-        return float(rescue_candidate["ankle_y"]) >= surrounding_y - raw_prominence
-
-    def _rescue_split_is_plausible(prev_candidate, rescue_candidate, next_candidate):
-        prev_pos = _track_pos(prev_candidate)
-        next_pos = _track_pos(next_candidate)
-        rescue_pos = _track_pos(rescue_candidate)
-        span = abs(next_pos - prev_pos)
-        if span <= 1e-6:
-            return True
-        before = abs(rescue_pos - prev_pos)
-        after = abs(next_pos - rescue_pos)
-        return min(before, after) >= span * 0.25
-
-    large_step_rescue_threshold = _large_step_rescue_threshold(filtered_candidates)
-
     for prev_candidate, next_candidate in zip(filtered_candidates, filtered_candidates[1:]):
         rescued_candidates.append(prev_candidate)
         gap = int(next_candidate["row"]["seq_frame"]) - int(prev_candidate["row"]["seq_frame"])
-        movement = abs(_track_pos(next_candidate) - _track_pos(prev_candidate))
+        movement = abs(
+            _candidate_track_pos(next_candidate, ctx.calibration)
+            - _candidate_track_pos(prev_candidate, ctx.calibration)
+        )
         large_step_gap = (
             large_step_rescue_threshold is not None
             and movement > large_step_rescue_threshold
@@ -1210,131 +1234,138 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
                 continue
             if not (prev_idx < peak_idx < next_idx):
                 continue
-            if peak_idx - prev_idx < min_touchdown_gap_frames:
+            if peak_idx - prev_idx < ctx.min_touchdown_gap_frames:
                 continue
-            if next_idx - peak_idx < min_touchdown_gap_frames:
+            if next_idx - peak_idx < ctx.min_touchdown_gap_frames:
                 continue
 
             candidate = _candidate_from_peak(
+                ankle_rows,
+                ctx.calibration,
                 peak_idx,
                 raw_prominences.get(peak_idx, 0.0),
                 "raw_rescue",
             )
             if candidate is None:
                 continue
-            if not _valid_conf(candidate["ankle_conf"], 0.50):
+            if not _valid_touchdown_conf(candidate["ankle_conf"], 0.50):
                 continue
-            if candidate["prominence"] < raw_prominence:
+            if candidate["prominence"] < ctx.raw_prominence:
                 continue
-            if not _position_is_between(prev_candidate, candidate, next_candidate):
+            if not _rescue_position_is_between(
+                prev_candidate, candidate, next_candidate, ctx.calibration
+            ):
                 continue
-            if not _rescue_height_is_plausible(prev_candidate, candidate, next_candidate):
+            if not _rescue_height_is_plausible(
+                prev_candidate, candidate, next_candidate, ctx.raw_prominence
+            ):
                 continue
-            if not _rescue_split_is_plausible(prev_candidate, candidate, next_candidate):
+            if not _rescue_split_is_plausible(
+                prev_candidate, candidate, next_candidate, ctx.calibration
+            ):
                 continue
             middle_raw_candidates.append(candidate)
 
         if middle_raw_candidates:
-            middle_raw_candidates.sort(
-                key=lambda c: (c["prominence"], c["ankle_conf"], c["ankle_y"]),
-                reverse=True,
-            )
+            middle_raw_candidates.sort(key=_candidate_score, reverse=True)
             rescued_candidates.append(middle_raw_candidates[0])
 
     if filtered_candidates:
         rescued_candidates.append(filtered_candidates[-1])
-    filtered_candidates = sorted(rescued_candidates, key=lambda c: c["row_idx"])
+    return sorted(rescued_candidates, key=lambda c: c["row_idx"])
 
-    def _candidate_score(candidate):
-        return (candidate["prominence"], candidate["ankle_conf"], candidate["ankle_y"])
 
-    def _min_valid_step_track_units():
-        # Normal running step length is usually well above 0.6 m. Values below
-        # this are more likely duplicate contacts from ankle jitter than true
-        # alternating touchdowns. Keep this conservative for short runners or
-        # slow jogs.
-        min_step_length_m = 0.60
-        if calibration.get("mode") == "homography":
-            return min_step_length_m
+def _min_valid_step_track_units(calibration):
+    # Normal running step length is usually well above 0.6 m. Values below
+    # this are more likely duplicate contacts from ankle jitter than true
+    # alternating touchdowns. Keep this conservative for short runners or
+    # slow jogs.
+    min_step_length_m = 0.60
+    if calibration.get("mode") == "homography":
+        return min_step_length_m
 
-        meters_per_pixel = calibration.get("meters_per_pixel")
-        if meters_per_pixel:
-            return min_step_length_m / float(meters_per_pixel)
+    meters_per_pixel = calibration.get("meters_per_pixel")
+    if meters_per_pixel:
+        return min_step_length_m / float(meters_per_pixel)
 
-        return None
+    return None
 
-    def _dedupe_short_contacts(candidates):
-        if len(candidates) < 2:
-            return candidates
 
-        positions = [_track_pos(candidate) for candidate in candidates]
-        step_lengths = [
-            abs(positions[i] - positions[i - 1])
-            for i in range(1, len(positions))
-        ]
-        typical_step_px = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
-        absolute_short_step = _min_valid_step_track_units()
-        if absolute_short_step is not None:
-            short_step_px = max(absolute_short_step, typical_step_px * 0.35)
-        else:
-            short_step_px = max(20.0, typical_step_px * 0.35)
-        short_gap_frames = max(min_touchdown_gap_frames, int(round(fps / 5.0)))
-
-        deduped = []
-        for candidate in candidates:
-            if not deduped:
-                deduped.append(candidate)
-                continue
-
-            previous = deduped[-1]
-            gap = int(candidate["row"]["seq_frame"]) - int(previous["row"]["seq_frame"])
-            movement = abs(_track_pos(candidate) - _track_pos(previous))
-            duplicate = (
-                (movement < short_step_px) or
-                (gap < short_gap_frames and movement < short_step_px)
-            )
-            if duplicate:
-                if _candidate_score(candidate) > _candidate_score(previous):
-                    deduped[-1] = candidate
-            else:
-                deduped.append(candidate)
-        return deduped
-
-    filtered_candidates = _dedupe_short_contacts(filtered_candidates)
-
-    def _apply_alternating_foot_labels(candidates):
-        # 跑步必定左右交替落地。逐幀計算的 lower_foot 只在單一幀比較左右腳踝
-        # y 座標，容易被雜訊誤判，因此只信任它來決定「第一步」（用峰值附近一
-        # 個小視窗做多數決，降低錨點本身判斷錯誤的機率）。第二步以後一律直接
-        # 取前一步的相反腳，不再重新讀取 lower_foot。落地時間點與
-        # ankle_x/ankle_y（實際偵測到的踝關節位置）完全不變，只修正 foot 這個標籤欄位。
-        if not candidates:
-            return candidates
-
-        anchor_window_radius = max(1, peak_distance // 3)
-        anchor_row_idx = candidates[0]["row_idx"]
-        lo = max(0, anchor_row_idx - anchor_window_radius)
-        hi = min(len(ankle_rows) - 1, anchor_row_idx + anchor_window_radius)
-        votes = [ankle_rows[i]["lower_foot"] for i in range(lo, hi + 1)]
-        left_votes = votes.count("left")
-        right_votes = votes.count("right")
-        if left_votes > right_votes:
-            anchor_foot = "left"
-        elif right_votes > left_votes:
-            anchor_foot = "right"
-        else:
-            anchor_foot = candidates[0]["foot"]  # tie: 保留原本單幀判斷值
-
-        candidates[0]["foot"] = anchor_foot
-        for i in range(1, len(candidates)):
-            candidates[i]["foot"] = "left" if candidates[i - 1]["foot"] == "right" else "right"
+def _dedupe_short_contacts(candidates, ctx):
+    if len(candidates) < 2:
         return candidates
 
-    filtered_candidates = _apply_alternating_foot_labels(filtered_candidates)
+    positions = [_candidate_track_pos(candidate, ctx.calibration) for candidate in candidates]
+    step_lengths = [
+        abs(positions[i] - positions[i - 1])
+        for i in range(1, len(positions))
+    ]
+    typical_step_px = float(np.nanmedian(step_lengths)) if step_lengths else 0.0
+    absolute_short_step = _min_valid_step_track_units(ctx.calibration)
+    if absolute_short_step is not None:
+        short_step_px = max(absolute_short_step, typical_step_px * 0.35)
+    else:
+        short_step_px = max(20.0, typical_step_px * 0.35)
+    short_gap_frames = max(ctx.min_touchdown_gap_frames, int(round(ctx.fps / 5.0)))
 
+    deduped = []
+    for candidate in candidates:
+        if not deduped:
+            deduped.append(candidate)
+            continue
+
+        previous = deduped[-1]
+        gap = int(candidate["row"]["seq_frame"]) - int(previous["row"]["seq_frame"])
+        movement = abs(
+            _candidate_track_pos(candidate, ctx.calibration)
+            - _candidate_track_pos(previous, ctx.calibration)
+        )
+        duplicate = (
+            (movement < short_step_px) or
+            (gap < short_gap_frames and movement < short_step_px)
+        )
+        if duplicate:
+            if _candidate_score(candidate) > _candidate_score(previous):
+                deduped[-1] = candidate
+        else:
+            deduped.append(candidate)
+    return deduped
+
+
+def _apply_alternating_foot_labels(candidates, ankle_rows, peak_distance):
+    # 跑步必定左右交替落地。逐幀計算的 lower_foot 只在單一幀比較左右腳踝
+    # y 座標，容易被雜訊誤判，因此只信任它來決定「第一步」（用峰值附近一
+    # 個小視窗做多數決，降低錨點本身判斷錯誤的機率）。第二步以後一律直接
+    # 取前一步的相反腳，不再重新讀取 lower_foot。落地時間點與
+    # ankle_x/ankle_y（實際偵測到的踝關節位置）完全不變，只修正 foot 這個標籤欄位。
+    if not candidates:
+        return candidates
+
+    anchor_window_radius = max(1, peak_distance // 3)
+    anchor_row_idx = candidates[0]["row_idx"]
+    lo = max(0, anchor_row_idx - anchor_window_radius)
+    hi = min(len(ankle_rows) - 1, anchor_row_idx + anchor_window_radius)
+    votes = [ankle_rows[i]["lower_foot"] for i in range(lo, hi + 1)]
+    left_votes = votes.count("left")
+    right_votes = votes.count("right")
+    if left_votes > right_votes:
+        anchor_foot = "left"
+    elif right_votes > left_votes:
+        anchor_foot = "right"
+    else:
+        anchor_foot = candidates[0]["foot"]  # tie: 保留原本單幀判斷值
+
+    candidates[0]["foot"] = anchor_foot
+    for i in range(1, len(candidates)):
+        candidates[i]["foot"] = "left" if candidates[i - 1]["foot"] == "right" else "right"
+    return candidates
+
+
+def _build_step_events(candidates, calibration):
+    """Project each labelled touchdown and emit the stable step-event dict."""
     events = []
     prev_proj = None
-    for step_idx, candidate in enumerate(filtered_candidates, start=1):
+    for step_idx, candidate in enumerate(candidates, start=1):
         row = candidate["row"]
         point = (candidate["ankle_x"], candidate["ankle_y"])
         track_pos = _project(point, calibration)
@@ -1368,6 +1399,48 @@ def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, promin
         })
 
     return events
+
+
+def detect_steps(ankle_rows, calibration, fps=None, min_step_frames=None, prominence=None,
+                  lookahead_rows=None):
+    """lookahead_rows: a few frames from the *next* camera, appended only so
+    find_peaks() has enough trailing signal to confirm/reject a touchdown
+    sitting right at this camera's tracked-window boundary (a peak with no
+    frames after it in ankle_rows can't be told apart from a still-rising
+    swing). These rows never become candidates themselves -- the next
+    camera's own detect_steps() call is what actually detects them.
+    """
+    if not ankle_rows:
+        return []
+
+    fps = fps if fps is not None else _estimate_fps_from_rows(ankle_rows)
+    fps = fps or 30.0
+    if min_step_frames is None:
+        # Minimum frames between consecutive touchdowns based on fps.
+        # Assumes max cadence ~4.5 steps/s per foot (270 spm).
+        min_step_frames = max(4, int(fps / 4.5))
+
+    y = np.array([r["lower_ankle_y"] for r in ankle_rows], dtype=float)
+    lookahead_rows = lookahead_rows or []
+    y_lookahead = np.array([r["lower_ankle_y"] for r in lookahead_rows], dtype=float)
+    raw_q75, raw_q25 = np.nanpercentile(y, [75, 25])
+    ctx = _PeakContext(
+        calibration=calibration,
+        fps=fps,
+        peak_distance=max(3, int(fps / 8.0)),
+        min_step_frames=min_step_frames,
+        min_touchdown_gap_frames=max(3, min_step_frames // 2),
+        raw_prominence=max((raw_q75 - raw_q25) * 0.20, 1.5),
+    )
+
+    candidates = _detect_smoothed_touchdown_candidates(
+        ankle_rows, y, y_lookahead, prominence, ctx
+    )
+    candidates = _suppress_close_touchdowns(candidates, ctx.min_touchdown_gap_frames)
+    candidates = _rescue_raw_peaks_in_large_gaps(candidates, ankle_rows, y, ctx)
+    candidates = _dedupe_short_contacts(candidates, ctx)
+    candidates = _apply_alternating_foot_labels(candidates, ankle_rows, ctx.peak_distance)
+    return _build_step_events(candidates, ctx.calibration)
 
 
 def add_cadence(step_events):
@@ -1426,6 +1499,263 @@ def add_global_cadence(step_events, ankle_rows):
     return summary
 
 
+def _clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
+def _leg_vectors(right_leg, left_leg):
+    return np.asarray([
+        right_leg[1] - right_leg[0],
+        right_leg[2] - right_leg[0],
+        left_leg[1] - left_leg[0],
+        left_leg[2] - left_leg[0],
+    ], dtype=np.float64)
+
+
+def _knee_angle(leg):
+    v1 = leg[0] - leg[1]
+    v2 = leg[2] - leg[1]
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if denom < 1e-8:
+        return 0.0
+    cos_a = np.dot(v1, v2) / denom
+    return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+
+
+def _estimate_seq_fps(events):
+    """Median sequential FPS implied by consecutive step-event timestamps."""
+    samples = []
+    sorted_events = sorted(events, key=lambda item: int(item["seq_frame"]))
+    for a, b in zip(sorted_events, sorted_events[1:]):
+        frame_delta = int(b["seq_frame"]) - int(a["seq_frame"])
+        if frame_delta <= 0:
+            continue
+        for time_key in ("seq_time_s", "time_s"):
+            if a.get(time_key) is None or b.get(time_key) is None:
+                continue
+            try:
+                time_delta = float(b[time_key]) - float(a[time_key])
+            except (TypeError, ValueError):
+                continue
+            if time_delta > 1e-6:
+                samples.append(frame_delta / time_delta)
+                break
+    if not samples:
+        return 60.0
+    fps = float(np.median(samples))
+    if not np.isfinite(fps) or fps <= 0:
+        return 60.0
+    return fps
+
+
+def _median_smoothed_ankle_velocity(kp):
+    """Per-frame ankle speed for each foot, median-smoothed over a 3-frame window."""
+    right_ankle, left_ankle = 3, 6
+    frames = kp.shape[0]
+    ankle_vel = {"right": np.zeros(frames), "left": np.zeros(frames)}
+    for t in range(1, frames):
+        ankle_vel["right"][t] = np.linalg.norm(kp[t, right_ankle] - kp[t - 1, right_ankle])
+        ankle_vel["left"][t] = np.linalg.norm(kp[t, left_ankle] - kp[t - 1, left_ankle])
+    for foot in ("right", "left"):
+        padded = np.pad(ankle_vel[foot], (1, 1), mode="edge")
+        ankle_vel[foot] = np.asarray(
+            [np.median(padded[t:t + 3]) for t in range(frames)], dtype=np.float64
+        )
+    return ankle_vel
+
+
+@dataclass(frozen=True)
+class _LegSolverWeights:
+    """Cost weights and margins for the anchor-DP leg-identity Viterbi solver."""
+
+    vector_weight: float = 1.0
+    coord_weight: float = 0.20
+    switch_penalty: float = 8.0
+    stance_penalty: float = 90.0
+    anchor_penalty: float = 1000.0
+    velocity_weight: float = 1.0
+    y_weight: float = 0.25
+    knee_angle_weight: float = 0.4
+    velocity_margin: float = 3.0
+    knee_angle_margin: float = 15.0
+    early_switch_until: float = 0.65
+    early_switch_weight: float = 50.0
+
+
+class _LegIdentitySolver:
+    """Per-segment Viterbi solver deciding, frame by frame between two touchdown
+    anchors, whether the left/right leg labels are swapped (state 1) or not
+    (state 0). Holds the shared 2D keypoints, smoothed ankle velocity, and
+    sequential FPS so the cost functions do not thread them individually.
+    """
+
+    LEG_L = [4, 5, 6]  # L_HIP, L_KNEE, L_ANKLE
+    LEG_R = [1, 2, 3]  # R_HIP, R_KNEE, R_ANKLE
+
+    def __init__(self, kp, ankle_vel, seq_fps, weights=_LegSolverWeights()):
+        self.kp = kp
+        self.ankle_vel = ankle_vel
+        self.seq_fps = seq_fps
+        self.w = weights
+
+    def _stance_extent(self, anchor_t, other_end_t, foot):
+        # The stance influence range must not depend on the pre-DP left/right
+        # labels, because those labels are exactly what DP is trying to resolve.
+        # Use a fixed fraction of the adjacent touchdown gap, with FPS-scaled
+        # min/max guards so the same seconds are covered at 30/60/120 fps.
+        step = 1 if other_end_t > anchor_t else -1
+        gap = abs(int(other_end_t) - int(anchor_t))
+        if gap <= 1:
+            return anchor_t
+
+        if step > 0:
+            raw_window = int(round(gap * 0.35))
+            min_window = max(1, int(round(self.seq_fps * 0.04)))
+            max_window = max(min_window, int(round(self.seq_fps * 0.12)))
+        else:
+            raw_window = int(round(gap * 0.20))
+            min_window = max(1, int(round(self.seq_fps * 0.02)))
+            max_window = max(min_window, int(round(self.seq_fps * 0.07)))
+
+        window = _clamp(raw_window, min_window, max_window)
+        window = min(window, gap - 1)
+        return anchor_t + step * window
+
+    def _legs_for_state(self, t, state):
+        if state:
+            return self.kp[t, self.LEG_L], self.kp[t, self.LEG_R]
+        return self.kp[t, self.LEG_R], self.kp[t, self.LEG_L]
+
+    def _transition_cost(self, prev_t, prev_state, t, state):
+        prev_r, prev_l = self._legs_for_state(prev_t, prev_state)
+        cur_r, cur_l = self._legs_for_state(t, state)
+        vector_cost = np.linalg.norm(
+            _leg_vectors(cur_r, cur_l) - _leg_vectors(prev_r, prev_l),
+            axis=1,
+        ).sum()
+        coord_cost = (
+            np.linalg.norm(cur_r - prev_r, axis=1).sum() +
+            np.linalg.norm(cur_l - prev_l, axis=1).sum()
+        )
+        cost = self.w.vector_weight * vector_cost + self.w.coord_weight * coord_cost
+        if state != prev_state:
+            cost += self.w.switch_penalty
+        return cost
+
+    def _lower_foot_for_state(self, t, state):
+        right_leg, left_leg = self._legs_for_state(t, state)
+        return "right" if right_leg[2, 1] >= left_leg[2, 1] else "left"
+
+    def _foot_mismatch_penalty(self, t, state, expected_foot, penalty):
+        if self._lower_foot_for_state(t, state) == expected_foot:
+            return 0.0
+        right_leg, left_leg = self._legs_for_state(t, state)
+        if expected_foot == "right":
+            y_gap = max(0.0, float(left_leg[2, 1] - right_leg[2, 1]))
+        else:
+            y_gap = max(0.0, float(right_leg[2, 1] - left_leg[2, 1]))
+        return penalty + y_gap
+
+    def _stance_evidence_cost(self, t, state, expected_foot, penalty):
+        right_leg, left_leg = self._legs_for_state(t, state)
+        if expected_foot == "right":
+            stance_leg, swing_leg = right_leg, left_leg
+            stance_vel = self.ankle_vel["right"][t] if not state else self.ankle_vel["left"][t]
+            swing_vel = self.ankle_vel["left"][t] if not state else self.ankle_vel["right"][t]
+        else:
+            stance_leg, swing_leg = left_leg, right_leg
+            stance_vel = self.ankle_vel["left"][t] if not state else self.ankle_vel["right"][t]
+            swing_vel = self.ankle_vel["right"][t] if not state else self.ankle_vel["left"][t]
+
+        velocity_cost = max(0.0, self.w.velocity_margin - float(swing_vel - stance_vel))
+        y_cost = max(0.0, float(swing_leg[2, 1] - stance_leg[2, 1]))
+        angle_gap = _knee_angle(stance_leg) - _knee_angle(swing_leg)
+        angle_cost = max(0.0, self.w.knee_angle_margin - angle_gap)
+        return penalty + (
+            self.w.velocity_weight * velocity_cost +
+            self.w.y_weight * y_cost +
+            self.w.knee_angle_weight * angle_cost
+        )
+
+    def _observation_cost(self, t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start):
+        if t == t_a:
+            return self._foot_mismatch_penalty(t, state, foot_a, self.w.anchor_penalty)
+        if t == t_b:
+            return self._foot_mismatch_penalty(t, state, foot_b, self.w.anchor_penalty)
+
+        near_start = t <= post_end
+        near_end = t >= pre_start
+        if near_start and near_end:
+            expected = foot_a if (t - t_a) <= (t_b - t) else foot_b
+            return self._stance_evidence_cost(t, state, expected, self.w.stance_penalty)
+        if near_start:
+            return self._stance_evidence_cost(t, state, foot_a, self.w.stance_penalty)
+        if near_end:
+            return self._stance_evidence_cost(t, state, foot_b, self.w.stance_penalty)
+        return 0.0
+
+    def _switch_timing_cost(self, t_a, t_b, t, prev_state, state):
+        if state == prev_state:
+            return 0.0
+        span = max(1, t_b - t_a)
+        progress = (t - t_a) / span
+        if progress >= self.w.early_switch_until:
+            return 0.0
+        return (self.w.early_switch_until - progress) * self.w.early_switch_weight
+
+    def solve_segment(self, t_a, foot_a, t_b, foot_b):
+        post_end = self._stance_extent(t_a, t_b, foot_a)
+        pre_start = self._stance_extent(t_b, t_a, foot_b)
+
+        frames = list(range(t_a, t_b + 1))
+        dp = np.full((len(frames), 2), np.inf, dtype=np.float64)
+        parent = np.full((len(frames), 2), -1, dtype=np.int8)
+
+        for state in (0, 1):
+            dp[0, state] = self._observation_cost(
+                t_a, state, t_a, foot_a, t_b, foot_b, post_end, pre_start
+            )
+
+        for idx in range(1, len(frames)):
+            t = frames[idx]
+            prev_t = frames[idx - 1]
+            for state in (0, 1):
+                obs = self._observation_cost(
+                    t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start
+                )
+                best_cost = np.inf
+                best_prev = 0
+                for prev_state in (0, 1):
+                    cost = (
+                        dp[idx - 1, prev_state] +
+                        self._transition_cost(prev_t, prev_state, t, state) +
+                        obs +
+                        self._switch_timing_cost(t_a, t_b, t, prev_state, state)
+                    )
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_prev = prev_state
+                dp[idx, state] = best_cost
+                parent[idx, state] = best_prev
+
+        states = {}
+        state = int(np.argmin(dp[-1]))
+        for idx in range(len(frames) - 1, -1, -1):
+            states[frames[idx]] = state
+            state = int(parent[idx, state]) if idx > 0 else state
+
+        return states
+
+
+def _persist_corrected_reconstruction(recon, valid_frames, swapped, keypoints_npz_path):
+    """Fill post-DP leg gaps, smooth/limit leg geometry, and overwrite the npz."""
+    _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path)
+    _post_dp_smooth_and_limit_legs(recon)
+    np.savez_compressed(
+        keypoints_npz_path, reconstruction=recon, valid_frames=valid_frames
+    )
+
+
 def apply_anchor_leg_correction(keypoints_npz_path, step_events):
     """Refine 2D keypoint L/R leg identity using confirmed touchdown events.
 
@@ -1447,234 +1777,22 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
     if len(step_events) < 2:
         return None
 
-    L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
-    R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
-    LEG_L, LEG_R = [L_HIP, L_KNEE, L_ANKLE], [R_HIP, R_KNEE, R_ANKLE]
-    vector_weight = 1.0
-    coord_weight = 0.20
-    switch_penalty = 8.0
-    stance_penalty = 90.0
-    anchor_penalty = 1000.0
-    velocity_weight = 1.0
-    y_weight = 0.25
-    knee_angle_weight = 0.4
-    velocity_margin = 3.0
-    knee_angle_margin = 15.0
-    early_switch_until = 0.65
-    early_switch_weight = 50.0
-
     data = np.load(keypoints_npz_path, allow_pickle=True)
     recon = data["reconstruction"]  # (M, T, J, C) -- C includes x, y, conf
     valid_frames = data["valid_frames"]
 
     kp = recon[0, :, :, :2].astype(np.float64)
     result = kp.copy()
+    frame_count = kp.shape[0]
 
-    T = kp.shape[0]
-    ankle_vel = {"right": np.zeros(T), "left": np.zeros(T)}
-    for t in range(1, T):
-        ankle_vel["right"][t] = np.linalg.norm(kp[t, R_ANKLE] - kp[t - 1, R_ANKLE])
-        ankle_vel["left"][t] = np.linalg.norm(kp[t, L_ANKLE] - kp[t - 1, L_ANKLE])
-    for foot in ("right", "left"):
-        padded = np.pad(ankle_vel[foot], (1, 1), mode="edge")
-        ankle_vel[foot] = np.asarray([
-            np.median(padded[t:t + 3]) for t in range(T)
-        ], dtype=np.float64)
+    solver = _LegIdentitySolver(
+        kp,
+        _median_smoothed_ankle_velocity(kp),
+        _estimate_seq_fps(step_events),
+    )
+    leg_l, leg_r = _LegIdentitySolver.LEG_L, _LegIdentitySolver.LEG_R
 
-    def _estimate_seq_fps(events):
-        samples = []
-        sorted_events = sorted(events, key=lambda item: int(item["seq_frame"]))
-        for a, b in zip(sorted_events, sorted_events[1:]):
-            frame_delta = int(b["seq_frame"]) - int(a["seq_frame"])
-            if frame_delta <= 0:
-                continue
-            for time_key in ("seq_time_s", "time_s"):
-                if a.get(time_key) is None or b.get(time_key) is None:
-                    continue
-                try:
-                    time_delta = float(b[time_key]) - float(a[time_key])
-                except (TypeError, ValueError):
-                    continue
-                if time_delta > 1e-6:
-                    samples.append(frame_delta / time_delta)
-                    break
-        if not samples:
-            return 60.0
-        fps = float(np.median(samples))
-        if not np.isfinite(fps) or fps <= 0:
-            return 60.0
-        return fps
-
-    seq_fps = _estimate_seq_fps(step_events)
-
-    def _clamp(value, lower, upper):
-        return max(lower, min(upper, value))
-
-    def _other(foot):
-        return "left" if foot == "right" else "right"
-
-    def _stance_extent(anchor_t, other_end_t, foot):
-        # The stance influence range must not depend on the pre-DP left/right
-        # labels, because those labels are exactly what DP is trying to resolve.
-        # Use a fixed fraction of the adjacent touchdown gap, with FPS-scaled
-        # min/max guards so the same seconds are covered at 30/60/120 fps.
-        step = 1 if other_end_t > anchor_t else -1
-        gap = abs(int(other_end_t) - int(anchor_t))
-        if gap <= 1:
-            return anchor_t
-
-        if step > 0:
-            raw_window = int(round(gap * 0.35))
-            min_window = max(1, int(round(seq_fps * 0.04)))
-            max_window = max(min_window, int(round(seq_fps * 0.12)))
-        else:
-            raw_window = int(round(gap * 0.20))
-            min_window = max(1, int(round(seq_fps * 0.02)))
-            max_window = max(min_window, int(round(seq_fps * 0.07)))
-
-        window = _clamp(raw_window, min_window, max_window)
-        window = min(window, gap - 1)
-        return anchor_t + step * window
-
-    def _legs_for_state(t, state):
-        if state:
-            return kp[t, LEG_L], kp[t, LEG_R]
-        return kp[t, LEG_R], kp[t, LEG_L]
-
-    def _leg_vectors(right_leg, left_leg):
-        return np.asarray([
-            right_leg[1] - right_leg[0],
-            right_leg[2] - right_leg[0],
-            left_leg[1] - left_leg[0],
-            left_leg[2] - left_leg[0],
-        ], dtype=np.float64)
-
-    def _knee_angle(leg):
-        v1 = leg[0] - leg[1]
-        v2 = leg[2] - leg[1]
-        denom = np.linalg.norm(v1) * np.linalg.norm(v2)
-        if denom < 1e-8:
-            return 0.0
-        cos_a = np.dot(v1, v2) / denom
-        return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
-
-    def _transition_cost(prev_t, prev_state, t, state):
-        prev_r, prev_l = _legs_for_state(prev_t, prev_state)
-        cur_r, cur_l = _legs_for_state(t, state)
-        vector_cost = np.linalg.norm(
-            _leg_vectors(cur_r, cur_l) - _leg_vectors(prev_r, prev_l),
-            axis=1,
-        ).sum()
-        coord_cost = (
-            np.linalg.norm(cur_r - prev_r, axis=1).sum() +
-            np.linalg.norm(cur_l - prev_l, axis=1).sum()
-        )
-        cost = vector_weight * vector_cost + coord_weight * coord_cost
-        if state != prev_state:
-            cost += switch_penalty
-        return cost
-
-    def _lower_foot_for_state(t, state):
-        right_leg, left_leg = _legs_for_state(t, state)
-        return "right" if right_leg[2, 1] >= left_leg[2, 1] else "left"
-
-    def _foot_mismatch_penalty(t, state, expected_foot, penalty):
-        if _lower_foot_for_state(t, state) == expected_foot:
-            return 0.0
-        right_leg, left_leg = _legs_for_state(t, state)
-        if expected_foot == "right":
-            y_gap = max(0.0, float(left_leg[2, 1] - right_leg[2, 1]))
-        else:
-            y_gap = max(0.0, float(right_leg[2, 1] - left_leg[2, 1]))
-        return penalty + y_gap
-
-    def _stance_evidence_cost(t, state, expected_foot, penalty):
-        right_leg, left_leg = _legs_for_state(t, state)
-        if expected_foot == "right":
-            stance_leg, swing_leg = right_leg, left_leg
-            stance_vel = ankle_vel["right"][t] if not state else ankle_vel["left"][t]
-            swing_vel = ankle_vel["left"][t] if not state else ankle_vel["right"][t]
-        else:
-            stance_leg, swing_leg = left_leg, right_leg
-            stance_vel = ankle_vel["left"][t] if not state else ankle_vel["right"][t]
-            swing_vel = ankle_vel["right"][t] if not state else ankle_vel["left"][t]
-
-        velocity_cost = max(0.0, velocity_margin - float(swing_vel - stance_vel))
-        y_cost = max(0.0, float(swing_leg[2, 1] - stance_leg[2, 1]))
-        angle_gap = _knee_angle(stance_leg) - _knee_angle(swing_leg)
-        angle_cost = max(0.0, knee_angle_margin - angle_gap)
-        return penalty + (
-            velocity_weight * velocity_cost +
-            y_weight * y_cost +
-            knee_angle_weight * angle_cost
-        )
-
-    def _observation_cost(t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start):
-        if t == t_a:
-            return _foot_mismatch_penalty(t, state, foot_a, anchor_penalty)
-        if t == t_b:
-            return _foot_mismatch_penalty(t, state, foot_b, anchor_penalty)
-
-        near_start = t <= post_end
-        near_end = t >= pre_start
-        if near_start and near_end:
-            expected = foot_a if (t - t_a) <= (t_b - t) else foot_b
-            return _stance_evidence_cost(t, state, expected, stance_penalty)
-        if near_start:
-            return _stance_evidence_cost(t, state, foot_a, stance_penalty)
-        if near_end:
-            return _stance_evidence_cost(t, state, foot_b, stance_penalty)
-        return 0.0
-
-    def _switch_timing_cost(t_a, t_b, t, prev_state, state):
-        if state == prev_state:
-            return 0.0
-        span = max(1, t_b - t_a)
-        progress = (t - t_a) / span
-        if progress >= early_switch_until:
-            return 0.0
-        return (early_switch_until - progress) * early_switch_weight
-
-    def _solve_segment_states(t_a, foot_a, t_b, foot_b):
-        post_end = _stance_extent(t_a, t_b, foot_a)
-        pre_start = _stance_extent(t_b, t_a, foot_b)
-
-        frames = list(range(t_a, t_b + 1))
-        dp = np.full((len(frames), 2), np.inf, dtype=np.float64)
-        parent = np.full((len(frames), 2), -1, dtype=np.int8)
-
-        for state in (0, 1):
-            dp[0, state] = _observation_cost(t_a, state, t_a, foot_a, t_b, foot_b, post_end, pre_start)
-
-        for idx in range(1, len(frames)):
-            t = frames[idx]
-            prev_t = frames[idx - 1]
-            for state in (0, 1):
-                obs = _observation_cost(t, state, t_a, foot_a, t_b, foot_b, post_end, pre_start)
-                best_cost = np.inf
-                best_prev = 0
-                for prev_state in (0, 1):
-                    cost = (
-                        dp[idx - 1, prev_state] +
-                        _transition_cost(prev_t, prev_state, t, state) +
-                        obs +
-                        _switch_timing_cost(t_a, t_b, t, prev_state, state)
-                    )
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_prev = prev_state
-                dp[idx, state] = best_cost
-                parent[idx, state] = best_prev
-
-        states = {}
-        state = int(np.argmin(dp[-1]))
-        for idx in range(len(frames) - 1, -1, -1):
-            states[frames[idx]] = state
-            state = int(parent[idx, state]) if idx > 0 else state
-
-        return states
-
-    swapped = np.zeros(T, dtype=bool)
+    swapped = np.zeros(frame_count, dtype=bool)
     anchors = sorted(
         ((int(e["seq_frame"]), e["foot"]) for e in step_events),
         key=lambda a: a[0],
@@ -1682,20 +1800,18 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
     for (t_a, foot_a), (t_b, foot_b) in zip(anchors, anchors[1:]):
         if t_b <= t_a:
             continue
-        states = _solve_segment_states(t_a, foot_a, t_b, foot_b)
+        states = solver.solve_segment(t_a, foot_a, t_b, foot_b)
         for t in range(t_a, t_b + 1):
             if states.get(t, 0):
-                result[t, LEG_R] = kp[t, LEG_L]
-                result[t, LEG_L] = kp[t, LEG_R]
+                result[t, leg_r] = kp[t, leg_l]
+                result[t, leg_l] = kp[t, leg_r]
                 swapped[t] = True
             else:
-                result[t, LEG_R] = kp[t, LEG_R]
-                result[t, LEG_L] = kp[t, LEG_L]
+                result[t, leg_r] = kp[t, leg_r]
+                result[t, leg_l] = kp[t, leg_l]
 
     recon[0, :, :, :2] = result
-    _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path)
-    _post_dp_smooth_and_limit_legs(recon)
-    np.savez_compressed(keypoints_npz_path, reconstruction=recon, valid_frames=valid_frames)
+    _persist_corrected_reconstruction(recon, valid_frames, swapped, keypoints_npz_path)
     return swapped
 
 
@@ -2185,20 +2301,24 @@ def _detect_long_jump_final_landing(ankle_rows, accepted_events, fps):
     }
 
 
-def _recompute_contact_event_metrics(events, calibrations, contexts=None):
-    """Recompute distances after special landing replacement changes event order.
+def _events_in_seq_order(events):
+    return sorted(events, key=lambda item: int(item["seq_frame"]))
 
-    contexts (from _contact_validation_contexts()) supplies each homography
-    camera's learned plausible world_y band. A point outside it gets its
-    world_x_m/world_y_m/step_length_m left as None rather than displaying an
-    implausible position -- this only affects display/distance for that one
-    event, not whether it stayed in `events` (which _detect_long_jump_final_
-    landing() already used purely by frame position, upstream of this call).
-    """
-    contexts = contexts or {}
+
+def _homography_cameras(calibrations):
+    """Yield (cam_idx, calibration) for homography-calibrated cameras only."""
+    for cam_idx, calibration in calibrations.items():
+        if calibration and calibration.get("mode") == "homography":
+            yield cam_idx, calibration
+
+
+def _project_contacts_and_step_lengths(events, calibrations, contexts):
+    """Pass 1: project every contact point, fill world/pixel coordinates and
+    per-camera + cross-camera step lengths, and stash the raw homography
+    world coordinates the later passes need."""
     previous_by_camera = {}
     previous_global_track_pos_m = None
-    for event in sorted(events, key=lambda item: int(item["seq_frame"])):
+    for event in _events_in_seq_order(events):
         cam_idx = int(event["cam"])
         calibration = calibrations.get(cam_idx)
         point = (float(event["contact_x"]), float(event["contact_y"]))
@@ -2258,15 +2378,15 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
         if track_pos is not None:
             previous_by_camera[cam_idx] = track_pos
 
-    # A point can be inside the physical strip yet still be a one-frame pose
-    # jump. Compare only an interior event with both neighbouring valid events
-    # from the same camera; end points are deliberately left alone because
-    # they have no two-sided temporal evidence.
-    for cam_idx, calibration in calibrations.items():
-        if not calibration or calibration.get("mode") != "homography":
-            continue
+
+def _reject_homography_lateral_temporal_jumps(events, calibrations):
+    """Pass 2: a point can be inside the physical strip yet still be a one-frame
+    pose jump. Compare only an interior event with both neighbouring valid
+    events from the same camera; end points are deliberately left alone because
+    they have no two-sided temporal evidence."""
+    for cam_idx, _calibration in _homography_cameras(calibrations):
         camera_events = [
-            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            event for event in _events_in_seq_order(events)
             if int(event.get("cam", -1)) == int(cam_idx)
             and event.get("world_y_m") is not None
             and str(event.get("event_type", "")) != "final_landing"
@@ -2291,15 +2411,15 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
             reason = "homography_lateral_temporal_jump"
             event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
 
-    # A rejected cross-track coordinate does not mean its gait event vanished.
-    # Preserve that event's raw forward X and timestamp, but estimate only Y
-    # from neighbouring trustworthy contacts. This prevents a pose heatmap
-    # jump from becoming either a false map point or a missing step.
-    for cam_idx, calibration in calibrations.items():
-        if not calibration or calibration.get("mode") != "homography":
-            continue
+
+def _interpolate_rejected_homography_world_y(events, calibrations):
+    """Pass 3: a rejected cross-track coordinate does not mean its gait event
+    vanished. Preserve that event's raw forward X and timestamp, but estimate
+    only Y from neighbouring trustworthy contacts. This prevents a pose heatmap
+    jump from becoming either a false map point or a missing step."""
+    for cam_idx, _calibration in _homography_cameras(calibrations):
         camera_events = [
-            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            event for event in _events_in_seq_order(events)
             if int(event.get("cam", -1)) == int(cam_idx)
             and str(event.get("event_type", "")) != "final_landing"
         ]
@@ -2337,19 +2457,19 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
             reason = "homography_y_interpolated"
             event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
 
-    # Layer 2 (velocity continuity): a contact point can pass the physical
-    # runway-bound check (layer 1, in _validate_homography_lateral()) yet
-    # still be a misdetection if it implies an impossible sprint speed
-    # to/from its neighbour -- e.g. the same distance jump happening in a
-    # much shorter time than a real stride takes. Checked only within a
-    # single camera's own clip: time_s resets at each camera cut, so a
-    # cross-camera pair's elapsed time isn't directly comparable, and a step
-    # spanning a camera cut is deliberately left unchecked by this layer.
-    for cam_idx, calibration in calibrations.items():
-        if not calibration or calibration.get("mode") != "homography":
-            continue
+
+def _reject_homography_implausible_velocity(events, calibrations):
+    """Pass 4 (velocity continuity): a contact point can pass the physical
+    runway-bound check (layer 1, in _validate_homography_lateral()) yet still
+    be a misdetection if it implies an impossible sprint speed to/from its
+    neighbour -- e.g. the same distance jump happening in a much shorter time
+    than a real stride takes. Checked only within a single camera's own clip:
+    time_s resets at each camera cut, so a cross-camera pair's elapsed time
+    isn't directly comparable, and a step spanning a camera cut is deliberately
+    left unchecked by this layer."""
+    for cam_idx, _calibration in _homography_cameras(calibrations):
         camera_events = [
-            event for event in sorted(events, key=lambda item: int(item["seq_frame"]))
+            event for event in _events_in_seq_order(events)
             if int(event.get("cam", -1)) == int(cam_idx)
             and event.get("world_x_m") is not None
             and str(event.get("event_type", "")) != "final_landing"
@@ -2383,10 +2503,12 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
             reason = "homography_velocity_implausible"
             event["contact_rejection_reason"] = f"{prior_reason};{reason}".strip(";")
 
-    # Recalculate Homography step lengths after any geometric/temporal rejection
-    # so no displayed distance is based on a hidden anchor.
+
+def _recompute_global_homography_step_lengths(events, calibrations):
+    """Pass 5: recalculate homography step lengths after any geometric/temporal
+    rejection so no displayed distance is based on a hidden anchor."""
     previous_global_world_x = None
-    for event in sorted(events, key=lambda item: int(item["seq_frame"])):
+    for event in _events_in_seq_order(events):
         calibration = calibrations.get(int(event.get("cam", 0)))
         if not calibration or calibration.get("mode") != "homography":
             continue
@@ -2402,79 +2524,70 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
             event["step_length_m"] = abs(global_world_x - previous_global_world_x)
         previous_global_world_x = global_world_x
 
-    # Internal values are used only while reconstructing this event list and
-    # must not leak into the stable CSV schema.
+
+def _strip_internal_homography_keys(events):
+    """Pass 6: internal values are used only while reconstructing this event
+    list and must not leak into the stable CSV schema."""
     for event in events:
         event.pop("_homography_raw_world_x", None)
         event.pop("_homography_raw_world_y", None)
 
 
-def refresh_step_analysis_after_leg_correction(
-    step_analysis,
-    config,
-    output_dir,
-    keypoints_npz,
-    offsets_npz,
-    foot_npz=None,
-    meters_per_pixel=None,
-):
-    """Refresh rows and final contact coordinates after keypoints were rewritten.
+def _recompute_contact_event_metrics(events, calibrations, contexts=None):
+    """Recompute distances after special landing replacement changes event order.
 
-    ``run_step_stride_analysis()`` must run before anchor leg correction because it
-    provides the touchdown anchors. After ``apply_anchor_leg_correction()`` rewrites
-    left/right leg identity in ``keypoints.npz``, the previously computed
-    ``ankle_rows`` still reflect the pre-correction labels. This function keeps the
-    already accepted event timing/foot labels, but regenerates ankle rows and event
-    coordinates from the corrected keypoints so the final overlay and CSVs use one
-    consistent source of truth.  Touchdown *time* remains the original
-    ankle-peak result.  Its final location follows the contact hierarchy:
-    heel (confidence >= .50), big toe (>= .50), then ankle fallback.
+    contexts (from _contact_validation_contexts()) supplies each homography
+    camera's learned plausible world_y band. A point outside it gets its
+    world_x_m/world_y_m/step_length_m left as None rather than displaying an
+    implausible position -- this only affects display/distance for that one
+    event, not whether it stayed in `events` (which _detect_long_jump_final_
+    landing() already used purely by frame position, upstream of this call).
     """
-    if not step_analysis:
-        return step_analysis
+    contexts = contexts or {}
+    _project_contacts_and_step_lengths(events, calibrations, contexts)
+    _reject_homography_lateral_temporal_jumps(events, calibrations)
+    _interpolate_rejected_homography_world_y(events, calibrations)
+    _reject_homography_implausible_velocity(events, calibrations)
+    _recompute_global_homography_step_lengths(events, calibrations)
+    _strip_internal_homography_keys(events)
 
-    cameras = config.get("cameras") or []
-    if not cameras:
-        return step_analysis
 
+def _first_camera_video_fps(cameras):
+    """FPS of the first camera's video, or 60.0 when it cannot be read."""
     video_path = cameras[0].get("video_path")
     cap = cv2.VideoCapture(video_path) if video_path else None
     fps = cap.get(cv2.CAP_PROP_FPS) if cap and cap.isOpened() else 60.0
     if cap:
         cap.release()
-    fps = fps or 60.0
+    return fps or 60.0
 
+
+def _normalize_line(line):
+    return [(float(x), float(y)) for x, y in line] if line else line
+
+
+def _build_sequential_calibrations(cameras, config, meters_per_pixel):
+    """One calibration per camera, each carrying its cumulative along-runway
+    offset.
+
+    Cameras are laid out sequentially along the runway, but both line
+    calibration and six-point Homography start their local X at zero. Stacking
+    their physical spans into one global track coordinate lets a step that
+    crosses a camera cut (e.g. S6 -> S7) have a real distance.
+    """
     args = SimpleNamespace(meters_per_pixel=meters_per_pixel)
-    ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
-    rows_by_seq = {int(row["seq_frame"]): row for row in ankle_rows}
-    foot_npz = foot_npz or str(Path(keypoints_npz).parent / "foot_keypoints.npz")
-    foot_contacts_by_seq = load_foot_contact_positions(foot_npz, offsets_npz)
-    contact_contexts = _contact_validation_contexts(
-        cameras, step_analysis.get("step_events", []), rows_by_seq,
-        foot_contacts_by_seq)
-
     calibrations = {}
     cumulative_offset_m = 0.0
     for cam_idx, cam in enumerate(cameras):
-        start_line = cam.get("start_line")
-        end_line = cam.get("end_line")
-        if start_line:
-            start_line = [(float(x), float(y)) for x, y in start_line]
-        if end_line:
-            end_line = [(float(x), float(y)) for x, y in end_line]
         distance_m = cam.get("distance_m") or config.get("distance_m")
         calibration = _make_calibration(
             cam,
             config,
             args,
-            start_line,
-            end_line,
+            _normalize_line(cam.get("start_line")),
+            _normalize_line(cam.get("end_line")),
             distance_m,
         )
-        # Cameras are laid out sequentially along the runway, but both line
-        # calibration and six-point Homography start their local X at zero.
-        # Stack their physical spans into one global track coordinate so the
-        # step that crosses a camera cut (e.g. S6 -> S7) has a real distance.
         calibration["camera_offset_m"] = cumulative_offset_m
         if calibration.get("mode") == "homography":
             camera_span_m = (
@@ -2485,11 +2598,27 @@ def refresh_step_analysis_after_leg_correction(
             camera_span_m = float(distance_m) if distance_m is not None else 0.0
         cumulative_offset_m += max(0.0, camera_span_m)
         calibrations[cam_idx] = calibration
+    return calibrations
 
+
+def _ankle_for_foot(row, foot):
+    if foot == "right":
+        return row["right_ankle_x"], row["right_ankle_y"], row["right_ankle_conf"]
+    if foot == "left":
+        return row["left_ankle_x"], row["left_ankle_y"], row["left_ankle_conf"]
+    return row["lower_ankle_x"], row["lower_ankle_y"], row["lower_ankle_conf"]
+
+
+def _rederive_events_from_corrected_keypoints(
+    step_events, rows_by_seq, calibrations, foot_contacts_by_seq, contact_contexts,
+):
+    """Re-derive every accepted event's coordinates from the corrected ankle
+    rows, keeping its original timing and foot label. Returns
+    (refreshed_events, rejected_events)."""
     refreshed_events = []
     rejected_events = []
     prev_proj_by_cam = {}
-    for event in sorted(step_analysis.get("step_events", []), key=lambda item: int(item["seq_frame"])):
+    for event in sorted(step_events, key=lambda item: int(item["seq_frame"])):
         seq_frame = int(event["seq_frame"])
         row = rows_by_seq.get(seq_frame)
         if row is None:
@@ -2497,18 +2626,7 @@ def refresh_step_analysis_after_leg_correction(
             continue
 
         foot = str(event.get("foot", row["lower_foot"]))
-        if foot == "right":
-            ankle_x = row["right_ankle_x"]
-            ankle_y = row["right_ankle_y"]
-            ankle_conf = row["right_ankle_conf"]
-        elif foot == "left":
-            ankle_x = row["left_ankle_x"]
-            ankle_y = row["left_ankle_y"]
-            ankle_conf = row["left_ankle_conf"]
-        else:
-            ankle_x = row["lower_ankle_x"]
-            ankle_y = row["lower_ankle_y"]
-            ankle_conf = row["lower_ankle_conf"]
+        ankle_x, ankle_y, ankle_conf = _ankle_for_foot(row, foot)
 
         cam_idx = int(row["cam"])
         calibration = calibrations.get(cam_idx) or calibrations.get(0)
@@ -2561,94 +2679,188 @@ def refresh_step_analysis_after_leg_correction(
             "step_length_m": step_len_m,
         })
         refreshed_events.append(updated)
+    return refreshed_events, rejected_events
+
+
+def _recover_terminal_preflight_contacts(
+    refreshed_events, ankle_rows, rows_by_seq, calibrations,
+    foot_contacts_by_seq, contact_contexts, fps, terminal_cam, keep_through_seq,
+):
+    """After a flight is confirmed, run one narrow step-detection pass on the
+    terminal camera only up to its last pre-takeoff anchor, appending any valid
+    contact the pre-DP pass missed. Mutates refreshed_events in place.
+
+    The initial peak pass happens before DP resolves leg identity, so a valid
+    final-camera touchdown immediately before takeoff can be absent from that
+    early list even though it is clear in the DP-corrected trajectory. This
+    never creates steps during flight or after sand impact.
+    """
+    terminal_calibration = calibrations.get(terminal_cam)
+    if terminal_calibration is None or keep_through_seq is None:
+        return
+
+    terminal_rows = [row for row in ankle_rows if int(row["cam"]) == terminal_cam]
+    existing_terminal_seq = {
+        int(event["seq_frame"]) for event in refreshed_events
+        if int(event["cam"]) == terminal_cam
+    }
+    recovered_candidates = detect_steps(terminal_rows, terminal_calibration, fps=fps)
+    for candidate in recovered_candidates:
+        seq_frame = int(candidate["seq_frame"])
+        row = rows_by_seq.get(seq_frame)
+        if row is None:
+            continue
+        if seq_frame > int(keep_through_seq) or seq_frame in existing_terminal_seq:
+            continue
+        foot = str(candidate["foot"])
+        ankle_x = float(candidate["ankle_x"])
+        ankle_y = float(candidate["ankle_y"])
+        ankle_conf = float(candidate["ankle_conf"])
+        contact = select_contact_point(
+            foot, ankle_x, ankle_y, ankle_conf,
+            foot_contacts_by_seq.get(seq_frame), contact_contexts.get(terminal_cam),
+        )
+        if not contact["contact_valid"]:
+            continue
+        recovered = {
+            "step_index": 0,
+            "seq_frame": seq_frame,
+            "orig_frame": int(row["orig_frame"]),
+            "time_s": float(row["time_s"]),
+            "seq_time_s": float(row["seq_time_s"]),
+            "cam": terminal_cam,
+            "foot": foot,
+            "event_type": "run_step",
+            "flight_start_frame": None,
+            "landing_position_source": "",
+            "landing_score": None,
+            "ankle_x": ankle_x,
+            "ankle_y": ankle_y,
+            "ankle_conf": ankle_conf,
+            **contact,
+            "track_position_px": None,
+            "world_x_m": None,
+            "world_y_m": None,
+            "step_length_px": None,
+            "step_length_m": None,
+            "cadence_spm": None,
+            "avg_cadence_spm": None,
+        }
+        recovered["contact_selection_reason"] = (
+            f"{contact['contact_selection_reason']};"
+            "terminal_preflight_recovered_after_dp"
+        )
+        refreshed_events.append(recovered)
+        existing_terminal_seq.add(seq_frame)
+
+
+def _drop_terminal_events_after_flight(
+    refreshed_events, terminal_cam, keep_through_seq, replace_after_seq,
+):
+    """A confirmed flight invalidates every ordinary peak after the last
+    pre-takeoff contact: peaks before impact are mid-air swing motion, peaks
+    after impact are recovery motion. Older fallback detections only provide
+    _replace_after_seq, so retain their former post-impact-only behaviour."""
+    return [
+        event for event in refreshed_events
+        if not (int(event["cam"]) == terminal_cam
+                and (
+                    (keep_through_seq is not None
+                     and int(event["seq_frame"]) > int(keep_through_seq))
+                    or (keep_through_seq is None and replace_after_seq is not None
+                        and int(event["seq_frame"]) >= int(replace_after_seq))
+                ))
+    ]
+
+
+def _apply_long_jump_final_landing(
+    refreshed_events, ankle_rows, rows_by_seq, calibrations,
+    foot_contacts_by_seq, contact_contexts, fps,
+):
+    """Detect one terminal-camera long-jump landing and, if found, recover any
+    missed pre-takeoff contact, drop mid-air/recovery peaks, and append the
+    landing event. Returns the (possibly rebuilt) event list."""
+    landing = _detect_long_jump_final_landing(ankle_rows, refreshed_events, fps)
+    if landing is None:
+        return refreshed_events
+
+    terminal_cam = int(landing["cam"])
+    _recover_terminal_preflight_contacts(
+        refreshed_events, ankle_rows, rows_by_seq, calibrations,
+        foot_contacts_by_seq, contact_contexts, fps, terminal_cam,
+        landing.get("_keep_through_seq"),
+    )
+    keep_through_seq = landing.pop("_keep_through_seq", None)
+    replace_after_seq = landing.pop("_replace_after_seq", None)
+    refreshed_events = _drop_terminal_events_after_flight(
+        refreshed_events, terminal_cam, keep_through_seq, replace_after_seq,
+    )
+    refreshed_events.append(landing)
+    return refreshed_events
+
+
+def _mean_step_length_m(events):
+    lengths = [
+        float(e["step_length_m"]) for e in events if e.get("step_length_m") is not None
+    ]
+    return float(np.mean(lengths)) if lengths else None
+
+
+def _write_refreshed_step_csvs(step_analysis, output_dir, ankle_rows, refreshed_events):
+    ankle_csv = step_analysis.get("ankle_csv") or str(Path(output_dir) / "ankle_positions.csv")
+    steps_csv = step_analysis.get("steps_csv") or str(Path(output_dir) / "step_events.csv")
+    write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
+    write_csv(steps_csv, refreshed_events, STEP_FIELDS)
+
+
+def refresh_step_analysis_after_leg_correction(
+    step_analysis,
+    config,
+    output_dir,
+    keypoints_npz,
+    offsets_npz,
+    foot_npz=None,
+    meters_per_pixel=None,
+):
+    """Refresh rows and final contact coordinates after keypoints were rewritten.
+
+    ``run_step_stride_analysis()`` must run before anchor leg correction because it
+    provides the touchdown anchors. After ``apply_anchor_leg_correction()`` rewrites
+    left/right leg identity in ``keypoints.npz``, the previously computed
+    ``ankle_rows`` still reflect the pre-correction labels. This function keeps the
+    already accepted event timing/foot labels, but regenerates ankle rows and event
+    coordinates from the corrected keypoints so the final overlay and CSVs use one
+    consistent source of truth.  Touchdown *time* remains the original
+    ankle-peak result.  Its final location follows the contact hierarchy:
+    heel (confidence >= .50), big toe (>= .50), then ankle fallback.
+    """
+    if not step_analysis:
+        return step_analysis
+
+    cameras = config.get("cameras") or []
+    if not cameras:
+        return step_analysis
+
+    fps = _first_camera_video_fps(cameras)
+    ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
+    rows_by_seq = {int(row["seq_frame"]): row for row in ankle_rows}
+    foot_npz = foot_npz or str(Path(keypoints_npz).parent / "foot_keypoints.npz")
+    foot_contacts_by_seq = load_foot_contact_positions(foot_npz, offsets_npz)
+    contact_contexts = _contact_validation_contexts(
+        cameras, step_analysis.get("step_events", []), rows_by_seq,
+        foot_contacts_by_seq)
+    calibrations = _build_sequential_calibrations(cameras, config, meters_per_pixel)
+
+    refreshed_events, rejected_events = _rederive_events_from_corrected_keypoints(
+        step_analysis.get("step_events", []), rows_by_seq, calibrations,
+        foot_contacts_by_seq, contact_contexts,
+    )
 
     if bool(config.get("long_jump_final_landing", False)):
-        landing = _detect_long_jump_final_landing(ankle_rows, refreshed_events, fps)
-        if landing is not None:
-            terminal_cam = int(landing["cam"])
-            keep_through_seq = landing.get("_keep_through_seq")
-
-            # The initial peak pass happens before DP resolves leg identity.
-            # A valid final-camera touchdown immediately before takeoff can be
-            # absent from that early list even though it is clear in the final
-            # DP-corrected trajectory.  Once a flight has been confirmed, run
-            # one narrow recovery pass only before its last pre-takeoff anchor.
-            # This never creates steps during flight or after sand impact.
-            terminal_rows = [row for row in ankle_rows if int(row["cam"]) == terminal_cam]
-            terminal_calibration = calibrations.get(terminal_cam)
-            existing_terminal_seq = {
-                int(event["seq_frame"]) for event in refreshed_events
-                if int(event["cam"]) == terminal_cam
-            }
-            if terminal_calibration is not None and keep_through_seq is not None:
-                recovered_candidates = detect_steps(
-                    terminal_rows, terminal_calibration, fps=fps)
-                for candidate in recovered_candidates:
-                    seq_frame = int(candidate["seq_frame"])
-                    row = rows_by_seq.get(seq_frame)
-                    if row is None:
-                        continue
-                    if seq_frame > int(keep_through_seq) or seq_frame in existing_terminal_seq:
-                        continue
-                    foot = str(candidate["foot"])
-                    ankle_x = float(candidate["ankle_x"])
-                    ankle_y = float(candidate["ankle_y"])
-                    ankle_conf = float(candidate["ankle_conf"])
-                    contact = select_contact_point(
-                        foot, ankle_x, ankle_y, ankle_conf,
-                        foot_contacts_by_seq.get(seq_frame), contact_contexts.get(terminal_cam),
-                    )
-                    if not contact["contact_valid"]:
-                        continue
-                    recovered = {
-                        "step_index": 0,
-                        "seq_frame": seq_frame,
-                        "orig_frame": int(row["orig_frame"]),
-                        "time_s": float(row["time_s"]),
-                        "seq_time_s": float(row["seq_time_s"]),
-                        "cam": terminal_cam,
-                        "foot": foot,
-                        "event_type": "run_step",
-                        "flight_start_frame": None,
-                        "landing_position_source": "",
-                        "landing_score": None,
-                        "ankle_x": ankle_x,
-                        "ankle_y": ankle_y,
-                        "ankle_conf": ankle_conf,
-                        **contact,
-                        "track_position_px": None,
-                        "world_x_m": None,
-                        "world_y_m": None,
-                        "step_length_px": None,
-                        "step_length_m": None,
-                        "cadence_spm": None,
-                        "avg_cadence_spm": None,
-                    }
-                    recovered["contact_selection_reason"] = (
-                        f"{contact['contact_selection_reason']};"
-                        "terminal_preflight_recovered_after_dp"
-                    )
-                    refreshed_events.append(recovered)
-                    existing_terminal_seq.add(seq_frame)
-
-            # A confirmed flight invalidates *every* ordinary peak after the
-            # last pre-takeoff contact: peaks before impact are mid-air swing
-            # motion, while peaks after impact are recovery motion.  Older
-            # fallback detections only provide _replace_after_seq, so retain
-            # their former post-impact-only behaviour for compatibility.
-            keep_through_seq = landing.pop("_keep_through_seq", None)
-            replace_after_seq = landing.pop("_replace_after_seq", None)
-            refreshed_events = [
-                event for event in refreshed_events
-                if not (int(event["cam"]) == terminal_cam
-                        and (
-                            (keep_through_seq is not None
-                             and int(event["seq_frame"]) > int(keep_through_seq))
-                            or (keep_through_seq is None and replace_after_seq is not None
-                                and int(event["seq_frame"]) >= int(replace_after_seq))
-                        ))
-            ]
-            refreshed_events.append(landing)
+        refreshed_events = _apply_long_jump_final_landing(
+            refreshed_events, ankle_rows, rows_by_seq, calibrations,
+            foot_contacts_by_seq, contact_contexts, fps,
+        )
 
     refreshed_events.sort(key=lambda event: int(event["seq_frame"]))
     _recompute_contact_event_metrics(refreshed_events, calibrations, contact_contexts)
@@ -2661,19 +2873,9 @@ def refresh_step_analysis_after_leg_correction(
     for idx, event in enumerate(refreshed_events, start=1):
         event["step_index"] = idx
     avg_cadence_spm = add_global_cadence(refreshed_events, ankle_rows)
+    avg_step_length_m = _mean_step_length_m(refreshed_events)
 
-    step_lengths = [
-        float(e["step_length_m"])
-        for e in refreshed_events
-        if e.get("step_length_m") is not None
-    ]
-    avg_step_length_m = float(np.mean(step_lengths)) if step_lengths else None
-
-    ankle_csv = step_analysis.get("ankle_csv") or str(Path(output_dir) / "ankle_positions.csv")
-    steps_csv = step_analysis.get("steps_csv") or str(Path(output_dir) / "step_events.csv")
-    write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
-    write_csv(steps_csv, refreshed_events, STEP_FIELDS)
-
+    _write_refreshed_step_csvs(step_analysis, output_dir, ankle_rows, refreshed_events)
     step_analysis["ankle_rows"] = ankle_rows
     step_analysis["step_events"] = refreshed_events
     step_analysis["rejected_step_events"] = rejected_events
