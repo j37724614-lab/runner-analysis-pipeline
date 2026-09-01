@@ -1,6 +1,6 @@
 import cv2
 try:
-    cv2.setLogLevel(3)   # 抑制 swscaler HDR 色彩轉換警告（不影響運作）
+    cv2.setLogLevel(3)  # type: ignore[attr-defined]  # 抑制 swscaler HDR 色彩轉換警告
 except AttributeError:
     pass  # 舊版 OpenCV 無此 API，忽略
 from ultralytics import YOLO
@@ -17,7 +17,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-from filterpy.kalman import KalmanFilter
+from filterpy.kalman import KalmanFilter  # type: ignore[import-untyped]
 from scipy.signal import butter, filtfilt
 from PIL import Image, ImageDraw, ImageFont
 
@@ -2003,7 +2003,7 @@ def main(config_dict=None):
                 # 初始化 VideoWriter（第一幀才知道最終尺寸）
                 if out is None:
                     h_out, w_out = frame_out.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore[attr-defined]
                     out = cv2.VideoWriter(output_path, fourcc, fps, (w_out, h_out))
                     print(f"  VideoWriter 初始化：{w_out}x{h_out}")
                 out.write(frame_out)

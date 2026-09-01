@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 
-from core.pipeline import run_analysis
+from core.pipeline import AnalysisOptions, run_analysis
 
 
 class ReusableHTTPServer(HTTPServer):
@@ -205,7 +205,9 @@ def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]
         except OSError:
             continue
     if server is None:
-        raise RuntimeError(f"cannot bind point picker port from {preferred_port} to {preferred_port + 19}")
+        raise RuntimeError(
+            f"cannot bind point picker port from {preferred_port} to {preferred_port + 19}"
+        )
 
     public_host = os.getenv("POINT_PICKER_HOST", "catslab.ee.ncku.edu.tw")
     print("\n" + "=" * 60)
@@ -224,9 +226,9 @@ def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]
     return start_line, end_line
 
 
-def build_camera_config(video_path: str, distance_m: float,
-                        lane_margin_px: int = 10,
-                        pre_roll_px: int = 100) -> dict:
+def build_camera_config(
+    video_path: str, distance_m: float, lane_margin_px: int = 10, pre_roll_px: int = 100
+) -> dict:
     start_line, end_line = pick_line_points(video_path)
     return {
         "video_path": video_path,
@@ -263,10 +265,7 @@ if __name__ == "__main__":
 
     run_analysis(
         config_dict=config_dict,
-        gpu="0",              # CUDA GPU 編號
-        only_2d=False,        # 是否只跑 2D 骨架
-        skip_track=False,     # 是否略過 Step 1 追蹤
-        output_dest=None      # 最終輸出目錄 (設為 None 則預設為第一支影片所在目錄)
+        options=AnalysisOptions(gpu="0"),
     )
 
     elapsed = time.perf_counter() - start_time

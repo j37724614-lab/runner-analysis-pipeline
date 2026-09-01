@@ -51,7 +51,7 @@ for _k, _v in {
 import cv2
 
 try:
-    cv2.setLogLevel(3)   # 抑制 swscaler 色彩轉換警告
+    cv2.setLogLevel(3)  # type: ignore[attr-defined]  # 抑制 swscaler 色彩轉換警告
 except AttributeError:
     pass
 import argparse
@@ -2080,7 +2080,7 @@ def _process_single_camera(cam_idx, cam, cap, model, out, dry_run, frame_map_pat
     overview_out = None
     overview_path = None
     if not dry_run and frame_map_path:
-        _ov_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        _ov_fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore[attr-defined]
         overview_path = frame_map_path.replace(
             '_frame_map.csv', f'_cam{cam_idx+1}_overview.mp4'
         )
@@ -2441,7 +2441,7 @@ def main():
         _f.write("\n".join(cam['video_path'] for cam in CAMERAS))
 
     first_fps = caps[0].get(cv2.CAP_PROP_FPS) or 60.0
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore[attr-defined]
 
     # crop 驗證（開始前確認所有相機的 crop 參數合法）
     for cam_idx, (cam, cap) in enumerate(zip(CAMERAS, caps)):
