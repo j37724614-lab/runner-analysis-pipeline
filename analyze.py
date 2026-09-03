@@ -19,39 +19,8 @@ class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
-def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]:
-    cap = cv2.VideoCapture(video_path)
-    success, frame = cap.read()
-    cap.release()
-    if not success:
-        raise RuntimeError(f"cannot read first frame: {video_path}")
-
-    max_width = 1280
-    scale = min(1.0, max_width / frame.shape[1])
-    display = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
-    ok, encoded = cv2.imencode(".jpg", display)
-    if not ok:
-        raise RuntimeError(f"cannot encode first frame: {video_path}")
-
-    selected: dict[str, list[list[int]] | None] = {"points": None}
-    image_bytes = encoded.tobytes()
-    image_width = frame.shape[1]
-    image_height = frame.shape[0]
-
-    class PointPickerHandler(BaseHTTPRequestHandler):
-        def log_message(self, _format: str, *_args) -> None:
-            return
-
-        def do_GET(self) -> None:
-            if self.path == "/frame.jpg":
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(image_bytes)))
-                self.end_headers()
-                self.wfile.write(image_bytes)
-                return
-
-            html = f"""<!doctype html>
+_POINT_PICKER_PAGE = """\
+<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -175,32 +144,34 @@ def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]
   </script>
 </body>
 </html>"""
-            body = html.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
-        def do_POST(self) -> None:
-            if self.path != "/submit":
-                self.send_error(404)
-                return
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            points = payload.get("points")
-            if not isinstance(points, list) or len(points) != 4:
-                self.send_error(400, "expected 4 points")
-                return
-            selected["points"] = [[int(p[0]), int(p[1])] for p in points]
-            self.send_response(200)
-            self.end_headers()
 
-    preferred_port = int(os.getenv("POINT_PICKER_PORT", "18002"))
+def _first_frame_jpeg(video_path: str) -> tuple[bytes, int, int]:
+    """Read the first video frame; return (jpeg_bytes, native_width, native_height).
+    The JPEG is downscaled to <=1280px wide for the browser, but the reported
+    size is the native resolution so picked points map back correctly."""
+    cap = cv2.VideoCapture(video_path)
+    success, frame = cap.read()
+    cap.release()
+    if not success:
+        raise RuntimeError(f"cannot read first frame: {video_path}")
+
+    max_width = 1280
+    scale = min(1.0, max_width / frame.shape[1])
+    display = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
+    ok, encoded = cv2.imencode(".jpg", display)
+    if not ok:
+        raise RuntimeError(f"cannot encode first frame: {video_path}")
+    return encoded.tobytes(), frame.shape[1], frame.shape[0]
+
+
+def _serve_until(handler_class, preferred_port: int, is_done) -> None:
+    """Bind the first free port at/above preferred_port and handle requests until
+    is_done() is true."""
     server = None
     for port in range(preferred_port, preferred_port + 20):
         try:
-            server = ReusableHTTPServer(("0.0.0.0", port), PointPickerHandler)
+            server = ReusableHTTPServer(("0.0.0.0", port), handler_class)
             break
         except OSError:
             continue
@@ -216,9 +187,56 @@ def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]
     print("Waiting for browser submission...")
     print("=" * 60)
 
-    while selected["points"] is None:
-        server.handle_request()
-    server.server_close()
+    try:
+        while not is_done():
+            server.handle_request()
+    finally:
+        server.server_close()
+
+
+def pick_line_points(video_path: str) -> tuple[list[list[int]], list[list[int]]]:
+    image_bytes, image_width, image_height = _first_frame_jpeg(video_path)
+    page = _POINT_PICKER_PAGE.format(
+        video_path=video_path, image_width=image_width, image_height=image_height
+    ).encode("utf-8")
+    selected: dict[str, list[list[int]] | None] = {"points": None}
+
+    class PointPickerHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args) -> None:
+            return
+
+        def _respond(self, content_type: str, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path == "/frame.jpg":
+                self._respond("image/jpeg", image_bytes)
+            else:
+                self._respond("text/html; charset=utf-8", page)
+
+        def do_POST(self) -> None:
+            if self.path != "/submit":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            points = payload.get("points")
+            if not isinstance(points, list) or len(points) != 4:
+                self.send_error(400, "expected 4 points")
+                return
+            selected["points"] = [[int(p[0]), int(p[1])] for p in points]
+            self.send_response(200)
+            self.end_headers()
+
+    _serve_until(
+        PointPickerHandler,
+        int(os.getenv("POINT_PICKER_PORT", "18002")),
+        lambda: selected["points"] is not None,
+    )
 
     points = selected["points"]
     start_line = [points[0], points[3]]

@@ -20,7 +20,6 @@ import csv
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -28,9 +27,28 @@ import yaml
 from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
 
 
-RIGHT_ANKLE = 3
-LEFT_ANKLE = 6
+# H36M / MotionAGFormer 2D body joint indices
+R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
+L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
 TEXT_COLOR = (0, 0, 0)
+
+# Runway-local quadrilateral tolerance (fraction of lane span) admitting ordinary
+# click / perspective noise while rejecting a point well outside the lane strip.
+RUNWAY_QUAD_ALONG_TRACK_MARGIN = 0.08
+RUNWAY_QUAD_CROSS_TRACK_MARGIN = 0.65
+
+
+def _within_runway_quad(local):
+    """True when a runway-local point (along-track, cross-track) sits inside the
+    calibrated lane quadrilateral plus the noise-tolerance margins."""
+    return (
+        -RUNWAY_QUAD_ALONG_TRACK_MARGIN
+        <= float(local[0])
+        <= 1.0 + RUNWAY_QUAD_ALONG_TRACK_MARGIN
+        and -RUNWAY_QUAD_CROSS_TRACK_MARGIN
+        <= float(local[1])
+        <= 1.0 + RUNWAY_QUAD_CROSS_TRACK_MARGIN
+    )
 
 ANKLE_FIELDS = [
     "seq_frame", "offset_index", "orig_frame", "time_s", "seq_time_s", "cam",
@@ -86,16 +104,21 @@ _POST_DP_LEG_THRESHOLD_CEIL = {
 }
 
 
+_POST_DP_PERCENTILE = 95.0
+_POST_DP_MIN_SAMPLES = 20
+
+
 def _compute_post_dp_leg_geometry(
-        kp, confidence, crossing_frames=None, bbox_heights=None,
-        bbox_ref_height=None, conf_threshold=0.50, percentile=95.0,
-        min_samples=20):
+        kp, confidence, crossing_frames=None, bbox_scale=None, conf_threshold=0.50):
     """Compute leg thresholds/outliers after L/R identity has been resolved.
 
     ``kp`` must be the anchor-DP output before post-DP interpolation, SG
     smoothing, bone-length normalization, or knee-angle limiting.  All six leg
     joints are represented relative to their kinematic parent, so runner/crop
     translation cannot look like a joint spike.
+
+    ``bbox_scale`` is an optional ``(per_frame_heights, reference_height)`` pair
+    used to scale the per-frame threshold with the runner's apparent size.
 
     The primary threshold is the current video's p95 high-confidence
     parent-relative displacement.  A conservative fixed floor is used when the
@@ -115,7 +138,8 @@ def _compute_post_dp_leg_geometry(
         aligned[:min(T, len(crossing_frames))] = crossing_frames[:T]
         crossing_frames = aligned
     scale = np.ones(T, dtype=np.float64)
-    if bbox_heights is not None and bbox_ref_height is not None:
+    if bbox_scale is not None:
+        bbox_heights, bbox_ref_height = bbox_scale
         heights = np.asarray(bbox_heights, dtype=np.float64).reshape(-1)
         try:
             ref_height = float(np.asarray(bbox_ref_height).reshape(-1)[0])
@@ -154,10 +178,12 @@ def _compute_post_dp_leg_geometry(
 
         floor = _POST_DP_LEG_THRESHOLD_FLOOR[joint_idx]
         ceil = _POST_DP_LEG_THRESHOLD_CEIL[joint_idx]
-        if values.size >= min_samples:
+        if values.size >= _POST_DP_MIN_SAMPLES:
             base_threshold = float(np.clip(
-                np.percentile(values, percentile), floor, ceil))
-            threshold_source[joint_idx] = f'post_dp_video_vector_p{int(percentile)}'
+                np.percentile(values, _POST_DP_PERCENTILE), floor, ceil))
+            threshold_source[joint_idx] = (
+                f'post_dp_video_vector_p{int(_POST_DP_PERCENTILE)}'
+            )
         else:
             base_threshold = float(floor)
             threshold_source[joint_idx] = 'post_dp_floor_insufficient_samples'
@@ -213,8 +239,6 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
     if status is None:
         return None
 
-    R_HIP, R_KNEE, R_ANKLE = 1, 2, 3
-    L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
     T = recon.shape[1]
     kp = recon[0, :, :, :2].astype(np.float64, copy=True)
     raw_conf = status["raw_confidence"][0].astype(np.float64)
@@ -256,12 +280,16 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
         bbox_heights = np.asarray(bbox_heights)[0]
     bbox_ref_height = (
         status["bbox_ref_height"] if "bbox_ref_height" in status.files else None)
+    bbox_scale = (
+        (bbox_heights, bbox_ref_height)
+        if bbox_heights is not None and bbox_ref_height is not None
+        else None
+    )
     geometry = _compute_post_dp_leg_geometry(
         kp,
         raw_conf_resolved,
         crossing_frames=crossing_frames,
-        bbox_heights=bbox_heights,
-        bbox_ref_height=bbox_ref_height,
+        bbox_scale=bbox_scale,
         conf_threshold=conf_threshold,
     )
     bilateral = geometry["bilateral"]
@@ -332,29 +360,33 @@ def _post_dp_fill_leg_gaps(recon, swapped, keypoints_npz_path,
     return post_fill
 
 
+KNEE_MIN_ANGLE_DEG = 20.0
+
+
 def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2, bone_blend=0.8):
     """Smooth and constrain leg geometry after DP has resolved L/R identity."""
-    leg_joints = (1, 2, 3, 4, 5, 6)
+    leg_joints = (R_HIP, R_KNEE, R_ANKLE, L_HIP, L_KNEE, L_ANKLE)
     sg_windows = {
-        1: 11,  # RHip
-        2: 7,   # RKnee
-        3: 3,   # RAnkle
-        4: 11,  # LHip
-        5: 7,   # LKnee
-        6: 3,   # LAnkle
+        R_HIP: 11, R_KNEE: 7, R_ANKLE: 3,
+        L_HIP: 11, L_KNEE: 7, L_ANKLE: 3,
     }
-    leg_bones = ((1, 2), (2, 3), (4, 5), (5, 6))
-    knee_limits = ((1, 2, 3, 20.0), (4, 5, 6, 20.0))
+    leg_bones = (
+        (R_HIP, R_KNEE), (R_KNEE, R_ANKLE), (L_HIP, L_KNEE), (L_KNEE, L_ANKLE),
+    )
+    knee_limits = (
+        (R_HIP, R_KNEE, R_ANKLE, KNEE_MIN_ANGLE_DEG),
+        (L_HIP, L_KNEE, L_ANKLE, KNEE_MIN_ANGLE_DEG),
+    )
 
-    M, T, J, _ = recon.shape
+    person_count, frame_count = recon.shape[:2]
     kp = recon[:, :, :, :2].astype(np.float64, copy=True)
 
-    for person_idx in range(M):
+    for person_idx in range(person_count):
         for joint_idx in leg_joints:
-            win = min(int(sg_windows[joint_idx]), T)
+            win = min(int(sg_windows[joint_idx]), frame_count)
             if win % 2 == 0:
                 win -= 1
-            if win >= sg_polyorder + 2 and T >= win:
+            if win >= sg_polyorder + 2 and frame_count >= win:
                 kp[person_idx, :, joint_idx, 0] = savgol_filter(
                     kp[person_idx, :, joint_idx, 0],
                     win,
@@ -385,29 +417,34 @@ def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2, bone_blend=0.8):
                 + bone_blend * normalized[adjust]
             )
 
-        for p_idx, j_idx, d_idx, min_deg in knee_limits:
-            p = kp[person_idx, :, p_idx]
-            j = kp[person_idx, :, j_idx]
-            d = kp[person_idx, :, d_idx]
-            v1 = p - j
-            v2 = d - j
-            len1 = np.linalg.norm(v1, axis=1)
-            len2 = np.linalg.norm(v2, axis=1)
-            valid = (len1 > 1.0) & (len2 > 1.0)
-            cos_a = np.einsum("ti,ti->t", v1, v2) / np.maximum(len1 * len2, 1e-8)
-            angles = np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
+        for hip_idx, knee_idx, ankle_idx, min_deg in knee_limits:
+            hip = kp[person_idx, :, hip_idx]
+            knee = kp[person_idx, :, knee_idx]
+            ankle = kp[person_idx, :, ankle_idx]
+            knee_to_hip = hip - knee
+            knee_to_ankle = ankle - knee
+            hip_len = np.linalg.norm(knee_to_hip, axis=1)
+            ankle_len = np.linalg.norm(knee_to_ankle, axis=1)
+            valid = (hip_len > 1.0) & (ankle_len > 1.0)
+            cos_angle = np.einsum("ti,ti->t", knee_to_hip, knee_to_ankle) / np.maximum(
+                hip_len * ankle_len, 1e-8
+            )
+            angles = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
             needs_fix = valid & (angles < min_deg)
             for t in np.where(needs_fix)[0]:
                 delta = np.radians(float(min_deg) - float(angles[t]))
-                cross = v1[t, 0] * v2[t, 1] - v1[t, 1] * v2[t, 0]
+                cross = (
+                    knee_to_hip[t, 0] * knee_to_ankle[t, 1]
+                    - knee_to_hip[t, 1] * knee_to_ankle[t, 0]
+                )
                 if cross < 0:
                     delta = -delta
-                cos_d, sin_d = np.cos(delta), np.sin(delta)
-                v2r = np.array([
-                    v2[t, 0] * cos_d - v2[t, 1] * sin_d,
-                    v2[t, 0] * sin_d + v2[t, 1] * cos_d,
+                cos_delta, sin_delta = np.cos(delta), np.sin(delta)
+                rotated_knee_to_ankle = np.array([
+                    knee_to_ankle[t, 0] * cos_delta - knee_to_ankle[t, 1] * sin_delta,
+                    knee_to_ankle[t, 0] * sin_delta + knee_to_ankle[t, 1] * cos_delta,
                 ])
-                kp[person_idx, t, d_idx] = j[t] + v2r
+                kp[person_idx, t, ankle_idx] = knee[t] + rotated_knee_to_ankle
 
     recon[:, :, :, :2] = kp
     return recon
@@ -532,12 +569,12 @@ def _homography_calibration(src_points, dst_points_world):
     }
 
 
-def _make_calibration(cam_cfg, cfg, args, start_line, end_line, distance_m):
+def _make_calibration(cam_cfg, cfg, meters_per_pixel, start_line, end_line, distance_m):
     calibration = _track_calibration(
         start_line=start_line,
         end_line=end_line,
         distance_m=distance_m,
-        meters_per_pixel=args.meters_per_pixel,
+        meters_per_pixel=meters_per_pixel,
     )
     if calibration.get("meters_per_pixel") is not None:
         return calibration
@@ -616,8 +653,8 @@ def load_ankle_positions(keypoints_npz, offsets_npz, fps):
 
         frame_kps = keypoints[i]
         off_x, off_y = offsets[offset_idx]
-        right = frame_kps[RIGHT_ANKLE]
-        left = frame_kps[LEFT_ANKLE]
+        right = frame_kps[R_ANKLE]
+        left = frame_kps[L_ANKLE]
 
         right_x, right_y = float(right[0] + off_x), float(right[1] + off_y)
         left_x, left_y = float(left[0] + off_x), float(left[1] + off_y)
@@ -871,7 +908,7 @@ def _validate_foot_contact(candidate, joint, ankle_x, ankle_y, context):
         # a little above/below that strip.  Keep a calibration-tolerant margin;
         # the independently learned ground band remains the stricter guard for
         # a grossly elevated point such as the reported S13 heel.
-        runway_valid = -0.65 <= float(local[1]) <= 1.65 and -0.08 <= float(local[0]) <= 1.08
+        runway_valid = _within_runway_quad(local)
         if not runway_valid:
             reasons.append("outside_runway_quadrilateral")
         center, tolerance = (context or {}).get("ground_center"), (context or {}).get("ground_tolerance")
@@ -908,7 +945,7 @@ def _validate_ankle_contact(ankle_x, ankle_y, context):
     runway_valid = True
     ground_valid = True
     if local is not None:
-        runway_valid = -0.65 <= float(local[1]) <= 1.65 and -0.08 <= float(local[0]) <= 1.08
+        runway_valid = _within_runway_quad(local)
         if not runway_valid:
             reasons.append("ankle_outside_runway_quadrilateral")
         center, tolerance = (context or {}).get("ground_center"), (context or {}).get("ground_tolerance")
@@ -1550,12 +1587,11 @@ def _estimate_seq_fps(events):
 
 def _median_smoothed_ankle_velocity(kp):
     """Per-frame ankle speed for each foot, median-smoothed over a 3-frame window."""
-    right_ankle, left_ankle = 3, 6
     frames = kp.shape[0]
     ankle_vel = {"right": np.zeros(frames), "left": np.zeros(frames)}
     for t in range(1, frames):
-        ankle_vel["right"][t] = np.linalg.norm(kp[t, right_ankle] - kp[t - 1, right_ankle])
-        ankle_vel["left"][t] = np.linalg.norm(kp[t, left_ankle] - kp[t - 1, left_ankle])
+        ankle_vel["right"][t] = np.linalg.norm(kp[t, R_ANKLE] - kp[t - 1, R_ANKLE])
+        ankle_vel["left"][t] = np.linalg.norm(kp[t, L_ANKLE] - kp[t - 1, L_ANKLE])
     for foot in ("right", "left"):
         padded = np.pad(ankle_vel[foot], (1, 1), mode="edge")
         ankle_vel[foot] = np.asarray(
@@ -1589,8 +1625,8 @@ class _LegIdentitySolver:
     sequential FPS so the cost functions do not thread them individually.
     """
 
-    LEG_L = [4, 5, 6]  # L_HIP, L_KNEE, L_ANKLE
-    LEG_R = [1, 2, 3]  # R_HIP, R_KNEE, R_ANKLE
+    LEG_L = [L_HIP, L_KNEE, L_ANKLE]
+    LEG_R = [R_HIP, R_KNEE, R_ANKLE]
 
     def __init__(self, kp, ankle_vel, seq_fps, weights=_LegSolverWeights()):
         self.kp = kp
@@ -1815,20 +1851,64 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
     return swapped
 
 
-def apply_leg_swap_to_foot_keypoints(foot_npz_path, swapped_mask):
-    """Apply the final raw-to-output L/R permutation to WholeBody foot points.
+_FOOT_LEFT = [0, 1, 2]   # L_big_toe, L_small_toe, L_heel
+_FOOT_RIGHT = [3, 4, 5]  # R_big_toe, R_small_toe, R_heel
 
-    The caller must pass the cumulative XOR mask covering both the preprocessing
-    ``_correct_leg_swaps`` pass and ``apply_anchor_leg_correction``.  Passing only
-    the latter desynchronizes feet whenever both body stages swapped the same
-    frame.
 
-    foot_npz_path: path to foot_keypoints.npz (keypoints order: L_big_toe,
-        L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel).
-    swapped_mask: per-frame final XOR bool array, or None when no correction ran.
+def _swap_foot_leg_identity(keypoints, scores, swapped_mask):
+    """L/R identity swap of WholeBody foot points on the masked frames, in place."""
+    for t in range(min(keypoints.shape[1], len(swapped_mask))):
+        if swapped_mask[t]:
+            keypoints[:, t, _FOOT_LEFT + _FOOT_RIGHT] = keypoints[:, t, _FOOT_RIGHT + _FOOT_LEFT]
+            scores[:, t, _FOOT_LEFT + _FOOT_RIGHT] = scores[:, t, _FOOT_RIGHT + _FOOT_LEFT]
 
-    No-ops (does not raise) if foot_npz_path doesn't exist or swapped_mask is None,
-    since foot data is optional and the correction may not have run.
+
+def _reanchor_foot_to_body(keypoints, swapped_mask, raw_keypoints_npz_path, keypoints_npz_path):
+    """Re-express each foot point as an offset from the raw ankle it was detected
+    next to, then re-apply that offset to the final smoothed ankle. In place.
+
+    Foot points are never smoothed, so after post-DP leg smoothing / bone-length
+    fixing moves the body ankle a raw foot point can sit tens of pixels away --
+    most visible right after a DP swap. Skipped when either keypoints file is
+    missing.
+    """
+    if not os.path.exists(raw_keypoints_npz_path) or not os.path.exists(keypoints_npz_path):
+        return
+
+    raw_body = np.load(raw_keypoints_npz_path, allow_pickle=True)["reconstruction"][0]
+    final_body = np.load(keypoints_npz_path, allow_pickle=True)["reconstruction"][0]
+    frame_count = min(
+        keypoints.shape[1], raw_body.shape[0], final_body.shape[0], len(swapped_mask)
+    )
+    for t in range(frame_count):
+        if swapped_mask[t]:
+            raw_left_ankle, raw_right_ankle = raw_body[t, R_ANKLE, :2], raw_body[t, L_ANKLE, :2]
+        else:
+            raw_left_ankle, raw_right_ankle = raw_body[t, L_ANKLE, :2], raw_body[t, R_ANKLE, :2]
+        final_left_ankle = final_body[t, L_ANKLE, :2]
+        final_right_ankle = final_body[t, R_ANKLE, :2]
+        for foot_idx in _FOOT_LEFT:
+            keypoints[:, t, foot_idx] = final_left_ankle + (keypoints[:, t, foot_idx] - raw_left_ankle)
+        for foot_idx in _FOOT_RIGHT:
+            keypoints[:, t, foot_idx] = final_right_ankle + (keypoints[:, t, foot_idx] - raw_right_ankle)
+
+
+def apply_foot_leg_correction(
+    foot_npz_path, raw_keypoints_npz_path, keypoints_npz_path, swapped_mask,
+):
+    """Correct WholeBody foot points to match the corrected body legs, in one
+    read-modify-write of foot_keypoints.npz.
+
+    Two stages: (1) apply the final raw-to-output L/R permutation to the foot
+    points on the swapped frames, then (2) re-anchor them to the post-smoothing
+    body ankles. ``swapped_mask`` must be the cumulative XOR mask covering both
+    the preprocessing ``_correct_leg_swaps`` pass and ``apply_anchor_leg_correction``.
+
+    keypoints order: L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel.
+
+    No-ops (does not raise) if swapped_mask is None or foot_npz_path is missing;
+    the re-anchor stage is additionally skipped when either keypoints file is
+    missing.
     """
     if swapped_mask is None or not os.path.exists(foot_npz_path):
         return
@@ -1836,23 +1916,18 @@ def apply_leg_swap_to_foot_keypoints(foot_npz_path, swapped_mask):
     data = np.load(foot_npz_path, allow_pickle=True)
     keypoints = data["keypoints"].copy()  # (M, T, 6, 2)
     scores = data["scores"].copy()        # (M, T, 6)
-    valid_frames = data["valid_frames"]
-    keypoint_names = data["keypoint_names"]
 
-    LEFT = [0, 1, 2]
-    RIGHT = [3, 4, 5]
-    T = keypoints.shape[1]
-    for t in range(min(T, len(swapped_mask))):
-        if swapped_mask[t]:
-            keypoints[:, t, LEFT + RIGHT] = keypoints[:, t, RIGHT + LEFT]
-            scores[:, t, LEFT + RIGHT] = scores[:, t, RIGHT + LEFT]
+    _swap_foot_leg_identity(keypoints, scores, swapped_mask)
+    _reanchor_foot_to_body(
+        keypoints, swapped_mask, raw_keypoints_npz_path, keypoints_npz_path
+    )
 
     np.savez_compressed(
         foot_npz_path,
         keypoints=keypoints,
         scores=scores,
-        valid_frames=valid_frames,
-        keypoint_names=keypoint_names,
+        valid_frames=data["valid_frames"],
+        keypoint_names=data["keypoint_names"],
     )
 
 
@@ -1871,14 +1946,8 @@ def combine_leg_swap_masks(pre_dp_swapped_mask, anchor_dp_swapped_mask):
     if anchor_dp_swapped_mask is None:
         return np.asarray(pre_dp_swapped_mask, dtype=bool).copy()
 
-    pre = (
-        np.asarray(pre_dp_swapped_mask, dtype=bool).reshape(-1)
-        if pre_dp_swapped_mask is not None else np.zeros(len(final_mask), dtype=bool)
-    )
-    anchor = (
-        np.asarray(anchor_dp_swapped_mask, dtype=bool).reshape(-1)
-        if anchor_dp_swapped_mask is not None else np.zeros(len(final_mask), dtype=bool)
-    )
+    pre = np.asarray(pre_dp_swapped_mask, dtype=bool).reshape(-1)
+    anchor = np.asarray(anchor_dp_swapped_mask, dtype=bool).reshape(-1)
     total = max(len(pre), len(anchor))
     pre_aligned = np.zeros(total, dtype=bool)
     anchor_aligned = np.zeros(total, dtype=bool)
@@ -1913,73 +1982,6 @@ def update_leg_swap_metadata(keypoints_npz_path, pre_dp_swapped_mask,
     })
     np.savez_compressed(mask_path, **values)
     return final_mask
-
-
-def align_foot_keypoints_to_body(foot_npz_path, raw_keypoints_npz_path, keypoints_npz_path, swapped_mask):
-    """Re-anchor foot points to the same post-smoothing/post-DP ankle positions
-    that the body skeleton in keypoints.npz uses, so the two draw consistently.
-
-    Foot points are never smoothed (see apply_leg_swap_to_foot_keypoints's
-    docstring), so a raw foot point can end up tens of pixels from the ankle
-    after apply_anchor_leg_correction()'s post-DP leg smoothing/bone-length
-    fix moves the ankle -- most visible right after a DP swap, where leg
-    smoothing corrects a sudden discontinuity. This does not mean the L/R
-    identity is wrong (compare each foot point against the *raw* ankle it was
-    actually detected next to, not the smoothed one); it just means the two
-    arrays are sitting in different processing stages.
-
-    Fix: express each foot point as an offset from the *raw* ankle it was
-    detected next to (using the same cumulative XOR decision as
-    apply_leg_swap_to_foot_keypoints so the correct raw ankle is picked even
-    on swapped frames), then re-apply that offset to the *final* smoothed
-    ankle position. This keeps the detected toe/heel geometry relative to the
-    ankle while letting the point follow wherever smoothing/DP moved the leg.
-
-    Must run after apply_leg_swap_to_foot_keypoints() (foot L/R identity
-    already corrected) and after apply_anchor_leg_correction() has returned
-    (keypoints_npz_path already holds the final smoothed body).
-
-    No-ops if swapped_mask is None or any required file is missing.
-    """
-    if swapped_mask is None or not os.path.exists(foot_npz_path):
-        return
-    if not os.path.exists(raw_keypoints_npz_path) or not os.path.exists(keypoints_npz_path):
-        return
-
-    foot_data = np.load(foot_npz_path, allow_pickle=True)
-    keypoints = foot_data["keypoints"].copy()  # (M, T, 6, 2), L/R identity already corrected
-    scores = foot_data["scores"]
-    valid_frames = foot_data["valid_frames"]
-    keypoint_names = foot_data["keypoint_names"]
-
-    raw_body = np.load(raw_keypoints_npz_path, allow_pickle=True)["reconstruction"][0]    # (T, 17, 3)
-    final_body = np.load(keypoints_npz_path, allow_pickle=True)["reconstruction"][0]      # (T, 17, 3)
-
-    L_ANKLE, R_ANKLE = 6, 3
-    LEFT = [0, 1, 2]
-    RIGHT = [3, 4, 5]
-
-    T = min(keypoints.shape[1], raw_body.shape[0], final_body.shape[0], len(swapped_mask))
-    for t in range(T):
-        if swapped_mask[t]:
-            raw_l_ankle, raw_r_ankle = raw_body[t, R_ANKLE, :2], raw_body[t, L_ANKLE, :2]
-        else:
-            raw_l_ankle, raw_r_ankle = raw_body[t, L_ANKLE, :2], raw_body[t, R_ANKLE, :2]
-        final_l_ankle = final_body[t, L_ANKLE, :2]
-        final_r_ankle = final_body[t, R_ANKLE, :2]
-
-        for fi in LEFT:
-            keypoints[:, t, fi] = final_l_ankle + (keypoints[:, t, fi] - raw_l_ankle)
-        for fi in RIGHT:
-            keypoints[:, t, fi] = final_r_ankle + (keypoints[:, t, fi] - raw_r_ankle)
-
-    np.savez_compressed(
-        foot_npz_path,
-        keypoints=keypoints,
-        scores=scores,
-        valid_frames=valid_frames,
-        keypoint_names=keypoint_names,
-    )
 
 
 def _long_jump_impact_position(rows, peak_index, foot):
@@ -2135,6 +2137,46 @@ def _long_jump_lowest_impact_index(rows, ground_return_index, fps):
     return best_index
 
 
+def _final_landing_event(rows, impact_index, flight_start_frame, landing_score, selection_reason):
+    """Build the shared 'final_landing' step-event record for a long-jump landing.
+
+    The horizontal contact position is interpolated from the nearest reliable
+    same-side ankle samples; heel/toe are never used for a sand impact.
+    """
+    peak = rows[impact_index]
+    foot = str(peak["lower_foot"])
+    contact_x, contact_y, position_source = _long_jump_impact_position(
+        rows, impact_index, foot
+    )
+    return {
+        "seq_frame": int(peak["seq_frame"]),
+        "orig_frame": int(peak["orig_frame"]),
+        "time_s": float(peak["time_s"]),
+        "seq_time_s": float(peak["seq_time_s"]),
+        "cam": int(peak["cam"]),
+        "foot": foot,
+        "event_type": "final_landing",
+        "flight_start_frame": flight_start_frame,
+        "landing_position_source": position_source,
+        "landing_score": landing_score,
+        "ankle_x": float(peak["lower_ankle_x"]),
+        "ankle_y": float(peak["lower_ankle_y"]),
+        "ankle_conf": float(peak["lower_ankle_conf"]),
+        "contact_joint": f"{foot}_ankle_estimated",
+        "contact_x": contact_x,
+        "contact_y": contact_y,
+        "contact_conf": float(peak["lower_ankle_conf"]),
+        "contact_selection_reason": selection_reason,
+        "heel_valid": False,
+        "big_toe_valid": False,
+        "runway_valid": True,
+        "attachment_valid": True,
+        "ground_band_valid": True,
+        "contact_rejection_reason": "",
+        "contact_valid": True,
+    }
+
+
 def _detect_long_jump_final_landing(ankle_rows, accepted_events, fps):
     """Find a low-confidence sand impact between two otherwise valid contacts.
 
@@ -2161,35 +2203,14 @@ def _detect_long_jump_final_landing(ankle_rows, accepted_events, fps):
     if flight is not None:
         impact_index = _long_jump_lowest_impact_index(
             rows, flight["return_index"], fps)
-        peak = rows[impact_index]
-        foot = str(peak["lower_foot"])
-        contact_x, contact_y, position_source = _long_jump_impact_position(rows, impact_index, foot)
         return {
-            "seq_frame": int(peak["seq_frame"]),
-            "orig_frame": int(peak["orig_frame"]),
-            "time_s": float(peak["time_s"]),
-            "seq_time_s": float(peak["seq_time_s"]),
-            "cam": int(peak["cam"]),
-            "foot": foot,
-            "event_type": "final_landing",
-            "flight_start_frame": int(rows[flight["flight_start_index"]]["seq_frame"]),
-            "landing_position_source": position_source,
-            "landing_score": float(flight["score"]),
-            "ankle_x": float(peak["lower_ankle_x"]),
-            "ankle_y": float(peak["lower_ankle_y"]),
-            "ankle_conf": float(peak["lower_ankle_conf"]),
-            "contact_joint": f"{foot}_ankle_estimated",
-            "contact_x": contact_x,
-            "contact_y": contact_y,
-            "contact_conf": float(peak["lower_ankle_conf"]),
-            "contact_selection_reason": "long_jump_confirmed_airborne_return",
-            "heel_valid": False,
-            "big_toe_valid": False,
-            "runway_valid": True,
-            "attachment_valid": True,
-            "ground_band_valid": True,
-            "contact_rejection_reason": "",
-            "contact_valid": True,
+            **_final_landing_event(
+                rows,
+                impact_index,
+                flight_start_frame=int(rows[flight["flight_start_index"]]["seq_frame"]),
+                landing_score=float(flight["score"]),
+                selection_reason="long_jump_confirmed_airborne_return",
+            ),
             # Keep all ordinary candidates only up to the last confirmed
             # pre-takeoff contact.  Mid-air peaks are explicitly discarded.
             "_keep_through_seq": int(flight["previous"]["seq_frame"]),
@@ -2268,35 +2289,14 @@ def _detect_long_jump_final_landing(ankle_rows, accepted_events, fps):
 
     if best is None:
         return None
-    peak = rows[best["peak_index"]]
-    foot = str(peak["lower_foot"])
-    contact_x, contact_y, position_source = _long_jump_impact_position(rows, best["peak_index"], foot)
     return {
-        "seq_frame": int(peak["seq_frame"]),
-        "orig_frame": int(peak["orig_frame"]),
-        "time_s": float(peak["time_s"]),
-        "seq_time_s": float(peak["seq_time_s"]),
-        "cam": int(peak["cam"]),
-        "foot": foot,
-        "event_type": "final_landing",
-        "flight_start_frame": int(rows[best["takeoff_index"]]["seq_frame"]),
-        "landing_position_source": position_source,
-        "landing_score": float(best["score"]),
-        "ankle_x": float(peak["lower_ankle_x"]),
-        "ankle_y": float(peak["lower_ankle_y"]),
-        "ankle_conf": float(peak["lower_ankle_conf"]),
-        "contact_joint": f"{foot}_ankle_estimated",
-        "contact_x": contact_x,
-        "contact_y": contact_y,
-        "contact_conf": float(peak["lower_ankle_conf"]),
-        "contact_selection_reason": "long_jump_low_confidence_impact_peak",
-        "heel_valid": False,
-        "big_toe_valid": False,
-        "runway_valid": True,
-        "attachment_valid": True,
-        "ground_band_valid": True,
-        "contact_rejection_reason": "",
-        "contact_valid": True,
+        **_final_landing_event(
+            rows,
+            best["peak_index"],
+            flight_start_frame=int(rows[best["takeoff_index"]]["seq_frame"]),
+            landing_score=float(best["score"]),
+            selection_reason="long_jump_low_confidence_impact_peak",
+        ),
         "_replace_after_seq": int(best["following"]["seq_frame"]),
     }
 
@@ -2552,14 +2552,18 @@ def _recompute_contact_event_metrics(events, calibrations, contexts=None):
     _strip_internal_homography_keys(events)
 
 
-def _first_camera_video_fps(cameras):
-    """FPS of the first camera's video, or 60.0 when it cannot be read."""
-    video_path = cameras[0].get("video_path")
+def _video_fps(video_path):
+    """FPS of a video file, or 60.0 when it is missing or unreadable."""
     cap = cv2.VideoCapture(video_path) if video_path else None
     fps = cap.get(cv2.CAP_PROP_FPS) if cap and cap.isOpened() else 60.0
     if cap:
         cap.release()
     return fps or 60.0
+
+
+def _first_camera_video_fps(cameras):
+    """FPS of the first camera's video, or 60.0 when it cannot be read."""
+    return _video_fps(cameras[0].get("video_path"))
 
 
 def _normalize_line(line):
@@ -2575,7 +2579,6 @@ def _build_sequential_calibrations(cameras, config, meters_per_pixel):
     their physical spans into one global track coordinate lets a step that
     crosses a camera cut (e.g. S6 -> S7) have a real distance.
     """
-    args = SimpleNamespace(meters_per_pixel=meters_per_pixel)
     calibrations = {}
     cumulative_offset_m = 0.0
     for cam_idx, cam in enumerate(cameras):
@@ -2583,7 +2586,7 @@ def _build_sequential_calibrations(cameras, config, meters_per_pixel):
         calibration = _make_calibration(
             cam,
             config,
-            args,
+            meters_per_pixel,
             _normalize_line(cam.get("start_line")),
             _normalize_line(cam.get("end_line")),
             distance_m,
@@ -2609,9 +2612,19 @@ def _ankle_for_foot(row, foot):
     return row["lower_ankle_x"], row["lower_ankle_y"], row["lower_ankle_conf"]
 
 
-def _rederive_events_from_corrected_keypoints(
-    step_events, rows_by_seq, calibrations, foot_contacts_by_seq, contact_contexts,
-):
+@dataclass(frozen=True)
+class _RefreshContext:
+    """Shared inputs for re-deriving step events after leg correction."""
+
+    ankle_rows: list
+    rows_by_seq: dict
+    calibrations: dict
+    foot_contacts_by_seq: dict
+    contact_contexts: dict
+    fps: float
+
+
+def _rederive_events_from_corrected_keypoints(step_events, ctx):
     """Re-derive every accepted event's coordinates from the corrected ankle
     rows, keeping its original timing and foot label. Returns
     (refreshed_events, rejected_events)."""
@@ -2620,7 +2633,7 @@ def _rederive_events_from_corrected_keypoints(
     prev_proj_by_cam = {}
     for event in sorted(step_events, key=lambda item: int(item["seq_frame"])):
         seq_frame = int(event["seq_frame"])
-        row = rows_by_seq.get(seq_frame)
+        row = ctx.rows_by_seq.get(seq_frame)
         if row is None:
             refreshed_events.append(event)
             continue
@@ -2629,10 +2642,10 @@ def _rederive_events_from_corrected_keypoints(
         ankle_x, ankle_y, ankle_conf = _ankle_for_foot(row, foot)
 
         cam_idx = int(row["cam"])
-        calibration = calibrations.get(cam_idx) or calibrations.get(0)
+        calibration = ctx.calibrations.get(cam_idx) or ctx.calibrations.get(0)
         contact = select_contact_point(
             foot, ankle_x, ankle_y, ankle_conf,
-            foot_contacts_by_seq.get(seq_frame), contact_contexts.get(cam_idx),
+            ctx.foot_contacts_by_seq.get(seq_frame), ctx.contact_contexts.get(cam_idx),
         )
         if not contact["contact_valid"]:
             rejected = dict(event)
@@ -2683,8 +2696,7 @@ def _rederive_events_from_corrected_keypoints(
 
 
 def _recover_terminal_preflight_contacts(
-    refreshed_events, ankle_rows, rows_by_seq, calibrations,
-    foot_contacts_by_seq, contact_contexts, fps, terminal_cam, keep_through_seq,
+    refreshed_events, ctx, terminal_cam, keep_through_seq,
 ):
     """After a flight is confirmed, run one narrow step-detection pass on the
     terminal camera only up to its last pre-takeoff anchor, appending any valid
@@ -2695,19 +2707,19 @@ def _recover_terminal_preflight_contacts(
     early list even though it is clear in the DP-corrected trajectory. This
     never creates steps during flight or after sand impact.
     """
-    terminal_calibration = calibrations.get(terminal_cam)
+    terminal_calibration = ctx.calibrations.get(terminal_cam)
     if terminal_calibration is None or keep_through_seq is None:
         return
 
-    terminal_rows = [row for row in ankle_rows if int(row["cam"]) == terminal_cam]
+    terminal_rows = [row for row in ctx.ankle_rows if int(row["cam"]) == terminal_cam]
     existing_terminal_seq = {
         int(event["seq_frame"]) for event in refreshed_events
         if int(event["cam"]) == terminal_cam
     }
-    recovered_candidates = detect_steps(terminal_rows, terminal_calibration, fps=fps)
+    recovered_candidates = detect_steps(terminal_rows, terminal_calibration, fps=ctx.fps)
     for candidate in recovered_candidates:
         seq_frame = int(candidate["seq_frame"])
-        row = rows_by_seq.get(seq_frame)
+        row = ctx.rows_by_seq.get(seq_frame)
         if row is None:
             continue
         if seq_frame > int(keep_through_seq) or seq_frame in existing_terminal_seq:
@@ -2718,7 +2730,8 @@ def _recover_terminal_preflight_contacts(
         ankle_conf = float(candidate["ankle_conf"])
         contact = select_contact_point(
             foot, ankle_x, ankle_y, ankle_conf,
-            foot_contacts_by_seq.get(seq_frame), contact_contexts.get(terminal_cam),
+            ctx.foot_contacts_by_seq.get(seq_frame),
+            ctx.contact_contexts.get(terminal_cam),
         )
         if not contact["contact_valid"]:
             continue
@@ -2773,22 +2786,17 @@ def _drop_terminal_events_after_flight(
     ]
 
 
-def _apply_long_jump_final_landing(
-    refreshed_events, ankle_rows, rows_by_seq, calibrations,
-    foot_contacts_by_seq, contact_contexts, fps,
-):
+def _apply_long_jump_final_landing(refreshed_events, ctx):
     """Detect one terminal-camera long-jump landing and, if found, recover any
     missed pre-takeoff contact, drop mid-air/recovery peaks, and append the
     landing event. Returns the (possibly rebuilt) event list."""
-    landing = _detect_long_jump_final_landing(ankle_rows, refreshed_events, fps)
+    landing = _detect_long_jump_final_landing(ctx.ankle_rows, refreshed_events, ctx.fps)
     if landing is None:
         return refreshed_events
 
     terminal_cam = int(landing["cam"])
     _recover_terminal_preflight_contacts(
-        refreshed_events, ankle_rows, rows_by_seq, calibrations,
-        foot_contacts_by_seq, contact_contexts, fps, terminal_cam,
-        landing.get("_keep_through_seq"),
+        refreshed_events, ctx, terminal_cam, landing.get("_keep_through_seq"),
     )
     keep_through_seq = landing.pop("_keep_through_seq", None)
     replace_after_seq = landing.pop("_replace_after_seq", None)
@@ -2850,17 +2858,21 @@ def refresh_step_analysis_after_leg_correction(
         cameras, step_analysis.get("step_events", []), rows_by_seq,
         foot_contacts_by_seq)
     calibrations = _build_sequential_calibrations(cameras, config, meters_per_pixel)
+    ctx = _RefreshContext(
+        ankle_rows=ankle_rows,
+        rows_by_seq=rows_by_seq,
+        calibrations=calibrations,
+        foot_contacts_by_seq=foot_contacts_by_seq,
+        contact_contexts=contact_contexts,
+        fps=fps,
+    )
 
     refreshed_events, rejected_events = _rederive_events_from_corrected_keypoints(
-        step_analysis.get("step_events", []), rows_by_seq, calibrations,
-        foot_contacts_by_seq, contact_contexts,
+        step_analysis.get("step_events", []), ctx,
     )
 
     if bool(config.get("long_jump_final_landing", False)):
-        refreshed_events = _apply_long_jump_final_landing(
-            refreshed_events, ankle_rows, rows_by_seq, calibrations,
-            foot_contacts_by_seq, contact_contexts, fps,
-        )
+        refreshed_events = _apply_long_jump_final_landing(refreshed_events, ctx)
 
     refreshed_events.sort(key=lambda event: int(event["seq_frame"]))
     _recompute_contact_event_metrics(refreshed_events, calibrations, contact_contexts)
@@ -2893,6 +2905,9 @@ def write_csv(path, rows, fieldnames):
 
 
 def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
+    # NOTE: duplicated in core/draw_utils.draw_dashed_line -- kept local here
+    # because core/__init__ eagerly imports core.pipeline, which imports this
+    # module, so `from core...` here is a circular import.
     dx = pt2[0] - pt1[0]
     dy = pt2[1] - pt1[1]
     length = (dx * dx + dy * dy) ** 0.5
@@ -2919,24 +2934,25 @@ def _draw_track_lines(frame, start_line=None, end_line=None):
         return
 
     if start_line and end_line:
-        p0 = (int(start_line[0][0]), int(start_line[0][1]))
-        p3 = (int(start_line[1][0]), int(start_line[1][1]))
-        p1 = (int(end_line[0][0]), int(end_line[0][1]))
-        p2 = (int(end_line[1][0]), int(end_line[1][1]))
-        for a, b in [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]:
-            _draw_dashed_line(frame, a, b, (255, 255, 255), thickness=2)
-        cv2.line(frame, p0, p3, (0, 0, 0), 5)
-        cv2.line(frame, p0, p3, (180, 255, 255), 3)
-        cv2.line(frame, p1, p2, (0, 0, 0), 5)
-        cv2.line(frame, p1, p2, (255, 200, 100), 3)
+        start_a = (int(start_line[0][0]), int(start_line[0][1]))
+        start_b = (int(start_line[1][0]), int(start_line[1][1]))
+        end_a = (int(end_line[0][0]), int(end_line[0][1]))
+        end_b = (int(end_line[1][0]), int(end_line[1][1]))
+        quad_edges = [(start_a, end_a), (end_a, end_b), (end_b, start_b), (start_b, start_a)]
+        for edge_start, edge_end in quad_edges:
+            _draw_dashed_line(frame, edge_start, edge_end, (255, 255, 255), thickness=2)
+        cv2.line(frame, start_a, start_b, (0, 0, 0), 5)
+        cv2.line(frame, start_a, start_b, (180, 255, 255), 3)
+        cv2.line(frame, end_a, end_b, (0, 0, 0), 5)
+        cv2.line(frame, end_a, end_b, (255, 200, 100), 3)
     elif start_line:
-        p0 = (int(start_line[0][0]), int(start_line[0][1]))
-        p1 = (int(start_line[1][0]), int(start_line[1][1]))
-        cv2.line(frame, p0, p1, (180, 255, 255), 3)
+        line_a = (int(start_line[0][0]), int(start_line[0][1]))
+        line_b = (int(start_line[1][0]), int(start_line[1][1]))
+        cv2.line(frame, line_a, line_b, (180, 255, 255), 3)
     elif end_line:
-        p0 = (int(end_line[0][0]), int(end_line[0][1]))
-        p1 = (int(end_line[1][0]), int(end_line[1][1]))
-        cv2.line(frame, p0, p1, (255, 200, 100), 3)
+        line_a = (int(end_line[0][0]), int(end_line[0][1]))
+        line_b = (int(end_line[1][0]), int(end_line[1][1]))
+        cv2.line(frame, line_a, line_b, (255, 200, 100), 3)
 
 
 def _event_contact_display(event):
@@ -2960,7 +2976,6 @@ def render_overlay(
     output_video,
     start_line=None,
     end_line=None,
-    avg_cadence_spm=None,
 ):
     if not ankle_rows:
         return
@@ -3035,7 +3050,6 @@ def annotate_step_stride_video(
     output_video,
     ankle_rows,
     step_events,
-    avg_cadence_spm=None,
 ):
     """Draw step length and cadence onto an existing sequential pipeline video."""
     if not ankle_rows:
@@ -3111,13 +3125,15 @@ def run_step_stride_analysis(
     output_dir=None,
     keypoints_npz=None,
     offsets_npz=None,
-    make_video=True,
-    output_video=None,
     meters_per_pixel=None,
     min_step_frames=None,
     prominence=None,
 ):
-    """Run ankle, step length, and cadence analysis from a pipeline config dict."""
+    """Run ankle, step length, and cadence analysis from a pipeline config dict.
+
+    Writes ankle_positions.csv / step_events.csv and returns the analysis dict.
+    Rendering the overlay video is the caller's job (see ``render_overlay``).
+    """
     cameras = config.get("cameras") or []
     if not cameras:
         raise ValueError("config has no cameras")
@@ -3140,85 +3156,43 @@ def run_step_stride_analysis(
     if not Path(offsets_npz).exists():
         raise FileNotFoundError(f"offsets npz not found: {offsets_npz}")
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
-    cap.release()
-
-    args = SimpleNamespace(meters_per_pixel=meters_per_pixel)
+    fps = _video_fps(video_path)
     ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
-    step_events = []
+    calibrations = _build_sequential_calibrations(cameras, config, meters_per_pixel)
 
+    step_events = []
     for cam_idx in sorted({int(row["cam"]) for row in ankle_rows}):
         if cam_idx >= len(cameras):
             continue
-
-        current_cam = cameras[cam_idx]
-        start_line = current_cam.get("start_line")
-        end_line = current_cam.get("end_line")
-        if start_line:
-            start_line = [(float(x), float(y)) for x, y in start_line]
-        if end_line:
-            end_line = [(float(x), float(y)) for x, y in end_line]
-
-        calibration = _make_calibration(
-            current_cam,
-            config,
-            args,
-            start_line,
-            end_line,
-            current_cam.get("distance_m") or config.get("distance_m"),
-        )
         cam_rows = [row for row in ankle_rows if int(row["cam"]) == cam_idx]
         next_cam_rows = sorted(
             (row for row in ankle_rows if int(row["cam"]) == cam_idx + 1),
             key=lambda row: int(row["seq_frame"]),
         )
-        cam_events = detect_steps(
+        step_events.extend(detect_steps(
             cam_rows,
-            calibration,
+            calibrations[cam_idx],
             fps=fps,
             min_step_frames=min_step_frames,
             prominence=prominence,
             lookahead_rows=next_cam_rows[:STEP_DETECTION_LOOKAHEAD_FRAMES],
-        )
-        step_events.extend(cam_events)
+        ))
 
     step_events.sort(key=lambda event: int(event["seq_frame"]))
     avg_cadence_spm = add_global_cadence(step_events, ankle_rows)
 
     ankle_csv = str(Path(output_dir) / f"{stem}_ankle_positions.csv")
     steps_csv = str(Path(output_dir) / f"{stem}_step_events.csv")
-
     write_csv(ankle_csv, ankle_rows, ANKLE_FIELDS)
     write_csv(steps_csv, step_events, STEP_FIELDS)
-
-    overlay_video = None
-    if make_video:
-        overlay_video = output_video or str(Path(output_dir) / f"{stem}_steps_overlay.mp4")
-        render_overlay(
-            video_path,
-            ankle_rows,
-            step_events,
-            overlay_video,
-            start_line=start_line,
-            end_line=end_line,
-            avg_cadence_spm=avg_cadence_spm,
-        )
-
-    step_lengths = [
-        float(e["step_length_m"])
-        for e in step_events
-        if e.get("step_length_m") is not None
-    ]
-    avg_step_length_m = float(np.mean(step_lengths)) if step_lengths else None
 
     return {
         "ankle_csv": ankle_csv,
         "steps_csv": steps_csv,
-        "overlay_video": overlay_video,
+        "overlay_video": None,
         "detected_steps": len(step_events),
         "avg_cadence_spm": avg_cadence_spm,
-        "avg_step_length_m": avg_step_length_m,
+        "avg_step_length_m": _mean_step_length_m(step_events),
         "ankle_rows": ankle_rows,
         "step_events": step_events,
     }
@@ -3262,9 +3236,7 @@ def main():
     if not video_path or not keypoints_npz or not offsets_npz:
         raise ValueError("provide --config or all of --video, --keypoints-npz, --offsets-npz")
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
-    cap.release()
+    fps = _video_fps(video_path)
 
     start_line = _parse_line(args.start_line)
     end_line = _parse_line(args.end_line)
@@ -3277,7 +3249,9 @@ def main():
     if distance_m is None:
         distance_m = cam_cfg.get("distance_m") or cfg.get("distance_m")
 
-    calibration = _make_calibration(cam_cfg, cfg, args, start_line, end_line, distance_m)
+    calibration = _make_calibration(
+        cam_cfg, cfg, args.meters_per_pixel, start_line, end_line, distance_m
+    )
 
     ankle_rows = load_ankle_positions(keypoints_npz, offsets_npz, fps)
     step_events = detect_steps(
@@ -3317,7 +3291,6 @@ def main():
             output_video,
             start_line=start_line,
             end_line=end_line,
-            avg_cadence_spm=avg_cadence_spm,
         )
         print(f"Overlay video: {output_video}")
 

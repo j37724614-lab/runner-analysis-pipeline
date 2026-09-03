@@ -7,19 +7,20 @@ core/visualization.py
 此模組封裝了原本在 scripts/visualization/add_angle_overlay.py 的核心運算邏輯。
 """
 
+import argparse
 import csv
 import os
-import sys
-import argparse
-from pathlib import Path
+from dataclasses import dataclass, field
+
 import matplotlib
+
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-from matplotlib.font_manager import FontProperties
-import numpy as np
 import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+from matplotlib import ticker
+from matplotlib.font_manager import FontProperties
 
 from core.utils import get_font_path
 
@@ -171,133 +172,142 @@ def _smooth_camera_boundary_angles(df, frame_map, cols, blend_frames=30):
     return out, applied
 
 
-def add_angle_overlay(video_path, csv_path, output_path,
-                      main_video_path=None,
-                      main_video_paths=None,
-                      frame_map_path=None,
-                      chart_height=200, display_height=340,
-                      inset_height_ratio=0.45, inset_margin=10,
-                      smooth_camera_boundary=True,
-                      boundary_blend_frames=30,
-                      dpi=100):
-    """
-    將追焦 2D 骨架影片與角度數據合併，並繪製下方的 2x2 角度變動折線圖。
-    """
-    zh_font = FontProperties(fname=FONT_PATH) if FONT_PATH and os.path.exists(FONT_PATH) else None
-    if zh_font is None:
-        print("  ⚠️  [Core.Vis] ChineseFont.ttf 不存在，將使用系統預設字型")
+@dataclass
+class AngleOverlayConfig:
+    """add_angle_overlay() 的顯示/輸入設定；全部有預設值。"""
+    main_videos: list = field(default_factory=list)
+    frame_map_path: "str | None" = None
+    chart_height: int = 200
+    display_height: int = 340
+    inset_height_ratio: float = 0.45
+    inset_margin: int = 10
+    smooth_camera_boundary: bool = True
+    boundary_blend_frames: int = 30
+    dpi: int = 100
 
+
+@dataclass
+class _Geometry:
+    inset_w: int
+    inset_h: int
+    fps: float
+    total: int
+    video_w: int
+    video_h: int
+    chart_h: int
+    total_w: int      # 輸出影片尺寸（各維向下取偶）
+    total_h: int
+
+
+def _zh_font():
+    if FONT_PATH and os.path.exists(FONT_PATH):
+        return FontProperties(fname=FONT_PATH)
+    print("  ⚠️  [Core.Vis] ChineseFont.ttf 不存在，將使用系統預設字型")
+    return None
+
+
+def _load_angle_dataframe(csv_path, cfg):
+    """讀角度 CSV，若有 frame_map 且啟用則做跨相機接縫平滑。回傳 (df, frame_map|None)。"""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"角度 CSV 不存在: {csv_path}")
     df = pd.read_csv(csv_path)
-    csv_len = len(df)
-    print(f"  [Core.Vis] CSV 數據讀取成功：{csv_len} 幀")
+    print(f"  [Core.Vis] CSV 數據讀取成功：{len(df)} 幀")
 
+    frame_map = None
+    if cfg.frame_map_path:
+        if not os.path.exists(cfg.frame_map_path):
+            raise FileNotFoundError(f"frame map 不存在: {cfg.frame_map_path}")
+        frame_map = {}
+        with open(cfg.frame_map_path, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                frame_map[int(row['output_frame'])] = {
+                    'cam': int(row.get('cam') or 1),
+                    'source_frame': int(row['source_frame']),
+                }
+        if cfg.smooth_camera_boundary:
+            df, _ = _smooth_camera_boundary_angles(
+                df, frame_map, cols=['pelvis_torso_angle'],
+                blend_frames=cfg.boundary_blend_frames)
+    return df, frame_map
+
+
+def _open_overlay_caps(video_path, main_videos):
+    """開 inset 骨架影片與 0..N 支原始主畫面影片；任一失敗即釋放已開的並拋出。"""
     inset_cap = cv2.VideoCapture(video_path)
     if not inset_cap.isOpened():
         raise RuntimeError(f"無法開啟 2D 追焦骨架影片: {video_path}")
-
-    if main_video_paths is None:
-        main_video_paths = []
-    if main_video_path and not main_video_paths:
-        main_video_paths = [main_video_path]
-
     main_caps = []
-    for idx, path in enumerate(main_video_paths):
+    for idx, path in enumerate(main_videos):
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
+            inset_cap.release()
             for opened in main_caps:
                 opened.release()
             raise RuntimeError(f"無法開啟原始影片 CAM{idx + 1}: {path}")
         main_caps.append(cap)
+    return inset_cap, main_caps
 
-    frame_map = None
-    if frame_map_path:
-        if not os.path.exists(frame_map_path):
-            raise FileNotFoundError(f"frame map 不存在: {frame_map_path}")
-        frame_map = {}
-        with open(frame_map_path, newline='', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                output_frame = int(row['output_frame'])
-                frame_map[output_frame] = {
-                    'cam': int(row.get('cam') or 1),
-                    'source_frame': int(row['source_frame']),
-                }
-        if smooth_camera_boundary:
-            df, applied_boundary_smoothing = _smooth_camera_boundary_angles(
-                df,
-                frame_map,
-                cols=['pelvis_torso_angle'],
-                blend_frames=boundary_blend_frames,
-            )
-        else:
-            applied_boundary_smoothing = []
-    else:
-        applied_boundary_smoothing = []
 
+def _output_geometry(inset_cap, main_caps, cfg):
     inset_w = int(inset_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     inset_h = int(inset_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps     = inset_cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total   = int(inset_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = inset_cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(inset_cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if main_caps:
         main_w = int(main_caps[0].get(cv2.CAP_PROP_FRAME_WIDTH))
         main_h = int(main_caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
-        video_h = max(1, int(display_height))
+        video_h = max(1, int(cfg.display_height))
         video_w = max(1, int(round(main_w * video_h / max(main_h, 1))))
     else:
         video_w, video_h = inset_w, inset_h
-    chart_h = max(0, int(chart_height))
+    chart_h = max(0, int(cfg.chart_height))
+    return _Geometry(inset_w, inset_h, fps, total, video_w, video_h, chart_h,
+                     total_w=video_w // 2 * 2, total_h=(video_h + chart_h) // 2 * 2)
 
-    print(f"  [Core.Vis] 2D追焦尺寸: {inset_w}×{inset_h}，{total} 幀")
-    print(f"  [Core.Vis] 輸出總解析度: {video_w}×{video_h + chart_h}")
 
-    # 預計算各 panel 的全域 Y 軸範圍
-    panel_ylims  = []
-    panel_yticks = []
+def _precompute_panel_axes(df):
+    """4 個 panel 的 (ylim, yticks) 與共用 x_max。"""
+    panel_ylims, panel_yticks = [], []
     for panel in PANELS:
         series_list = [df[c].dropna() for c in panel['cols'] if c in df.columns]
         if series_list:
             combined = pd.concat(series_list)
-            lo = combined.quantile(0.05)
-            hi = combined.quantile(0.95)
+            lo, hi = combined.quantile(0.05), combined.quantile(0.95)
             margin = max((hi - lo) * 0.15, 3.0)
-            y0 = lo - margin
-            y1 = hi + margin
+            y0, y1 = lo - margin, hi + margin
         else:
             y0, y1 = 0.0, 180.0
         panel_ylims.append((y0, y1))
-        
+
         span = y1 - y0
         for step in [1, 2, 5, 10, 15, 20, 25, 30]:
             if span / step <= 6:
                 break
         first = int(np.ceil(y0 / step)) * step
         ticks = np.arange(first, y1 + step * 0.01, step)
-        ticks = ticks[(ticks >= y0) & (ticks <= y1)]
-        panel_yticks.append(ticks)
+        panel_yticks.append(ticks[(ticks >= y0) & (ticks <= y1)])
 
+    csv_len = len(df)
     x_max = max(df['frame'].iloc[-1], csv_len - 1) if csv_len > 0 else 100
+    return panel_ylims, panel_yticks, x_max
 
+
+def _build_chart_figure(df, geom, cfg, axes_spec, zh_font):
+    """建立 2x2 折線圖畫布，回傳 (fig, panel_lines, panel_dots)。line/dot 之後由
+    render loop 逐幀 set_data。``axes_spec`` 為 _precompute_panel_axes 的回傳。"""
+    panel_ylims, panel_yticks, x_max = axes_spec
     fig, axes = plt.subplots(
-        2, 2,
-        figsize=(video_w / dpi, max(chart_h, 1) / dpi),
-        dpi=dpi,
-    )
+        2, 2, figsize=(geom.video_w / cfg.dpi, max(geom.chart_h, 1) / cfg.dpi), dpi=cfg.dpi)
     fig.patch.set_facecolor('#ffffff')
-    axes_flat = axes.flatten()
 
-    panel_lines = []
-    panel_dots  = []
-
-    for i, (ax, panel, ylim, yticks) in enumerate(
-            zip(axes_flat, PANELS, panel_ylims, panel_yticks)):
-
+    panel_lines, panel_dots = [], []
+    for ax, panel, ylim, yticks in zip(axes.flatten(), PANELS, panel_ylims, panel_yticks):
         ax.set_facecolor('#ffffff')
         ax.set_xlim(0, x_max)
         ax.set_ylim(ylim[0], ylim[1])
         ax.set_yticks(yticks)
         ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%g'))
-        
+
         title_kw = {'fontsize': 6, 'color': 'black', 'pad': 3, 'fontweight': 'bold'}
         if zh_font:
             title_kw['fontproperties'] = zh_font
@@ -306,13 +316,12 @@ def add_angle_overlay(video_path, csv_path, output_path,
         ax.spines[:].set_color('black')
         ax.grid(True, alpha=0.3)
 
-        col_lines = []
-        col_dots  = []
+        col_lines, col_dots = [], []
         for col, color in zip(panel['cols'], panel['colors']):
             if col not in df.columns:
                 continue
             zh_label = COL_ZH.get(col, col)
-            ln,  = ax.plot([], [], color=color, lw=1.0, label=zh_label, alpha=1.0)
+            ln, = ax.plot([], [], color=color, lw=1.0, label=zh_label, alpha=1.0)
             dot, = ax.plot([], [], 'o', color=color, ms=6, zorder=5)
             col_lines.append((col, ln))
             col_dots.append((col, dot))
@@ -333,83 +342,106 @@ def add_angle_overlay(video_path, csv_path, output_path,
 
     plt.tight_layout(pad=0.4)
     fig.canvas.draw()
+    return fig, panel_lines, panel_dots
 
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    
-    total_w = video_w // 2 * 2
-    total_h = (video_h + chart_h) // 2 * 2
-    out = cv2.VideoWriter(output_path, fourcc, fps, (total_w, total_h))
 
+def _read_main_frame(frame_idx, main_caps, frame_map, last_main_frame):
+    """依 frame_map 選相機/定位，讀一張主畫面幀。回傳 (main_frame, last_main_frame)。
+    讀失敗時沿用上一張；連上一張都沒有時回傳 (None, last_main_frame)。"""
+    main_cap = main_caps[0]
+    if frame_map is not None and frame_idx in frame_map:
+        mapped = frame_map[frame_idx]
+        cam_no = mapped['cam']
+        if 1 <= cam_no <= len(main_caps):
+            main_cap = main_caps[cam_no - 1]
+        else:
+            print(f"  ⚠️  [Core.Vis] CAM{cam_no} 超出 main videos，改用 CAM1")
+        main_cap.set(cv2.CAP_PROP_POS_FRAMES, mapped['source_frame'])
+    ret_main, main_frame = main_cap.read()
+    if ret_main:
+        return main_frame, main_frame
+    return last_main_frame, last_main_frame
+
+
+def _chart_band_bgr(fig, geom):
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    chart_bgr = cv2.cvtColor(buf[:, :, :3], cv2.COLOR_RGB2BGR)
+    return cv2.resize(chart_bgr, (geom.video_w, geom.chart_h),
+                      interpolation=cv2.INTER_LANCZOS4)
+
+
+def _update_panel_data(panel_lines, panel_dots, df, csv_idx):
+    for col_lines, col_dots in zip(panel_lines, panel_dots):
+        for (col, ln), (_, dot) in zip(col_lines, col_dots):
+            ln.set_data(df['frame'].iloc[:csv_idx + 1].values,
+                        df[col].iloc[:csv_idx + 1].values)
+            dot.set_data([df['frame'].iloc[csv_idx]], [df[col].iloc[csv_idx]])
+
+
+def _render_overlay_video(out, inset_cap, main_caps, frame_map, df, chart, geom, cfg):
+    fig, panel_lines, panel_dots = chart
+    csv_len = len(df)
     frame_idx = 0
     last_main_frame = None
     while True:
         ret, inset_frame = inset_cap.read()
         if not ret:
             break
+
         if main_caps:
-            main_cap = main_caps[0]
-            source_frame = None
-            cam_no = 1
-            if frame_map is not None and frame_idx in frame_map:
-                mapped = frame_map[frame_idx]
-                cam_no = mapped['cam']
-                source_frame = mapped['source_frame']
-                if 1 <= cam_no <= len(main_caps):
-                    main_cap = main_caps[cam_no - 1]
-                else:
-                    print(f"  ⚠️  [Core.Vis] CAM{cam_no} 超出 main videos，改用 CAM1")
-                    cam_no = 1
-                main_cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-            ret_main, main_frame = main_cap.read()
-            if ret_main:
-                last_main_frame = main_frame
-            elif last_main_frame is not None:
-                main_frame = last_main_frame
-            else:
+            main_frame, last_main_frame = _read_main_frame(
+                frame_idx, main_caps, frame_map, last_main_frame)
+            if main_frame is None:
                 main_frame = inset_frame
-            frame = _compose_main_with_inset(
-                main_frame, inset_frame, video_w, video_h,
-                inset_height_ratio=inset_height_ratio,
-                inset_margin=inset_margin,
+            top = _compose_main_with_inset(
+                main_frame, inset_frame, geom.video_w, geom.video_h,
+                inset_height_ratio=cfg.inset_height_ratio,
+                inset_margin=cfg.inset_margin,
             )
         else:
-            frame = _fit_to_canvas(inset_frame, video_w, video_h)
+            top = _fit_to_canvas(inset_frame, geom.video_w, geom.video_h)
 
-        csv_idx = min(frame_idx, csv_len - 1)
-
-        for col_lines, col_dots in zip(panel_lines, panel_dots):
-            for (col, ln), (_, dot) in zip(col_lines, col_dots):
-                x_data = df['frame'].iloc[:csv_idx + 1].values
-                y_data = df[col].iloc[:csv_idx + 1].values
-                ln.set_data(x_data, y_data)
-                dot.set_data([df['frame'].iloc[csv_idx]],
-                             [df[col].iloc[csv_idx]])
-
-        fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
-        chart_rgb = buf[:, :, :3]
-        chart_bgr = cv2.cvtColor(chart_rgb, cv2.COLOR_RGB2BGR)
-        chart_bgr = cv2.resize(chart_bgr, (video_w, chart_h),
-                               interpolation=cv2.INTER_LANCZOS4)
-
-        combined = np.vstack([frame, chart_bgr])
-        if (combined.shape[1], combined.shape[0]) != (total_w, total_h):
-            combined = cv2.resize(combined, (total_w, total_h))
+        _update_panel_data(panel_lines, panel_dots, df, min(frame_idx, csv_len - 1))
+        combined = np.vstack([top, _chart_band_bgr(fig, geom)])
+        if (combined.shape[1], combined.shape[0]) != (geom.total_w, geom.total_h):
+            combined = cv2.resize(combined, (geom.total_w, geom.total_h))
         out.write(combined)
 
         frame_idx += 1
         if frame_idx % 100 == 0:
-            print(f"  [Core.Vis] 合併進度: {frame_idx}/{total} 幀 ({frame_idx/total*100:.0f}%)")
+            print(f"  [Core.Vis] 合併進度: {frame_idx}/{geom.total} 幀 "
+                  f"({frame_idx / geom.total * 100:.0f}%)")
 
-    inset_cap.release()
-    for cap in main_caps:
-        cap.release()
-    out.release()
-    plt.close(fig)
+
+def add_angle_overlay(video_path, csv_path, output_path, config=None):
+    """將追焦 2D 骨架影片與角度數據合併，並繪製下方的 2x2 角度變動折線圖。"""
+    cfg = config or AngleOverlayConfig()
+    zh_font = _zh_font()
+
+    df, frame_map = _load_angle_dataframe(csv_path, cfg)
+    inset_cap, main_caps = _open_overlay_caps(video_path, cfg.main_videos)
+    geom = _output_geometry(inset_cap, main_caps, cfg)
+    print(f"  [Core.Vis] 2D追焦尺寸: {geom.inset_w}×{geom.inset_h}，{geom.total} 幀")
+    print(f"  [Core.Vis] 輸出總解析度: {geom.video_w}×{geom.video_h + geom.chart_h}")
+
+    chart = _build_chart_figure(df, geom, cfg, _precompute_panel_axes(df), zh_font)
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'),
+                          geom.fps, (geom.total_w, geom.total_h))
+
+    try:
+        _render_overlay_video(out, inset_cap, main_caps, frame_map, df, chart, geom, cfg)
+    finally:
+        inset_cap.release()
+        for cap in main_caps:
+            cap.release()
+        out.release()
+        plt.close(chart[0])
     print(f"✅ [Core.Vis] 角度圖表合併影片生成完成！儲存至: {output_path}")
 
 
@@ -454,10 +486,10 @@ def run_cli(args=None):
     if args is None:
         args = parse_args()
 
-    add_angle_overlay(
-        args.video, args.csv, args.output,
-        main_video_path=args.main_video,
-        main_video_paths=args.main_video_paths if hasattr(args, 'main_video_paths') else getattr(args, 'main_videos', None),
+    main_videos = getattr(args, 'main_videos', None) or (
+        [args.main_video] if args.main_video else [])
+    add_angle_overlay(args.video, args.csv, args.output, AngleOverlayConfig(
+        main_videos=main_videos,
         frame_map_path=args.frame_map,
         chart_height=args.chart_height,
         display_height=args.display_height,
@@ -466,4 +498,4 @@ def run_cli(args=None):
         smooth_camera_boundary=args.smooth_camera_boundary,
         boundary_blend_frames=args.boundary_blend_frames,
         dpi=args.dpi,
-    )
+    ))

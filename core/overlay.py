@@ -5,14 +5,18 @@ core/overlay.py
 此模組封裝了原本在根目錄下 overlay_original.py 的核心運算邏輯。
 """
 
-import sys
-import os
 import argparse
-import numpy as np
-import cv2
-import yaml
 import json
+import os
+import sys
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import yaml
 from tqdm import tqdm
+
+from core.draw_utils import draw_dashed_line as _draw_dashed_line
 
 
 # ---------------------------------------------------------------------------
@@ -73,32 +77,6 @@ def show2Dpose_original(kps, img, offset_x, offset_y, foot_kps=None, foot_scores
 
 
 # ---------------------------------------------------------------------------
-# 輔助虛線繪製
-# ---------------------------------------------------------------------------
-def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8):
-    """在影像上繪製指定長度間隔的虛線。"""
-    dx = pt2[0] - pt1[0]
-    dy = pt2[1] - pt1[1]
-    length = (dx ** 2 + dy ** 2) ** 0.5
-    if length == 0:
-        return
-    ux, uy = dx / length, dy / length
-    pos = 0.0
-    drawing = True
-    while pos < length:
-        seg = dash_len if drawing else gap_len
-        end_pos = min(pos + seg, length)
-        if drawing:
-            x1 = int(pt1[0] + ux * pos)
-            y1 = int(pt1[1] + uy * pos)
-            x2 = int(pt1[0] + ux * end_pos)
-            y2 = int(pt1[1] + uy * end_pos)
-            cv2.line(img, (x1, y1), (x2, y2), color, thickness)
-        pos = end_pos
-        drawing = not drawing
-
-
-# ---------------------------------------------------------------------------
 # 在影格上畫起終點線與跑道範圍
 # ---------------------------------------------------------------------------
 def _draw_lines(frame, start_line, end_line, homography_points=None):
@@ -138,327 +116,261 @@ def _draw_lines(frame, start_line, end_line, homography_points=None):
 
 
 # ---------------------------------------------------------------------------
+# 共用：載入 offsets / keypoints / foot npz 與 config 合併
+# ---------------------------------------------------------------------------
+@dataclass
+class _OverlaySources:
+    """overlay_videos() 與 overlay_videos_per_camera() 共用的輸入資料。"""
+    cameras: list
+    offsets: "np.ndarray"
+    orig_frames: "np.ndarray"
+    cam_indices: "np.ndarray"
+    kps_map: dict
+    foot_kps_map: dict
+    foot_scores_map: dict
+    num_cams: int
+
+
+def _merge_line_config(cameras, config):
+    """以 config['cameras'] 的 start_line/end_line 補上各相機（不覆蓋已有值）。"""
+    if not (config and 'cameras' in config):
+        return cameras
+    cfg_cams = config['cameras']
+    merged = []
+    for i, cam in enumerate(cameras):
+        c = dict(cam)
+        if i < len(cfg_cams):
+            c.setdefault('start_line', cfg_cams[i].get('start_line'))
+            c.setdefault('end_line', cfg_cams[i].get('end_line'))
+        merged.append(c)
+    return merged
+
+
+def _load_overlay_sources(cameras, offsets_npz, kps_npz, config):
+    """讀 offsets / keypoints /（可選）foot npz，建立 v_idx → keypoints 對應表。"""
+    cameras = _merge_line_config(cameras, config)
+
+    offsets_data = np.load(offsets_npz)
+    offsets = offsets_data['offsets']
+    orig_frames = offsets_data['orig_frames']
+    if 'cam_indices' in offsets_data:
+        cam_indices = offsets_data['cam_indices'].astype(int)
+    else:
+        print("  ⚠️  offsets.npz 未含 cam_indices，假設所有幀皆來自相機 0")
+        cam_indices = np.zeros(len(orig_frames), dtype=int)
+
+    kps_data = np.load(kps_npz, allow_pickle=True)
+    keypoints = kps_data['reconstruction'][0]
+    valid_frames = np.asarray(kps_data['valid_frames']).flatten().astype(int)
+    kps_map = {v: keypoints[i] for i, v in enumerate(valid_frames)
+               if v < len(orig_frames)}
+
+    foot_kps_map, foot_scores_map = {}, {}
+    foot_npz = os.path.join(os.path.dirname(kps_npz), 'foot_keypoints.npz')
+    if os.path.exists(foot_npz):
+        foot_data = np.load(foot_npz, allow_pickle=True)
+        foot_keypoints = foot_data['keypoints'][0]
+        foot_scores = foot_data['scores'][0]
+        for i, v in enumerate(valid_frames):
+            if v < len(orig_frames) and i < len(foot_keypoints):
+                foot_kps_map[v] = foot_keypoints[i]
+                foot_scores_map[v] = foot_scores[i]
+
+    num_cams = int(max(cam_indices)) + 1 if len(cam_indices) > 0 else len(cameras)
+    return _OverlaySources(cameras, offsets, orig_frames, cam_indices,
+                           kps_map, foot_kps_map, foot_scores_map, num_cams)
+
+
+def _iter_original_frames(sources, wanted_cams=None):
+    """依 orig_frames 順序產出 (v_idx, c_idx, frame)。每台相機只開一次
+    VideoCapture 並循序讀取（cap.set() 在壓縮影片上定位不準）。
+    不在 wanted_cams、或無法開啟/讀取的幀 → frame 為 None。"""
+    current_cam_idx = -1
+    cap = None
+    current_frame_pos = 0
+    try:
+        for v_idx in range(len(sources.orig_frames)):
+            c_idx = int(sources.cam_indices[v_idx])
+            orig_idx = int(sources.orig_frames[v_idx])
+
+            if wanted_cams is not None and c_idx not in wanted_cams:
+                yield v_idx, c_idx, None
+                continue
+
+            if c_idx != current_cam_idx:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                video_path = (sources.cameras[c_idx].get('video_path')
+                              if c_idx < len(sources.cameras) else None)
+                if not video_path or not os.path.exists(video_path):
+                    print(f"  ⚠️  找不到相機 {c_idx} 的影片: {video_path}，跳過")
+                    yield v_idx, c_idx, None
+                    continue
+                cap = cv2.VideoCapture(video_path)
+                current_cam_idx = c_idx
+                current_frame_pos = 0
+
+            ret = False
+            frame = None
+            while current_frame_pos <= orig_idx:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                current_frame_pos += 1
+            yield v_idx, c_idx, (frame if ret else None)
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def _draw_skeleton_on_frame(frame, sources, v_idx):
+    """在原始幀上畫起終點線與（若有）骨架，回傳更新後的 frame。"""
+    if v_idx not in sources.kps_map:
+        return frame
+    off_x, off_y = sources.offsets[v_idx]
+    return show2Dpose_original(
+        sources.kps_map[v_idx], frame, off_x, off_y,
+        foot_kps=sources.foot_kps_map.get(v_idx),
+        foot_scores=sources.foot_scores_map.get(v_idx),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 主要公開 API
 # ---------------------------------------------------------------------------
 def overlay_videos(cameras, offsets_npz, kps_npz, output_video, config=None):
     """
     在各台相機的原始影片上疊加 2D 骨架與起終點標線，輸出為單支合成影片。
 
-    Parameters
-    ----------
-    cameras      : list[dict]  每個 dict 含 'video_path', 'start_line', 'end_line'
-    offsets_npz  : str         npz 路徑（含 offsets / orig_frames / cam_indices）
-    kps_npz      : str         keypoints.npz 路徑
-    output_video : str         輸出影片路徑
-    config       : dict|None   若提供，用 config['cameras'] 的 start/end_line 覆蓋
+    cameras / offsets_npz / kps_npz / output_video 同舊版；config 提供時以其
+    start/end_line 覆寫。
     """
-    # ── 若有額外 config，以 config 的 start/end_line 為準 ──
-    if config and 'cameras' in config:
-        cfg_cams = config['cameras']
-        merged = []
-        for i, cam in enumerate(cameras):
-            c = dict(cam)
-            if i < len(cfg_cams):
-                c.setdefault('start_line', cfg_cams[i].get('start_line'))
-                c.setdefault('end_line',   cfg_cams[i].get('end_line'))
-            merged.append(c)
-        cameras = merged
+    sources = _load_overlay_sources(cameras, offsets_npz, kps_npz, config)
 
-    # ── 讀取 offsets npz ──
-    offsets_data = np.load(offsets_npz)
-    offsets     = offsets_data['offsets']       # (N, 2)
-    orig_frames = offsets_data['orig_frames']   # (N,)   原始影片幀號
-    # cam_indices: 向前相容舊版 npz（未含此欄位時預設全部為相機 0）
-    if 'cam_indices' in offsets_data:
-        cam_indices = offsets_data['cam_indices'].astype(int)  # (N,)
-    else:
-        print("  ⚠️  offsets.npz 未含 cam_indices，假設所有幀皆來自相機 0")
-        cam_indices = np.zeros(len(orig_frames), dtype=int)
-
-    # ── 讀取 keypoints npz ──
-    kps_data   = np.load(kps_npz, allow_pickle=True)
-    keypoints  = kps_data['reconstruction'][0]         # (valid_frames, 17, 4)
-    valid_frames = np.asarray(kps_data['valid_frames']).flatten().astype(int)
-
-    # valid_frames[i] 是裁切影片的第 i 個有效幀在「all_offsets 序列」中的索引
-    # 建立 v_idx → keypoints 的對應
-    kps_map = {}
-    for i, v_idx in enumerate(valid_frames):
-        if v_idx < len(orig_frames):
-            kps_map[v_idx] = keypoints[i]
-
-    # ── 讀取腳部 keypoints npz（若存在；舊的 17-only checkpoint 輸出不會有這個檔案）──
-    foot_kps_map = {}
-    foot_scores_map = {}
-    foot_npz = os.path.join(os.path.dirname(kps_npz), 'foot_keypoints.npz')
-    if os.path.exists(foot_npz):
-        foot_data = np.load(foot_npz, allow_pickle=True)
-        foot_keypoints = foot_data['keypoints'][0]   # (valid_frames, 6, 2)
-        foot_scores = foot_data['scores'][0]         # (valid_frames, 6)
-        for i, v_idx in enumerate(valid_frames):
-            if v_idx < len(orig_frames) and i < len(foot_keypoints):
-                foot_kps_map[v_idx] = foot_keypoints[i]
-                foot_scores_map[v_idx] = foot_scores[i]
-
-    # ── 依相機分組，找出每台相機需要哪些幀 ──
-    # 每台相機只開啟一次 VideoCapture，依序讀取所需幀
-    num_cams = max(cam_indices) + 1 if len(cam_indices) > 0 else len(cameras)
-
-    # 先從第一台相機取得輸出尺寸與 FPS
-    first_video = cameras[0].get('video_path')
+    first_video = sources.cameras[0].get('video_path')
     if not first_video or not os.path.exists(first_video):
         raise FileNotFoundError(f"找不到影片: {first_video}")
-
     cap0 = cv2.VideoCapture(first_video)
-    width  = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
+    width = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps    = cap0.get(cv2.CAP_PROP_FPS)
+    fps = cap0.get(cv2.CAP_PROP_FPS)
     cap0.release()
     if fps <= 0:
         fps = 30.0
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    print(f"[Core.Overlay] 正在輸出原解析度骨架影片: {output_video} "
+          f"(幀數: {len(sources.orig_frames)}, 相機數: {sources.num_cams})")
 
-    print(f"[Core.Overlay] 正在輸出原解析度骨架影片: {output_video} (幀數: {len(orig_frames)}, 相機數: {num_cams})")
-
-    # ── 逐幀輸出：按 v_idx 順序，切換相機 VideoCapture ──
-    current_cam_idx = -1   # 目前已開啟的相機
-    cap = None
-    current_frame_pos = 0  # 目前相機已讀到的幀號
-
-    with tqdm(total=len(orig_frames), desc="Overlaying") as pbar:
-        for v_idx in range(len(orig_frames)):
-            c_idx     = int(cam_indices[v_idx])
-            orig_idx  = int(orig_frames[v_idx])
-
-            # 切換相機時開新 VideoCapture
-            if c_idx != current_cam_idx:
-                if cap is not None:
-                    cap.release()
-                video_path = cameras[c_idx].get('video_path') if c_idx < len(cameras) else None
-                if not video_path or not os.path.exists(video_path):
-                    print(f"  ⚠️  找不到相機 {c_idx} 的影片: {video_path}，跳過")
-                    pbar.update(1)
-                    continue
-                cap = cv2.VideoCapture(video_path)
-                current_cam_idx  = c_idx
-                current_frame_pos = 0
-
-            # 依序讀到目標幀（避免 cap.set() 在壓縮影片上定位不準）
-            ret = False
-            while current_frame_pos <= orig_idx:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                current_frame_pos += 1
-
-            if not ret:
-                pbar.update(1)
-                continue
-
-            # ── 畫起終點線 ──
-            cam_cfg = cameras[c_idx] if c_idx < len(cameras) else {}
-            start_line = cam_cfg.get('start_line')
-            end_line   = cam_cfg.get('end_line')
-            _draw_lines(frame, start_line, end_line, cam_cfg.get('homography_src_points'))
-
-            # ── 畫骨架 ──
-            if v_idx in kps_map:
-                kps = kps_map[v_idx]
-                off_x, off_y = offsets[v_idx]
-                frame = show2Dpose_original(
-                    kps, frame, off_x, off_y,
-                    foot_kps=foot_kps_map.get(v_idx),
-                    foot_scores=foot_scores_map.get(v_idx),
-                )
-
-            out.write(frame)
+    with tqdm(total=len(sources.orig_frames), desc="Overlaying") as pbar:
+        for v_idx, c_idx, frame in _iter_original_frames(sources):
+            if frame is not None:
+                cam_cfg = sources.cameras[c_idx] if c_idx < len(sources.cameras) else {}
+                _draw_lines(frame, cam_cfg.get('start_line'), cam_cfg.get('end_line'),
+                            cam_cfg.get('homography_src_points'))
+                frame = _draw_skeleton_on_frame(frame, sources, v_idx)
+                out.write(frame)
             pbar.update(1)
 
-    if cap is not None:
-        cap.release()
     out.release()
     print(f"✅ [Core.Overlay] 原影片骨架疊加完成！儲存至: {output_video}")
 
 
+def _open_per_camera_writers(sources, output_paths):
+    """依 output_paths 為每台有效相機建立 VideoWriter（以該相機影片尺寸）。"""
+    writers = {}
+    for c_idx in range(sources.num_cams):
+        out_path = output_paths[c_idx] if c_idx < len(output_paths) else None
+        if not out_path:
+            continue
+        video_path = (sources.cameras[c_idx].get('video_path')
+                      if c_idx < len(sources.cameras) else None)
+        if not video_path or not os.path.exists(video_path):
+            print(f"  ⚠️  找不到相機 {c_idx} 的影片，略過該相機的疊圖輸出: {video_path}")
+            continue
+        probe = cv2.VideoCapture(video_path)
+        w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
+        probe.release()
+        writers[c_idx] = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    return writers
+
+
+def _annotate_landing(frame, row, cam_history, total_steps, contact_display):
+    """在一幀上畫腳踝點、過去 20 個落地事件標記、時間/步數文字。"""
+    from scripts.analysis.ankle_step_stride import TEXT_COLOR
+
+    if row:
+        cv2.circle(frame, (int(row["right_ankle_x"]), int(row["right_ankle_y"])), 3, (0, 0, 255), -1)
+        cv2.circle(frame, (int(row["left_ankle_x"]), int(row["left_ankle_y"])), 3, (255, 0, 0), -1)
+
+    for past in cam_history[-20:]:
+        # homography_lateral_valid 只在 homography 相機上設定；False = 該點世界座標
+        # 被標為離群值 → 不畫。
+        if past.get("homography_lateral_valid") is False:
+            continue
+        px, py, colour, joint_tag = contact_display(past)
+        cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
+        cv2.circle(frame, (px, py), 3, colour, -1)
+        label = f"S{past['step_index']} {joint_tag}"
+        if past["step_length_m"] is not None:
+            label += f" L={past['step_length_m']:.2f}m"
+        elif past["step_length_px"] is not None:
+            label += f" L={past['step_length_px']:.0f}px"
+        label_y = py + 43 if (past['step_index'] % 2 == 1) else py + 70
+        cv2.putText(frame, label, (px + 8, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 2, cv2.LINE_AA)
+
+    if row:
+        cv2.putText(frame, f"Time: {row['seq_time_s']:.2f}s", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Steps: {total_steps}", (30, 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
+
+
 def overlay_videos_per_camera(cameras, offsets_npz, kps_npz, ankle_rows, step_events,
-                               output_paths, config=None):
+                              output_paths, config=None):
     """
-    跟 overlay_videos() 邏輯相同（骨架疊圖），但額外疊上落地點標註（比照
-    scripts/analysis/ankle_step_stride.py::annotate_step_stride_video()），
-    而且每台相機各自輸出一支影片，不拼接成一支。
-
-    Parameters
-    ----------
-    cameras      : list[dict]  每個 dict 含 'video_path', 'start_line', 'end_line'
-    offsets_npz  : str
-    kps_npz      : str
-    ankle_rows   : list[dict]  run_step_stride_analysis() 回傳的逐幀腳踝資料
-    step_events  : list[dict]  run_step_stride_analysis() 回傳的落地事件
-    output_paths : list[str|None]  每台相機的輸出路徑，長度需與相機數一致；
-                                    某相機不需要輸出時該項傳 None。
-    config       : dict|None   同 overlay_videos()
+    同 overlay_videos()（骨架疊圖），但額外疊上落地點標註，且每台相機
+    各自輸出一支影片（不拼接）。output_paths 長度需與相機數一致，
+    某相機不輸出時該項傳 None。
     """
-    from scripts.analysis.ankle_step_stride import _event_contact_display, TEXT_COLOR
+    from scripts.analysis.ankle_step_stride import _event_contact_display
 
-    if config and 'cameras' in config:
-        cfg_cams = config['cameras']
-        merged = []
-        for i, cam in enumerate(cameras):
-            c = dict(cam)
-            if i < len(cfg_cams):
-                c.setdefault('start_line', cfg_cams[i].get('start_line'))
-                c.setdefault('end_line',   cfg_cams[i].get('end_line'))
-            merged.append(c)
-        cameras = merged
-
-    offsets_data = np.load(offsets_npz)
-    offsets     = offsets_data['offsets']
-    orig_frames = offsets_data['orig_frames']
-    if 'cam_indices' in offsets_data:
-        cam_indices = offsets_data['cam_indices'].astype(int)
-    else:
-        cam_indices = np.zeros(len(orig_frames), dtype=int)
-
-    kps_data   = np.load(kps_npz, allow_pickle=True)
-    keypoints  = kps_data['reconstruction'][0]
-    valid_frames = np.asarray(kps_data['valid_frames']).flatten().astype(int)
-    kps_map = {}
-    for i, v_idx in enumerate(valid_frames):
-        if v_idx < len(orig_frames):
-            kps_map[v_idx] = keypoints[i]
-
-    foot_kps_map = {}
-    foot_scores_map = {}
-    foot_npz = os.path.join(os.path.dirname(kps_npz), 'foot_keypoints.npz')
-    if os.path.exists(foot_npz):
-        foot_data = np.load(foot_npz, allow_pickle=True)
-        foot_keypoints = foot_data['keypoints'][0]
-        foot_scores = foot_data['scores'][0]
-        for i, v_idx in enumerate(valid_frames):
-            if v_idx < len(orig_frames) and i < len(foot_keypoints):
-                foot_kps_map[v_idx] = foot_keypoints[i]
-                foot_scores_map[v_idx] = foot_scores[i]
-
+    sources = _load_overlay_sources(cameras, offsets_npz, kps_npz, config)
     rows_by_seq = {int(r["seq_frame"]): r for r in ankle_rows}
     events_by_seq = {int(e["seq_frame"]): e for e in step_events}
     event_history_by_cam = {}
 
-    num_cams = max(cam_indices) + 1 if len(cam_indices) > 0 else len(cameras)
-
-    writers = {}
-    for c_idx in range(num_cams):
-        out_path = output_paths[c_idx] if c_idx < len(output_paths) else None
-        if not out_path:
-            continue
-        video_path = cameras[c_idx].get('video_path') if c_idx < len(cameras) else None
-        if not video_path or not os.path.exists(video_path):
-            print(f"  ⚠️  找不到相機 {c_idx} 的影片，略過該相機的疊圖輸出: {video_path}")
-            continue
-        cap_probe = cv2.VideoCapture(video_path)
-        w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap_probe.get(cv2.CAP_PROP_FPS) or 30.0
-        cap_probe.release()
-        writers[c_idx] = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
+    writers = _open_per_camera_writers(sources, output_paths)
     print(f"[Core.Overlay] 正在輸出各相機獨立骨架+落地點疊圖影片（相機數: {len(writers)}）")
 
-    current_cam_idx = -1
-    cap = None
-    current_frame_pos = 0
+    with tqdm(total=len(sources.orig_frames), desc="Per-camera overlaying") as pbar:
+        for v_idx, c_idx, frame in _iter_original_frames(sources, wanted_cams=set(writers)):
+            if frame is not None:
+                cam_cfg = sources.cameras[c_idx] if c_idx < len(sources.cameras) else {}
+                _draw_lines(frame, cam_cfg.get('start_line'), cam_cfg.get('end_line'),
+                            cam_cfg.get('homography_src_points'))
+                frame = _draw_skeleton_on_frame(frame, sources, v_idx)
 
-    with tqdm(total=len(orig_frames), desc="Per-camera overlaying") as pbar:
-        for v_idx in range(len(orig_frames)):
-            c_idx = int(cam_indices[v_idx])
-            orig_idx = int(orig_frames[v_idx])
-
-            if c_idx not in writers:
-                pbar.update(1)
-                continue
-
-            if c_idx != current_cam_idx:
-                if cap is not None:
-                    cap.release()
-                video_path = cameras[c_idx].get('video_path')
-                cap = cv2.VideoCapture(video_path)
-                current_cam_idx = c_idx
-                current_frame_pos = 0
-
-            ret = False
-            while current_frame_pos <= orig_idx:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                current_frame_pos += 1
-            if not ret:
-                pbar.update(1)
-                continue
-
-            cam_cfg = cameras[c_idx] if c_idx < len(cameras) else {}
-            _draw_lines(frame, cam_cfg.get('start_line'), cam_cfg.get('end_line'), cam_cfg.get('homography_src_points'))
-
-            if v_idx in kps_map:
-                kps = kps_map[v_idx]
-                off_x, off_y = offsets[v_idx]
-                frame = show2Dpose_original(
-                    kps, frame, off_x, off_y,
-                    foot_kps=foot_kps_map.get(v_idx),
-                    foot_scores=foot_scores_map.get(v_idx),
-                )
-
-            row = rows_by_seq.get(v_idx)
-            if row:
-                rx, ry = int(row["right_ankle_x"]), int(row["right_ankle_y"])
-                lx, ly = int(row["left_ankle_x"]), int(row["left_ankle_y"])
-                cv2.circle(frame, (rx, ry), 3, (0, 0, 255), -1)
-                cv2.circle(frame, (lx, ly), 3, (255, 0, 0), -1)
-
-            event = events_by_seq.get(v_idx)
-            if event:
-                event_history_by_cam.setdefault(c_idx, []).append(event)
-            cam_history = event_history_by_cam.get(c_idx, [])
-            for past in cam_history[-20:]:
-                # homography_lateral_valid is only set (True/False) for
-                # homography-calibrated cameras (see _recompute_contact_
-                # event_metrics()); False means this point's world
-                # coordinate was flagged as an outlier -- skip drawing it
-                # entirely rather than showing an untrustworthy position.
-                if past.get("homography_lateral_valid") is False:
-                    continue
-                px, py, colour, joint_tag = _event_contact_display(past)
-                cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
-                cv2.circle(frame, (px, py), 3, colour, -1)
-                label = f"S{past['step_index']} {joint_tag}"
-                if past["step_length_m"] is not None:
-                    label += f" L={past['step_length_m']:.2f}m"
-                elif past["step_length_px"] is not None:
-                    label += f" L={past['step_length_px']:.0f}px"
-                label_y = py + 43 if (past['step_index'] % 2 == 1) else py + 70
-                cv2.putText(frame, label, (px + 8, label_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 2, cv2.LINE_AA)
-
-            if row:
-                cv2.putText(frame, f"Time: {row['seq_time_s']:.2f}s", (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
-            total_steps = sum(len(h) for h in event_history_by_cam.values())
-            cv2.putText(frame, f"Steps: {total_steps}", (30, 78),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
-
-            writers[c_idx].write(frame)
+                event = events_by_seq.get(v_idx)
+                if event:
+                    event_history_by_cam.setdefault(c_idx, []).append(event)
+                total_steps = sum(len(h) for h in event_history_by_cam.values())
+                _annotate_landing(frame, rows_by_seq.get(v_idx),
+                                  event_history_by_cam.get(c_idx, []),
+                                  total_steps, _event_contact_display)
+                writers[c_idx].write(frame)
             pbar.update(1)
 
-    if cap is not None:
-        cap.release()
     for w in writers.values():
         w.release()
     print(f"✅ [Core.Overlay] 各相機獨立疊圖完成，共 {len(writers)} 支影片")
 
 
-# ---------------------------------------------------------------------------
-# CLI 參數解析器與入口（供 CLI Wrapper 直接導入呼叫）
-# ---------------------------------------------------------------------------
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--orig_video',   required=True,

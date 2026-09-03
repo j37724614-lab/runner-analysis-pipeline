@@ -9,28 +9,9 @@ from core.process_runtime import (
     temporary_environment_variable,
 )
 
-TRACKING_CONFIG_FIELDS = {
-    "output_dir": ("OUTPUT_DIR", str),
-    "crop_width": ("CROP_WIDTH", int),
-    "crop_height": ("CROP_HEIGHT", int),
-    "auto_crop": ("AUTO_CROP", bool),
-    "show_overlay": ("SHOW_OVERLAY", bool),
-    "draw_bbox_overlay": ("DRAW_BBOX_OVERLAY", bool),
-    "movement_threshold": ("MOVEMENT_THRESHOLD", int),
-    "min_movement_frames": ("MIN_MOVEMENT_FRAMES", int),
-    "stationary_decay": ("STATIONARY_DECAY", int),
-    "max_person_memory": ("MAX_PERSON_MEMORY", int),
-    "tracking_mode": ("TRACKING_MODE", str),
-    "prescan_enabled": ("PRESCAN_ENABLED", bool),
-    "prescan_engine_path": ("PRESCAN_ENGINE_PATH", str),
-    "prescan_stride": ("PRESCAN_STRIDE", int),
-    "prescan_imgsz": ("PRESCAN_IMGSZ", int),
-    "prescan_conf": ("PRESCAN_CONF", float),
-    "prescan_iou": ("PRESCAN_IOU", float),
-    "prescan_buffer_sec": ("PRESCAN_BUFFER_SEC", float),
-    "prescan_max_gap_sec": ("PRESCAN_MAX_GAP_SEC", float),
-    "prescan_use_grab": ("PRESCAN_USE_GRAB", bool),
-}
+# Single source of truth lives in core.tracking (so the CLI path
+# _apply_config_overrides and this pipeline path never drift apart).
+from core.tracking import _TRACKING_CONFIG_FIELDS as TRACKING_CONFIG_FIELDS
 
 
 @dataclass(frozen=True)

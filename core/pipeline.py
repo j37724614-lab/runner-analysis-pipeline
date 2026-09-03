@@ -32,20 +32,23 @@ from core import angle_csv_store, tracking
 from core.overlay import overlay_videos, overlay_videos_per_camera
 from core.process_runtime import (
     PROCESS_STATE_LOCK as _PROCESS_STATE_LOCK,
+)
+from core.process_runtime import (
     temporary_environment_variable as _temporary_environment_variable,
 )
 from core.tracker_impl import compute_speed_from_bbox_map
 from core.tracking_runtime import (
     TrackingRuntimeOptions,
+)
+from core.tracking_runtime import (
     temporary_tracking_runtime as _temporary_tracking_runtime,
 )
 from core.utils import REPO_ROOT, convert_to_web_compatible_mp4
-from core.visualization import add_angle_overlay
+from core.visualization import AngleOverlayConfig, add_angle_overlay
 from scripts.analysis.ankle_step_stride import (
-    align_foot_keypoints_to_body,
     annotate_step_stride_video,
     apply_anchor_leg_correction,
-    apply_leg_swap_to_foot_keypoints,
+    apply_foot_leg_correction,
     refresh_step_analysis_after_leg_correction,
     run_step_stride_analysis,
     update_leg_swap_metadata,
@@ -1700,18 +1703,13 @@ def _render_angle_overlay(
 ) -> None:
     """以固定顯示設定產生 2D 骨架與角度折線圖合併影片。"""
     add_angle_overlay(
-        video_path=workspace.pose_video,
-        csv_path=workspace.angle_csv,
-        output_path=workspace.output_video,
-        main_video_paths=main_video_paths,
-        frame_map_path=workspace.frame_map,
-        chart_height=200,
-        display_height=340,
-        inset_height_ratio=0.45,
-        inset_margin=10,
-        smooth_camera_boundary=True,
-        boundary_blend_frames=30,
-        dpi=100,
+        workspace.pose_video,
+        workspace.angle_csv,
+        workspace.output_video,
+        AngleOverlayConfig(
+            main_videos=main_video_paths,
+            frame_map_path=workspace.frame_map,
+        ),
     )
 
 
@@ -2204,7 +2202,6 @@ def _run_initial_step_analysis(
     state.step_analysis = run_step_stride_analysis(
         config=context.config,
         output_dir=context.output_dest,
-        make_video=False,
     )
 
 
@@ -2253,13 +2250,12 @@ def _correct_leg_identity(
         "input_2D",
         "foot_keypoints.npz",
     )
-    apply_leg_swap_to_foot_keypoints(state.foot_npz, swapped_mask)
     raw_keypoints_npz = os.path.join(
         state.final_pose_dir,
         "input_2D",
         "keypoints_raw.npz",
     )
-    align_foot_keypoints_to_body(
+    apply_foot_leg_correction(
         state.foot_npz,
         raw_keypoints_npz,
         state.keypoints_npz,
@@ -2474,7 +2470,6 @@ def _annotate_main_overlay_video(
         output_video=temporary_output,
         ankle_rows=state.step_analysis["ankle_rows"],
         step_events=state.step_analysis["step_events"],
-        avg_cadence_spm=state.step_analysis.get("avg_cadence_spm"),
     )
     os.replace(temporary_output, state.output_video)
     _record_timing(
