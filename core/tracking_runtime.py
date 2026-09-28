@@ -9,8 +9,8 @@ from core.process_runtime import (
     temporary_environment_variable,
 )
 
-# Single source of truth lives in core.tracking (so the CLI path
-# _apply_config_overrides and this pipeline path never drift apart).
+# Single source of truth lives in core.tracking and is consumed by the
+# production pipeline runtime boundary below.
 from core.tracking import _TRACKING_CONFIG_FIELDS as TRACKING_CONFIG_FIELDS
 
 

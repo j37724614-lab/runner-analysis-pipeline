@@ -1295,11 +1295,11 @@ def show3Dpose(vals, ax):
     ax.tick_params('z', labelleft=False)
 
 
-def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None):
-    cap = cv2.VideoCapture(video_path)
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    cap.release()
+def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None,
+               frame_source=None, profiling=None):
+    if frame_source is None:
+        cap = cv2.VideoCapture(video_path)
+        cap.release()
 
     print('\nGenerating 2D pose...')
     if bbox_csv:
@@ -1313,6 +1313,8 @@ def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None):
         gen_output=True,
         bbox_csv=bbox_csv,
         model_path=model_path,
+        frame_source=frame_source,
+        profiling=profiling,
     )
 
     # HRNet 現在輸出 17 個 COCO body 點 + 6 個 COCO-WholeBody 腳部點（大腳趾/小腳趾/腳跟 x 左右）。
@@ -1733,7 +1735,7 @@ def compute_angles(npz_path, output_dir, fps=30.0):
 
 
 @torch.no_grad()
-def get_pose3D(video_path, output_dir, skip_video=False):
+def get_pose3D(video_path, output_dir, skip_video=False, video_metadata=None):
     # 從此腳本所在位置推算 config 絕對路徑，不受工作目錄影響
     config_path = str(_REPO_ROOT / "configs" / "h36m" / "MotionAGFormer-large.yaml")
     with open(config_path, 'r') as f:
@@ -1784,17 +1786,24 @@ def get_pose3D(video_path, output_dir, skip_video=False):
 
     clips, downsample_indices = turn_into_clips(keypoints)
 
-    cap = cv2.VideoCapture(video_path)
-    video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if video_metadata is not None and skip_video:
+        cap = None
+        video_fps = float(video_metadata["fps"])
+        img_size = (
+            int(video_metadata["height"]),
+            int(video_metadata["width"]), 3,
+        )
+    else:
+        cap = cv2.VideoCapture(video_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        ret, first_img = cap.read()
+        if not ret:
+            cap.release()
+            print("Error: Could not read video file.")
+            return
+        img_size = first_img.shape
     if video_fps <= 0:
         video_fps = 30.0
-    ret, first_img = cap.read()
-    if not ret:
-        cap.release()
-        print("Error: Could not read video file.")
-        return
-    img_size = first_img.shape
 
     valid_frame_count = keypoints.shape[1]
 
@@ -1817,7 +1826,8 @@ def get_pose3D(video_path, output_dir, skip_video=False):
             image = show2Dpose(input_2D_raw, copy.deepcopy(img), frame_foot_kps, frame_foot_scores)
             cv2.imwrite(os.path.join(output_dir_2D, str(('%04d' % i)) + '_2D.png'), image)
 
-    cap.release()
+    if cap is not None:
+        cap.release()
 
     ## 3D pose
     print('\nGenerating 3D pose...')

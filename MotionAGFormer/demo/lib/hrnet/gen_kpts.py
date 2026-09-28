@@ -109,7 +109,8 @@ def _load_bbox_map(bbox_csv):
 
 
 def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
-                   bbox_csv=None, model_path=None):
+                   bbox_csv=None, model_path=None, frame_source=None,
+                   profiling=None):
     # Updating configuration
     args = parse_args([])
     args.det_dim = det_dim
@@ -120,29 +121,51 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
         args.modelDir = os.path.abspath(model_path)
     reset_config(args)
 
-    cap = cv2.VideoCapture(video)
-
-    bbox_map = _load_bbox_map(bbox_csv)
+    cap = cv2.VideoCapture(video) if frame_source is None else None
+    bbox_map = _load_bbox_map(bbox_csv) if frame_source is None else None
 
     # Loading detector and pose model, initialize sort for track
-    human_model = None if bbox_map is not None else yolo_model(inp_dim=det_dim)
+    human_model = None if bbox_map is not None or frame_source is not None else yolo_model(inp_dim=det_dim)
+    model_load_started_at = time.perf_counter()
     pose_model = model_load(cfg)
+    if profiling is not None:
+        profiling.update({
+            'model_load_sec': round(time.perf_counter() - model_load_started_at, 4),
+            'preprocess_sec': 0.0,
+            'decode_sec': 0.0,
+            'frame_processing_wall_sec': 0.0,
+            'inference_device_sec': 0.0,
+            'inference_frames': 0,
+        })
+    cuda_events = []
     people_sort = Sort(min_hits=0)
 
-    video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap is not None else None
+    frames = (cap.read() for _ in range(video_length)) if cap is not None else frame_source
 
     kpts_result = []
     scores_result = []
     bboxs_pre = None
     scores_pre = None
 
-    for ii in tqdm(range(video_length)):
-        ret, frame = cap.read()
+    for ii, item in enumerate(tqdm(frames, total=video_length)):
+        frame_started_at = time.perf_counter() if profiling is not None else None
+        if frame_source is None:
+            ret, frame = item
+            supplied_bbox = None
+        else:
+            frame, supplied_bbox = item
+            ret = frame is not None
 
         if not ret:
             continue
 
-        if bbox_map is not None:
+        if frame_source is not None:
+            track_bboxs = [supplied_bbox] if supplied_bbox is not None else bboxs_pre
+            if track_bboxs is None:
+                continue
+            bboxs_pre = copy.deepcopy(track_bboxs)
+        elif bbox_map is not None:
             track_bboxs = bbox_map.get(ii)
             if not track_bboxs:
                 if bboxs_pre is None:
@@ -183,17 +206,36 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
 
         with torch.no_grad():
             # bbox is coordinate location
+            preprocess_started_at = time.perf_counter() if profiling is not None else None
             inputs, origin_img, center, scale = PreProcess(frame, track_bboxs, cfg, num_peroson)
 
             inputs = inputs[:, [2, 1, 0]]
 
             if torch.cuda.is_available():
                 inputs = inputs.cuda()
+            if profiling is not None:
+                profiling['preprocess_sec'] += time.perf_counter() - preprocess_started_at
+                if inputs.is_cuda:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+                else:
+                    inference_started_at = time.perf_counter()
             output = pose_model(inputs)
+            if profiling is not None:
+                if inputs.is_cuda:
+                    end_event.record()
+                    cuda_events.append((start_event, end_event))
+                else:
+                    profiling['inference_device_sec'] += time.perf_counter() - inference_started_at
+                profiling['inference_frames'] += 1
 
             # compute coordinate — DarkPose unbiased decode for all joints (body + foot)
+            decode_started_at = time.perf_counter() if profiling is not None else None
             preds, maxvals = get_final_preds_dark(
                 cfg, output.clone().cpu().numpy(), np.asarray(center), np.asarray(scale))
+            if profiling is not None:
+                profiling['decode_sec'] += time.perf_counter() - decode_started_at
 
         kpts = np.zeros((num_peroson, cfg.MODEL.NUM_JOINTS, 2), dtype=np.float32)
         scores = np.zeros((num_peroson, cfg.MODEL.NUM_JOINTS), dtype=np.float32)
@@ -205,6 +247,22 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
 
         kpts_result.append(kpts)
         scores_result.append(scores)
+        if profiling is not None:
+            profiling['frame_processing_wall_sec'] += time.perf_counter() - frame_started_at
+
+    if profiling is not None:
+        if cuda_events:
+            torch.cuda.synchronize()
+            profiling['inference_device_sec'] = sum(
+                start.elapsed_time(end) for start, end in cuda_events
+            ) / 1000.0
+        profiling['inference_device_kind'] = 'cuda' if cuda_events else 'cpu'
+        for key in ('preprocess_sec', 'decode_sec', 'frame_processing_wall_sec',
+                    'inference_device_sec'):
+            profiling[key] = round(profiling[key], 4)
+
+    if cap is not None:
+        cap.release()
 
     if not kpts_result:
         print("Warning: No keypoints generated for any frame.")

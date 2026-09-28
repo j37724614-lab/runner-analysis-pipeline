@@ -26,7 +26,9 @@ MODEL:
   INIT_WEIGHTS: true
   NAME: pose_hrnet
   NUM_JOINTS: 23
-  PRETRAINED: 'demo/lib/checkpoint/pose_hrnet_w48_wholebody23_384x288_dark.pth'
+  # Runtime loading uses gen_kpts.py --modelDir.  This mirrors its default:
+  # Jump-Broadcast long+triple pre-training followed by pilot300 head-only FT.
+  PRETRAINED: '../data/runner_wholebody23/exports/pose_hrnet_w48_wholebody23_384x288_dark_jump_broadcast_long_triple_pilot300_headonly_epoch3.pth'
   TARGET_TYPE: gaussian
   IMAGE_SIZE:
   - 288

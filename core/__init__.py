@@ -6,10 +6,8 @@ core package
 """
 
 from core.pipeline import run_pipeline, run_analysis
-from core.tracker import run_tracker
 
 __all__ = [
     'run_pipeline',
     'run_analysis',
-    'run_tracker'
 ]

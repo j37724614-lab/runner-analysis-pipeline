@@ -5,15 +5,11 @@ core/overlay.py
 此模組封裝了原本在根目錄下 overlay_original.py 的核心運算邏輯。
 """
 
-import argparse
-import json
 import os
-import sys
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
-import yaml
 from tqdm import tqdm
 
 from core.draw_utils import draw_dashed_line as _draw_dashed_line
@@ -22,58 +18,117 @@ from core.draw_utils import draw_dashed_line as _draw_dashed_line
 # ---------------------------------------------------------------------------
 # 骨架繪製（H36M 17 關節格式）
 # ---------------------------------------------------------------------------
-def show2Dpose_original(kps, img, offset_x, offset_y, foot_kps=None, foot_scores=None):
-    """
-    在原始影格上繪製 H36M 17 關節格式的 2D 骨架。
-    使用 offsets 修正回正確的相機原始空間座標。
+@dataclass(frozen=True)
+class PoseOverlayRequest:
+    """在原始影格繪製一幀 2D 姿態所需的資料。"""
 
-    foot_kps/foot_scores（可選）：COCO-WholeBody 腳部 6 點，順序為
-    L_big_toe, L_small_toe, L_heel, R_big_toe, R_small_toe, R_heel，
-    連到 H36M 左(6)/右(3)腳踝，同樣套用 offset 修正回原始空間座標。
-    """
-    # [9, 10] (Neck/Nose -> Head) and [8, 9] (Thorax -> Neck/Nose) intentionally
-    # omitted: both keypoints are unreliable for this checkpoint and jitter
-    # badly, so they're left undrawn rather than rendering distracting
-    # jumping points.
-    connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
-                   [5, 6], [0, 7], [7, 8],
-                   [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16]]
+    keypoints: "np.ndarray"
+    image: "np.ndarray"
+    offset: tuple
+    foot_keypoints: "np.ndarray | None" = None
+    foot_scores: "np.ndarray | None" = None
 
-    LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
 
-    lcolor = (255, 0, 0)   # Blue (左側)
-    rcolor = (0, 0, 255)   # Red (右側)
-    thickness = 2
+class _OriginalPoseRenderer:
+    """將裁切空間的 H36M 與腳部關節還原並繪製到原始影格。"""
 
-    for j, c in enumerate(connections):
-        start = kps[c[0]]
-        end = kps[c[1]]
-        sx, sy = int(start[0] + offset_x), int(start[1] + offset_y)
-        ex, ey = int(end[0] + offset_x), int(end[1] + offset_y)
-        cv2.line(img, (sx, sy), (ex, ey), lcolor if LR[j] else rcolor, thickness)
-        cv2.circle(img, (sx, sy), thickness=-1, color=(0, 255, 0), radius=2)
-        cv2.circle(img, (ex, ey), thickness=-1, color=(0, 255, 0), radius=2)
+    # Neck/Nose -> Head 與 Thorax -> Neck/Nose 刻意省略；目前 checkpoint
+    # 對這兩組關節不穩定，繪製後會產生明顯跳動。
+    BODY_CONNECTIONS = (
+        (0, 1, False),
+        (1, 2, False),
+        (2, 3, False),
+        (0, 4, True),
+        (4, 5, True),
+        (5, 6, True),
+        (0, 7, True),
+        (7, 8, True),
+        (8, 11, True),
+        (11, 12, True),
+        (12, 13, True),
+        (8, 14, False),
+        (14, 15, False),
+        (15, 16, False),
+    )
+    FOOT_CONNECTIONS = (
+        (0, 6),
+        (1, 6),
+        (2, 6),
+        (3, 3),
+        (4, 3),
+        (5, 3),
+    )
+    LEFT_BODY_COLOR = (255, 0, 0)
+    RIGHT_BODY_COLOR = (0, 0, 255)
+    LEFT_FOOT_COLOR = (0, 255, 255)
+    RIGHT_FOOT_COLOR = (255, 0, 255)
+    JOINT_COLOR = (0, 255, 0)
+    FOOT_SCORE_THRESHOLD = 0.3
+    BODY_THICKNESS = 2
 
-    if foot_kps is not None:
-        # Keep foot colors attached to the corrected logical L/R slots.  The
-        # pipeline swaps each three-point foot group together with the body
-        # legs before rendering, so these colors follow the DP-corrected
-        # identity as well.
-        LEFT_FOOT_COLOR = (0, 255, 255)    # yellow (BGR)
-        RIGHT_FOOT_COLOR = (255, 0, 255)  # magenta (BGR)
-        RIGHT_ANKLE, LEFT_ANKLE = 3, 6
-        foot_to_ankle = [(0, LEFT_ANKLE), (1, LEFT_ANKLE), (2, LEFT_ANKLE),
-                          (3, RIGHT_ANKLE), (4, RIGHT_ANKLE), (5, RIGHT_ANKLE)]
-        for fi, ankle_idx in foot_to_ankle:
-            if foot_scores is not None and foot_scores[fi] < 0.3:
+    def __init__(self, request):
+        self.request = request
+
+    def render(self):
+        self._draw_body()
+        if self.request.foot_keypoints is not None:
+            self._draw_feet()
+        return self.request.image
+
+    def _draw_body(self):
+        for start_index, end_index, is_left in self.BODY_CONNECTIONS:
+            start = self._original_point(self.request.keypoints[start_index])
+            end = self._original_point(self.request.keypoints[end_index])
+            color = self.LEFT_BODY_COLOR if is_left else self.RIGHT_BODY_COLOR
+            cv2.line(
+                self.request.image,
+                start,
+                end,
+                color,
+                self.BODY_THICKNESS,
+            )
+            self._draw_joint(start)
+            self._draw_joint(end)
+
+    def _draw_feet(self):
+        for foot_index, ankle_index in self.FOOT_CONNECTIONS:
+            if not self._foot_point_is_visible(foot_index):
                 continue
-            foot_color = LEFT_FOOT_COLOR if fi < 3 else RIGHT_FOOT_COLOR
-            fx, fy = int(foot_kps[fi, 0] + offset_x), int(foot_kps[fi, 1] + offset_y)
-            ax, ay = int(kps[ankle_idx, 0] + offset_x), int(kps[ankle_idx, 1] + offset_y)
-            cv2.line(img, (ax, ay), (fx, fy), foot_color, 2)
-            cv2.circle(img, (fx, fy), 4, foot_color, -1)
+            foot = self._original_point(
+                self.request.foot_keypoints[foot_index]
+            )
+            ankle = self._original_point(self.request.keypoints[ankle_index])
+            color = (
+                self.LEFT_FOOT_COLOR
+                if foot_index < 3
+                else self.RIGHT_FOOT_COLOR
+            )
+            cv2.line(self.request.image, ankle, foot, color, 2)
+            cv2.circle(self.request.image, foot, 4, color, -1)
 
-    return img
+    def _original_point(self, point):
+        offset_x, offset_y = self.request.offset
+        return int(point[0] + offset_x), int(point[1] + offset_y)
+
+    def _foot_point_is_visible(self, foot_index):
+        return (
+            self.request.foot_scores is None
+            or self.request.foot_scores[foot_index] >= self.FOOT_SCORE_THRESHOLD
+        )
+
+    def _draw_joint(self, point):
+        cv2.circle(
+            self.request.image,
+            point,
+            thickness=-1,
+            color=self.JOINT_COLOR,
+            radius=2,
+        )
+
+
+def draw_pose_on_original_frame(request):
+    """在原始影格繪製 H36M 17 關節骨架與可選的腳部關節。"""
+    return _OriginalPoseRenderer(request).render()
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +284,13 @@ def _draw_skeleton_on_frame(frame, sources, v_idx):
     if v_idx not in sources.kps_map:
         return frame
     off_x, off_y = sources.offsets[v_idx]
-    return show2Dpose_original(
-        sources.kps_map[v_idx], frame, off_x, off_y,
-        foot_kps=sources.foot_kps_map.get(v_idx),
+    return draw_pose_on_original_frame(PoseOverlayRequest(
+        keypoints=sources.kps_map[v_idx],
+        image=frame,
+        offset=(off_x, off_y),
+        foot_keypoints=sources.foot_kps_map.get(v_idx),
         foot_scores=sources.foot_scores_map.get(v_idx),
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -298,20 +355,33 @@ def _open_per_camera_writers(sources, output_paths):
     return writers
 
 
-def _annotate_landing(frame, row, cam_history, total_steps, contact_display):
+@dataclass(frozen=True)
+class _LandingAnnotation:
+    """單幀落地資訊疊圖所需的資料。"""
+
+    frame: "np.ndarray"
+    ankle_row: object
+    camera_history: list
+    total_steps: int
+    contact_display: object
+
+
+def _annotate_landing(request):
     """在一幀上畫腳踝點、過去 20 個落地事件標記、時間/步數文字。"""
     from scripts.analysis.ankle_step_stride import TEXT_COLOR
 
+    frame = request.frame
+    row = request.ankle_row
     if row:
         cv2.circle(frame, (int(row["right_ankle_x"]), int(row["right_ankle_y"])), 3, (0, 0, 255), -1)
         cv2.circle(frame, (int(row["left_ankle_x"]), int(row["left_ankle_y"])), 3, (255, 0, 0), -1)
 
-    for past in cam_history[-20:]:
+    for past in request.camera_history[-20:]:
         # homography_lateral_valid 只在 homography 相機上設定；False = 該點世界座標
         # 被標為離群值 → 不畫。
         if past.get("homography_lateral_valid") is False:
             continue
-        px, py, colour, joint_tag = contact_display(past)
+        px, py, colour, joint_tag = request.contact_display(past)
         cv2.circle(frame, (px, py), 6, TEXT_COLOR, 2)
         cv2.circle(frame, (px, py), 3, colour, -1)
         label = f"S{past['step_index']} {joint_tag}"
@@ -326,89 +396,116 @@ def _annotate_landing(frame, row, cam_history, total_steps, contact_display):
     if row:
         cv2.putText(frame, f"Time: {row['seq_time_s']:.2f}s", (30, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
-    cv2.putText(frame, f"Steps: {total_steps}", (30, 78),
+    cv2.putText(frame, f"Steps: {request.total_steps}", (30, 78),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, TEXT_COLOR, 2, cv2.LINE_AA)
 
 
-def overlay_videos_per_camera(cameras, offsets_npz, kps_npz, ankle_rows, step_events,
-                              output_paths, config=None):
-    """
-    同 overlay_videos()（骨架疊圖），但額外疊上落地點標註，且每台相機
-    各自輸出一支影片（不拼接）。output_paths 長度需與相機數一致，
-    某相機不輸出時該項傳 None。
-    """
-    from scripts.analysis.ankle_step_stride import _event_contact_display
+@dataclass(frozen=True)
+class PerCameraOverlayRequest:
+    """產生各相機骨架與落地點回顧影片所需的完整輸入。"""
 
-    sources = _load_overlay_sources(cameras, offsets_npz, kps_npz, config)
-    rows_by_seq = {int(r["seq_frame"]): r for r in ankle_rows}
-    events_by_seq = {int(e["seq_frame"]): e for e in step_events}
-    event_history_by_cam = {}
-
-    writers = _open_per_camera_writers(sources, output_paths)
-    print(f"[Core.Overlay] 正在輸出各相機獨立骨架+落地點疊圖影片（相機數: {len(writers)}）")
-
-    with tqdm(total=len(sources.orig_frames), desc="Per-camera overlaying") as pbar:
-        for v_idx, c_idx, frame in _iter_original_frames(sources, wanted_cams=set(writers)):
-            if frame is not None:
-                cam_cfg = sources.cameras[c_idx] if c_idx < len(sources.cameras) else {}
-                _draw_lines(frame, cam_cfg.get('start_line'), cam_cfg.get('end_line'),
-                            cam_cfg.get('homography_src_points'))
-                frame = _draw_skeleton_on_frame(frame, sources, v_idx)
-
-                event = events_by_seq.get(v_idx)
-                if event:
-                    event_history_by_cam.setdefault(c_idx, []).append(event)
-                total_steps = sum(len(h) for h in event_history_by_cam.values())
-                _annotate_landing(frame, rows_by_seq.get(v_idx),
-                                  event_history_by_cam.get(c_idx, []),
-                                  total_steps, _event_contact_display)
-                writers[c_idx].write(frame)
-            pbar.update(1)
-
-    for w in writers.values():
-        w.release()
-    print(f"✅ [Core.Overlay] 各相機獨立疊圖完成，共 {len(writers)} 支影片")
+    cameras: list
+    offsets_npz: str
+    keypoints_npz: str
+    ankle_rows: list
+    step_events: list
+    output_paths: list
+    config: object = None
 
 
+class _PerCameraOverlayRenderer:
+    """管理各相機 overlay 的資料索引、逐幀繪製與輸出資源。"""
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--orig_video',   required=True,
-                        help="第一台相機影片路徑（單相機模式，或作為 config 比對用）")
-    parser.add_argument('--offsets_npz',  required=True)
-    parser.add_argument('--kps_npz',      required=True)
-    parser.add_argument('--config_yaml',  default=None)
-    parser.add_argument('--config_json',  default=None)
-    parser.add_argument('--output_video', required=True)
-    return parser.parse_args()
+    def __init__(self, request):
+        from scripts.analysis.ankle_step_stride import _event_contact_display
+
+        self.sources = _load_overlay_sources(
+            request.cameras,
+            request.offsets_npz,
+            request.keypoints_npz,
+            request.config,
+        )
+        self.ankle_rows = {
+            int(row["seq_frame"]): row for row in request.ankle_rows
+        }
+        self.events = {
+            int(event["seq_frame"]): event for event in request.step_events
+        }
+        self.event_history = {}
+        self.contact_display = _event_contact_display
+        self.writers = _open_per_camera_writers(
+            self.sources,
+            request.output_paths,
+        )
+
+    def render(self):
+        """逐幀寫入各相機回顧影片，並確保所有 writer 都會釋放。"""
+        print(
+            "[Core.Overlay] 正在輸出各相機獨立骨架+落地點疊圖影片"
+            f"（相機數: {len(self.writers)}）"
+        )
+        try:
+            self._render_frames()
+        finally:
+            self._release_writers()
+        print(
+            "✅ [Core.Overlay] 各相機獨立疊圖完成，"
+            f"共 {len(self.writers)} 支影片"
+        )
+
+    def _render_frames(self):
+        wanted_cameras = set(self.writers)
+        with tqdm(
+            total=len(self.sources.orig_frames),
+            desc="Per-camera overlaying",
+        ) as progress:
+            for sequence_frame, camera_index, frame in _iter_original_frames(
+                self.sources,
+                wanted_cams=wanted_cameras,
+            ):
+                if frame is not None:
+                    self._render_frame(sequence_frame, camera_index, frame)
+                progress.update(1)
+
+    def _render_frame(self, sequence_frame, camera_index, frame):
+        camera = self._camera_config(camera_index)
+        _draw_lines(
+            frame,
+            camera.get('start_line'),
+            camera.get('end_line'),
+            camera.get('homography_src_points'),
+        )
+        frame = _draw_skeleton_on_frame(frame, self.sources, sequence_frame)
+        camera_history = self._record_event(sequence_frame, camera_index)
+        _annotate_landing(_LandingAnnotation(
+            frame=frame,
+            ankle_row=self.ankle_rows.get(sequence_frame),
+            camera_history=camera_history,
+            total_steps=self._total_steps(),
+            contact_display=self.contact_display,
+        ))
+        self.writers[camera_index].write(frame)
+
+    def _camera_config(self, camera_index):
+        if camera_index < len(self.sources.cameras):
+            return self.sources.cameras[camera_index]
+        return {}
+
+    def _record_event(self, sequence_frame, camera_index):
+        camera_history = self.event_history.setdefault(camera_index, [])
+        event = self.events.get(sequence_frame)
+        if event:
+            camera_history.append(event)
+        return camera_history
+
+    def _total_steps(self):
+        return sum(len(history) for history in self.event_history.values())
+
+    def _release_writers(self):
+        for writer in self.writers.values():
+            writer.release()
 
 
-def run_cli(args=None):
-    if args is None:
-        args = parse_args()
-
-    config = None
-    if args.config_yaml:
-        with open(args.config_yaml, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-    elif args.config_json:
-        config = json.loads(args.config_json)
-    else:
-        print("Error: --config_yaml or --config_json is required.")
-        sys.exit(1)
-
-    # 從 config 取出相機清單（若沒有就用 orig_video 建一台）
-    cfg_cams = config.get('cameras', [])
-    if cfg_cams:
-        cameras = [
-            {
-                'video_path': cam.get('video_path'),
-                'start_line': cam.get('start_line'),
-                'end_line':   cam.get('end_line'),
-            }
-            for cam in cfg_cams
-        ]
-    else:
-        cameras = [{'video_path': args.orig_video}]
-
-    overlay_videos(cameras, args.offsets_npz, args.kps_npz, args.output_video, config=config)
+def overlay_videos_per_camera(request):
+    """分別輸出各相機的骨架與落地點回顧影片。"""
+    _PerCameraOverlayRenderer(request).render()
