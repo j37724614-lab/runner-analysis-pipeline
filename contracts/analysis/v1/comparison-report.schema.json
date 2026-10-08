@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runner-analysis.local/contracts/analysis/v1/comparison-report.schema.json",
+  "title": "ComparisonReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "comparison_group_id", "request_id", "server_run_id", "local_run_id", "created_at", "status", "input_hashes_match", "metric_differences", "performance", "warnings"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "comparison_group_id": {"type": "string", "format": "uuid"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "server_run_id": {"type": "string", "format": "uuid"},
+    "local_run_id": {"type": "string", "format": "uuid"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["complete", "partial", "not_comparable"]},
+    "input_hashes_match": {"type": "boolean"},
+    "metric_differences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["metric", "server_value", "local_value", "absolute_difference", "relative_difference_percent", "tolerance", "within_tolerance", "unit"],
+        "properties": {
+          "metric": {"type": "string", "minLength": 1},
+          "server_value": {"type": ["number", "null"]},
+          "local_value": {"type": ["number", "null"]},
+          "absolute_difference": {"type": ["number", "null"], "minimum": 0},
+          "relative_difference_percent": {"type": ["number", "null"], "minimum": 0},
+          "tolerance": {"type": "number", "minimum": 0},
+          "within_tolerance": {"type": ["boolean", "null"]},
+          "unit": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_duration_seconds", "local_duration_seconds", "local_to_server_ratio"],
+      "properties": {
+        "server_duration_seconds": {"type": ["number", "null"], "minimum": 0},
+        "local_duration_seconds": {"type": ["number", "null"], "minimum": 0},
+        "local_to_server_ratio": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"input_hashes_match": {"const": false}}, "required": ["input_hashes_match"]},
+      "then": {"properties": {"status": {"const": "not_comparable"}}}
+    }
+  ]
+}

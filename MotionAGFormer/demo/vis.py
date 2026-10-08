@@ -1317,6 +1317,17 @@ def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None,
         profiling=profiling,
     )
 
+    # Preserve the model-native COCO WholeBody23 output before the legacy
+    # COCO -> H36M conversion below.  The pipeline still writes/consumes the
+    # existing H36M17 and foot files unchanged; this raw handoff is used later
+    # to publish a canonical original-video-coordinate artifact shared with
+    # the on-device implementation.
+    wholebody23_raw = None
+    wholebody23_scores_raw = None
+    if keypoints.shape[2] == 23:
+        wholebody23_raw = keypoints.copy()
+        wholebody23_scores_raw = scores.copy()
+
     # HRNet 現在輸出 17 個 COCO body 點 + 6 個 COCO-WholeBody 腳部點（大腳趾/小腳趾/腳跟 x 左右）。
     # MotionAGFormer 3D 模型架構固定 17 關節，所以只有前 17 點會進入既有 pipeline；
     # 腳部點另外存檔，不參與 H36M 轉換、平滑或 3D lifting。
@@ -1371,6 +1382,13 @@ def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None,
 
     output_2d_dir = os.path.join(output_dir, 'input_2D')
     _reset_dir(output_2d_dir)
+
+    if wholebody23_raw is not None:
+        np.savez_compressed(
+            os.path.join(output_2d_dir, 'wholebody23_raw.npz'),
+            keypoints=wholebody23_raw,
+            scores=wholebody23_scores_raw,
+        )
 
     output_npz = os.path.join(output_2d_dir, 'keypoints.npz')
     np.savez_compressed(output_npz, reconstruction=keypoints, valid_frames=valid_frames)

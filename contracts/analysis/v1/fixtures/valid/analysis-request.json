@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "11111111-1111-4111-8111-111111111111",
+  "analysis_kind": "running",
+  "compute_targets": ["server", "local"],
+  "cameras": [
+    {
+      "camera_index": 0,
+      "video": {
+        "uri": "inputs/cam0.mov",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fps": 59.94,
+        "width": 1920,
+        "height": 1080,
+        "frame_count": 727,
+        "rotation_degrees": 0
+      },
+      "calibration": {
+        "start_line": [[100, 700], [100, 900]],
+        "end_line": [[1800, 700], [1800, 900]],
+        "distance_m": 20,
+        "homography_image_points": [[100, 700], [100, 900], [1800, 700], [1800, 900]],
+        "homography_world_points_m": [[0, 0], [0, 1.22], [20, 0], [20, 1.22]]
+      }
+    }
+  ],
+  "output_policy": {
+    "include_pose_data": true,
+    "include_overlays": true
+  }
+}

@@ -274,6 +274,7 @@ from core.pipeline.final_export import (
     _export_trial_topdown_reviews,
     _finish_analysis_timing,
     _print_step_analysis_summary,
+    _publish_wholebody23_comparison_artifact,
     _read_primary_summary_metrics,
     _run_analysis_post_processing,
     _run_base_analysis_pipeline,
@@ -284,6 +285,7 @@ from core.pipeline.final_export import (
     calculate_summary_metrics,
     export_analysis_videos,
     run_analysis,
+    run_analysis_with_manifest,
 )
 from core.pipeline.homography_review import (
     CameraHomographyInputs,
@@ -484,6 +486,7 @@ __all__ = [
     "_prescan_person_frame_ranges",
     "_print_pose_estimation_plan",
     "_print_step_analysis_summary",
+    "_publish_wholebody23_comparison_artifact",
     "_publish_corrected_angle_csv",
     "_read_primary_summary_metrics",
     "_read_video_frames_per_second",
@@ -548,6 +551,7 @@ __all__ = [
     "refresh_step_analysis_after_leg_correction",
     "replace",
     "run_analysis",
+    "run_analysis_with_manifest",
     "run_leg_identity_analysis",
     "run_pipeline",
     "run_speed_analysis",

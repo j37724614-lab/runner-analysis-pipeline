@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runner-analysis.local/contracts/analysis/v1/analysis-request.schema.json",
+  "title": "AnalysisRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "analysis_kind", "compute_targets", "cameras", "output_policy"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "analysis_kind": {"enum": ["running", "long_jump"]},
+    "compute_targets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {"enum": ["server", "local"]}
+    },
+    "cameras": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/camera"}
+    },
+    "output_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include_pose_data", "include_overlays"],
+      "properties": {
+        "include_pose_data": {"type": "boolean"},
+        "include_overlays": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "point": {
+      "type": "array",
+      "prefixItems": [{"type": "number"}, {"type": "number"}],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "line": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/point"},
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "video": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "sha256", "fps", "width", "height", "frame_count", "rotation_degrees"],
+      "properties": {
+        "uri": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "fps": {"type": "number", "exclusiveMinimum": 0},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "frame_count": {"type": "integer", "minimum": 1},
+        "rotation_degrees": {"enum": [0, 90, 180, 270]}
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start_line": {"$ref": "#/$defs/line"},
+        "end_line": {"$ref": "#/$defs/line"},
+        "distance_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "homography_image_points": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/point"},
+          "minItems": 4
+        },
+        "homography_world_points_m": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/point"},
+          "minItems": 4
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["camera_index", "video"],
+      "properties": {
+        "camera_index": {"type": "integer", "minimum": 0},
+        "video": {"$ref": "#/$defs/video"},
+        "calibration": {"$ref": "#/$defs/calibration"}
+      }
+    }
+  }
+}

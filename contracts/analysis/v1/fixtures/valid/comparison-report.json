@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "comparison_group_id": "44444444-4444-4444-8444-444444444444",
+  "request_id": "11111111-1111-4111-8111-111111111111",
+  "server_run_id": "66666666-6666-4666-8666-666666666666",
+  "local_run_id": "33333333-3333-4333-8333-333333333333",
+  "created_at": "2026-10-04T12:02:00Z",
+  "status": "complete",
+  "input_hashes_match": true,
+  "metric_differences": [
+    {
+      "metric": "summary.average_speed_mps",
+      "server_value": 8.72,
+      "local_value": 8.70,
+      "absolute_difference": 0.02,
+      "relative_difference_percent": 0.23,
+      "tolerance": 0.1,
+      "within_tolerance": true,
+      "unit": "m/s"
+    }
+  ],
+  "performance": {
+    "server_duration_seconds": 18.0,
+    "local_duration_seconds": 26.4,
+    "local_to_server_ratio": 1.47
+  },
+  "warnings": []
+}

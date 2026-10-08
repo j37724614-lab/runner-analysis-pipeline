@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runner-analysis.local/contracts/analysis/v1/analysis-result-manifest.schema.json",
+  "title": "AnalysisResultManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "run_id", "compute_location", "status", "created_at", "config_sha256", "engine", "input_videos", "coordinate_system", "stages", "summary", "artifacts", "warnings"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "request_id": {"type": "string", "format": "uuid"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "comparison_group_id": {"type": ["string", "null"], "format": "uuid"},
+    "compute_location": {"enum": ["server", "local"]},
+    "status": {"enum": ["completed", "degraded", "failed"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "config_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "models"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+              "compute_units": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "input_videos": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["camera_index", "sha256"],
+        "properties": {
+          "camera_index": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "coordinate_system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pose2d_origin", "x_axis", "y_axis", "pose2d_unit", "bbox_format", "joint_order"],
+      "properties": {
+        "pose2d_origin": {"const": "top_left"},
+        "x_axis": {"const": "right"},
+        "y_axis": {"const": "down"},
+        "pose2d_unit": {"const": "original_video_pixel"},
+        "bbox_format": {"const": "x1_y1_x2_y2"},
+        "joint_order": {
+          "const": ["nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle", "left_big_toe", "left_small_toe", "left_heel", "right_big_toe", "right_small_toe", "right_heel"]
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": {"enum": ["validating", "prescan", "tracking", "pose2d", "pose3d", "speed", "gait", "export", "sync"]},
+          "status": {"enum": ["completed", "skipped", "failed"]},
+          "duration_seconds": {"type": ["number", "null"], "minimum": 0},
+          "warnings": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_time_seconds", "average_speed_mps", "average_acceleration_mps2", "detected_steps", "average_cadence_spm", "average_step_length_m"],
+      "properties": {
+        "total_time_seconds": {"type": "number", "minimum": 0},
+        "average_speed_mps": {"type": ["number", "null"]},
+        "average_acceleration_mps2": {"type": ["number", "null"]},
+        "detected_steps": {"type": ["integer", "null"], "minimum": 0},
+        "average_cadence_spm": {"type": ["number", "null"], "minimum": 0},
+        "average_step_length_m": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact"}
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "type", "media_type", "relative_path", "sha256", "size_bytes"],
+      "properties": {
+        "artifact_id": {"type": "string", "format": "uuid"},
+        "type": {"enum": ["metrics", "angles", "steps", "pose2d", "pose3d", "overlay", "timing", "diagnostics", "other"]},
+        "media_type": {"type": "string", "minLength": 1},
+        "relative_path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "camera_index": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  }
+}

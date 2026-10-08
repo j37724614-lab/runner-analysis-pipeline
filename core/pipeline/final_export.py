@@ -1,9 +1,17 @@
 """最終回顧影片輸出（骨架疊圖、逐相機回顧、俯視回顧）、統計彙總，以及 run_analysis() 總入口。"""
 import os
 import time
+from collections.abc import Mapping
+from pathlib import Path
+from uuid import UUID
 
 import pandas as pd
 
+from core.contracts import (
+    ServerManifestRequest,
+    write_server_manifest,
+    write_wholebody23_artifact,
+)
 from core.overlay import (
     PerCameraOverlayRequest,
     overlay_videos,
@@ -42,6 +50,8 @@ from .orchestration import (
     AnalysisState,
     PipelineOptions,
     PipelineRequest,
+    _normalize_analysis_config,
+    _resolve_analysis_output_directory,
     prepare_analysis_context,
     run_pipeline,
 )
@@ -428,6 +438,40 @@ def _analysis_state_from_pipeline_result(
     )
 
 
+def _publish_wholebody23_comparison_artifact(
+    context: AnalysisContext,
+    state: AnalysisState,
+) -> str | None:
+    """Publish model-native WholeBody23 in Local's canonical JSON shape."""
+    raw_npz = os.path.join(
+        state.final_pose_dir,
+        "input_2D",
+        "wholebody23_raw.npz",
+    )
+    if not os.path.isfile(raw_npz):
+        return None
+    if not context.cameras or not context.cameras[0].get("video_path"):
+        raise ValueError("WholeBody23 export requires at least one camera video path")
+
+    first_camera_stem = Path(context.cameras[0]["video_path"]).stem
+    offsets_npz = os.path.join(context.output_dest, f"{first_camera_stem}_offsets.npz")
+    tracked_video_stem = (
+        Path(state.tracked_video).stem if state.tracked_video else first_camera_stem
+    )
+    bbox_map_csv = os.path.join(
+        context.output_dest,
+        f"{tracked_video_stem}_bbox_map.csv",
+    )
+    destination = os.path.join(context.output_dest, "pose", "keypoints_2d.json")
+    return str(write_wholebody23_artifact(
+        raw_npz=raw_npz,
+        offsets_npz=offsets_npz,
+        bbox_map_csv=bbox_map_csv,
+        destination=destination,
+        frames_per_second=_first_camera_fps(context),
+    ))
+
+
 def _run_analysis_post_processing(
     context: AnalysisContext,
     state: AnalysisState,
@@ -459,7 +503,42 @@ def run_analysis(
     _remove_stale_angle_csv(context.output_dest)
     context.report_progress(PROGRESS_POSE_COMPLETED)
     state = _analysis_state_from_pipeline_result(context, pipeline_result)
+    _publish_wholebody23_comparison_artifact(context, state)
     _run_analysis_post_processing(context, state)
     print("\n" + OUTPUT_SEPARATOR)
     context.report_progress(PROGRESS_ANALYSIS_COMPLETED)
     return calculate_summary_metrics(context, state)
+
+
+def run_analysis_with_manifest(
+    analysis_config: dict,
+    options: AnalysisOptions | None = None,
+    *,
+    engine_version: str = "unknown",
+    model_files: Mapping[str, str | os.PathLike[str]] | None = None,
+    comparison_group_id: str | UUID | None = None,
+) -> dict:
+    """執行 `run_analysis()`（行為與回傳值完全不變），並額外發布一份
+    contract v1 的 `manifest.json` 到同一個輸出目錄（規劃書 §13 Step 3）。
+
+    `output_dir` 刻意不讓呼叫端指定，而是用 `run_analysis()` 內部也會用到的
+    `_normalize_analysis_config` / `_resolve_analysis_output_directory` 重新
+    推導一次——兩者吃同一組 `analysis_config`/`options`，純函式、無副作用，
+    保證跟 `run_analysis()` 實際寫檔的目錄一致，不需要修改 `run_analysis()`
+    本身去外洩內部 `context`。
+    """
+    resolved_options = options or AnalysisOptions()
+    result = run_analysis(analysis_config, resolved_options)
+
+    normalized_config = _normalize_analysis_config(analysis_config)
+    output_dir = _resolve_analysis_output_directory(normalized_config, resolved_options)
+    request = ServerManifestRequest(
+        analysis_config=analysis_config,
+        legacy_result=result,
+        output_dir=output_dir,
+        engine_version=engine_version,
+        model_files=model_files or {},
+        comparison_group_id=comparison_group_id,
+    )
+    write_server_manifest(request)
+    return result
