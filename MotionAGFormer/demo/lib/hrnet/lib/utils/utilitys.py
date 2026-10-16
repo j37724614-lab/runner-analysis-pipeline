@@ -148,7 +148,11 @@ def PreProcess(image, bboxs, cfg, num_pos=2):
     scales = []
 
     for bbox in bboxs[:num_pos]:
-        c, s = box_to_center_scale(bbox, data_numpy.shape[0], data_numpy.shape[1])
+        c, s = box_to_center_scale(
+            bbox,
+            int(cfg.MODEL.IMAGE_SIZE[0]),
+            int(cfg.MODEL.IMAGE_SIZE[1]),
+        )
         centers.append(c)
         scales.append(s)
         r = 0

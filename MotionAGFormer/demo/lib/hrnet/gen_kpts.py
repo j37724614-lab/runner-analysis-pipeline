@@ -17,6 +17,7 @@ import cv2
 import copy
 
 from lib.hrnet.lib.utils.utilitys import plot_keypoint, PreProcess, write, load_json
+from lib.hrnet.lib.utils.pose_crop import TemporalPoseCropStabilizer
 from lib.hrnet.lib.config import cfg, update_config
 from lib.hrnet.lib.utils.transforms import *
 from lib.hrnet.lib.utils.inference import get_final_preds_dark
@@ -99,12 +100,20 @@ def _load_bbox_map(bbox_csv):
     bbox_map = {}
     with open(bbox_csv, newline='', encoding='utf-8') as f:
         for row in csv.DictReader(f):
-            bbox_map[int(row['output_frame'])] = [[
-                float(row['x1']),
-                float(row['y1']),
-                float(row['x2']),
-                float(row['y2']),
-            ]]
+            track_id = row.get('track_id') or None
+            bbox_map[int(row['output_frame'])] = {
+                'bbox': [
+                    float(row['x1']),
+                    float(row['y1']),
+                    float(row['x2']),
+                    float(row['y2']),
+                ],
+                'context': (
+                    int(row.get('cam') or 0),
+                    track_id,
+                    int(row.get('source_frame') or row.get('cam_frame') or 0),
+                ),
+            }
     return bbox_map
 
 
@@ -147,15 +156,18 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
     scores_result = []
     bboxs_pre = None
     scores_pre = None
+    pose_crop_stabilizer = TemporalPoseCropStabilizer()
 
     for ii, item in enumerate(tqdm(frames, total=video_length)):
         frame_started_at = time.perf_counter() if profiling is not None else None
         if frame_source is None:
             ret, frame = item
             supplied_bbox = None
+            pose_context = None
         else:
             frame, supplied_bbox = item
             ret = frame is not None
+            pose_context = None
 
         if not ret:
             continue
@@ -166,12 +178,14 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
                 continue
             bboxs_pre = copy.deepcopy(track_bboxs)
         elif bbox_map is not None:
-            track_bboxs = bbox_map.get(ii)
-            if not track_bboxs:
+            bbox_entry = bbox_map.get(ii)
+            if not bbox_entry:
                 if bboxs_pre is None:
                     continue
                 track_bboxs = bboxs_pre
             else:
+                track_bboxs = [bbox_entry['bbox']]
+                pose_context = bbox_entry['context']
                 bboxs_pre = copy.deepcopy(track_bboxs)
         else:
             bboxs, scores = yolo_det(frame, human_model, reso=det_dim, confidence=args.thred_score)
@@ -203,6 +217,13 @@ def gen_video_kpts(video, det_dim=416, num_peroson=1, gen_output=False,
                 bbox = [round(i, 2) for i in list(bbox)]
                 track_bboxs.append(bbox)
             bboxs_pre = copy.deepcopy(track_bboxs)
+
+        if len(track_bboxs) == 1:
+            track_bboxs = [[*pose_crop_stabilizer.update(
+                track_bboxs[0],
+                frame_size=(frame.shape[1], frame.shape[0]),
+                context=pose_context,
+            )]]
 
         with torch.no_grad():
             # bbox is coordinate location

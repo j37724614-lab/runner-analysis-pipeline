@@ -45,11 +45,19 @@ def _write_two_pass_debug(all_detections, summaries, preset_ids, base_name):
 
 
 def _auto_crop_side_from_bbox_sizes(widths, heights):
-    """依 bbox 寬高樣本計算 auto square crop 邊長。"""
+    """Return a square that contains the padded 288x384 HRNet source view."""
     if not widths or not heights:
         return None
-    p90_side = max(np.percentile(widths, 90), np.percentile(heights, 90)) * 1.25
-    max_side = max(max(widths), max(heights)) * 1.05
+    pose_aspect = 288.0 / 384.0
+    safety_scale = 1.25
+    p90_side = max(
+        np.percentile(heights, 90),
+        np.percentile(widths, 90) / pose_aspect,
+    ) * safety_scale
+    max_side = max(
+        max(heights),
+        max(widths) / pose_aspect,
+    ) * safety_scale
     return int(np.ceil(max(p90_side, max_side)))
 
 
