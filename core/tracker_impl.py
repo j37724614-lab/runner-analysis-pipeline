@@ -490,6 +490,67 @@ def _resolve_camera_fps(cam, fps_override):
     return fps or 60.0
 
 
+def _stabilize_bbox_speed_points(points):
+    """Repair isolated YOLO box jumps before calibration projection.
+
+    The five-frame gate and three-frame median mirror Local
+    ``GroundPointStabilizer``.  Only scalar coordinates are retained, so this
+    adds negligible memory and no model inference.
+    """
+    if not points:
+        return []
+    stabilized = [dict(point, repaired=False, outlier=False) for point in points]
+    for index in range(2, len(stabilized) - 2):
+        point = stabilized[index]
+        window = stabilized[index - 2:index + 3]
+        median_x = float(np.median([item['center_x'] for item in window]))
+        median_center_y = float(np.median([item['center_y'] for item in window]))
+        median_bottom_y = float(np.median([item['bottom_y'] for item in window]))
+        median_width = max(1.0, float(np.median([item['width'] for item in window])))
+        median_height = max(1.0, float(np.median([item['height'] for item in window])))
+        center_residual = float(np.hypot(
+            point['center_x'] - median_x,
+            point['center_y'] - median_center_y,
+        ))
+        bottom_residual = float(np.hypot(
+            point['center_x'] - median_x,
+            point['bottom_y'] - median_bottom_y,
+        ))
+        residual = max(center_residual, bottom_residual)
+        limit = max(8.0, median_height * 0.12)
+        width_ratio = point['width'] / median_width
+        height_ratio = point['height'] / median_height
+        size_jump = (
+            width_ratio < 0.70 or width_ratio > 1.30
+            or height_ratio < 0.70 or height_ratio > 1.30
+        )
+        if residual > limit or (size_jump and residual > limit * 0.55):
+            point['outlier'] = True
+
+    valid = [index for index, point in enumerate(stabilized) if not point['outlier']]
+    if not valid:
+        return stabilized
+    coordinate_keys = ('center_x', 'center_y', 'bottom_y')
+    for left, right in pairwise(valid):
+        if right <= left + 1:
+            continue
+        for index in range(left + 1, right):
+            ratio = (index - left) / (right - left)
+            for key in coordinate_keys:
+                stabilized[index][key] = (
+                    stabilized[left][key]
+                    + (stabilized[right][key] - stabilized[left][key]) * ratio
+                )
+            stabilized[index]['repaired'] = True
+    original = [dict(point) for point in stabilized]
+    for index in range(1, len(stabilized) - 1):
+        for key in coordinate_keys:
+            stabilized[index][key] = float(np.median([
+                original[index - 1][key], original[index][key], original[index + 1][key],
+            ]))
+    return stabilized
+
+
 def _pixel_distance_for_point(pixel_cam, cx_orig, cy_orig, dist_offset_m):
     """Legacy pixel calibration: bbox centre projected onto the start/end-line
     direction and scaled by that line's known metres-per-pixel. None when the
@@ -561,6 +622,7 @@ class _CameraDistanceSamples:
     world_points: list = field(default_factory=list)
     image_points: list = field(default_factory=list)
     interpolated_mask: list = field(default_factory=list)
+    measurement_confidence: list = field(default_factory=list)
     source_frames: list = field(default_factory=list)
 
 
@@ -649,6 +711,10 @@ class _BBoxSpeedCalculator:
             return []
 
         gap_lengths, confidence = _interpolation_metadata(samples.interpolated_mask)
+        confidence = [
+            min(value, samples.measurement_confidence[index])
+            for index, value in enumerate(confidence)
+        ]
         pixel_series = self._smooth_pixel_series(samples, fps, confidence)
         homography_series = self._smooth_homography_series(samples, fps, confidence)
         self._update_continuity(pixel_series, homography_series)
@@ -680,6 +746,7 @@ class _BBoxSpeedCalculator:
         crop_x = crop_params[0] if crop_params else 0
         crop_y = crop_params[1] if crop_params else 0
 
+        point_rows = []
         for row in camera_rows:
             source_frame = int(row['source_frame'])
             frame_x, frame_y = self.offset_map.get(
@@ -691,6 +758,23 @@ class _BBoxSpeedCalculator:
             center_x = (x1 + x2) / 2.0 + frame_x + crop_x
             center_y = (y1 + y2) / 2.0 + frame_y + crop_y
             bottom_y = y2 + frame_y + crop_y
+
+            point_rows.append({
+                'row': row,
+                'source_frame': source_frame,
+                'center_x': center_x,
+                'center_y': center_y,
+                'bottom_y': bottom_y,
+                'width': max(1, x2 - x1),
+                'height': max(1, y2 - y1),
+            })
+
+        for point in _stabilize_bbox_speed_points(point_rows):
+            row = point['row']
+            source_frame = point['source_frame']
+            center_x = point['center_x']
+            center_y = point['center_y']
+            bottom_y = point['bottom_y']
 
             samples.pixel.append(_pixel_distance_for_point(
                 pixel_camera,
@@ -708,8 +792,9 @@ class _BBoxSpeedCalculator:
             samples.world_points.append(world_point)
             samples.image_points.append(image_point)
             samples.interpolated_mask.append(
-                bool(int(row.get('is_interpolated', 0)))
+                bool(int(row.get('is_interpolated', 0))) or point['repaired']
             )
+            samples.measurement_confidence.append(0.25 if point['repaired'] else 1.0)
             samples.source_frames.append(source_frame)
         return samples
 
