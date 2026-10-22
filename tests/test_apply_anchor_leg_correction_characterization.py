@@ -25,7 +25,7 @@ _SWAPPED_MASK = [
     0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
     0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
 ]
-_LEG_CHECKSUM = 36073.7131
+_LEG_CHECKSUM = 36060.0
 
 
 def _synthetic_recon(frames=30, label_error_frames=range(10, 20)):

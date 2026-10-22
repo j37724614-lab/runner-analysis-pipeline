@@ -426,10 +426,6 @@ _POST_DP_SG_WINDOWS = {
     R_HIP: 11, R_KNEE: 7, R_ANKLE: 3,
     L_HIP: 11, L_KNEE: 7, L_ANKLE: 3,
 }
-_LEG_BONES = (
-    (R_HIP, R_KNEE), (R_KNEE, R_ANKLE),
-    (L_HIP, L_KNEE), (L_KNEE, L_ANKLE),
-)
 _KNEE_LIMITS = (
     (R_HIP, R_KNEE, R_ANKLE, KNEE_MIN_ANGLE_DEG),
     (L_HIP, L_KNEE, L_ANKLE, KNEE_MIN_ANGLE_DEG),
@@ -447,25 +443,6 @@ def _smooth_leg_trajectories(keypoints, person_idx, frame_count, polynomial_orde
                 keypoints[person_idx, :, joint_idx, coordinate],
                 window, polynomial_order, mode="mirror",
             )
-
-
-def _normalize_leg_bone_lengths(keypoints, person_idx, blend):
-    for parent_idx, child_idx in _LEG_BONES:
-        difference = keypoints[person_idx, :, child_idx] - keypoints[person_idx, :, parent_idx]
-        lengths = np.linalg.norm(difference, axis=1)
-        valid = lengths > 1.0
-        if valid.sum() < 2:
-            continue
-        reference = float(np.median(lengths[valid]))
-        ratios = np.where(valid, reference / lengths, 1.0)
-        adjust = np.abs(ratios - 1.0) > 0.10
-        if not np.any(adjust):
-            continue
-        normalized = keypoints[person_idx, :, parent_idx] + difference * ratios[:, None]
-        keypoints[person_idx, adjust, child_idx] = (
-            (1.0 - blend) * keypoints[person_idx, adjust, child_idx]
-            + blend * normalized[adjust]
-        )
 
 
 def _rotate_ankle_to_minimum_knee_angle(keypoints, person_idx, specification):
@@ -498,13 +475,17 @@ def _rotate_ankle_to_minimum_knee_angle(keypoints, person_idx, specification):
         keypoints[person_idx, frame_idx, ankle_idx] = knee[frame_idx] + rotated
 
 
-def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2, bone_blend=0.8):
-    """Smooth and constrain leg geometry after DP has resolved L/R identity."""
+def _post_dp_smooth_and_limit_legs(recon, sg_polyorder=2):
+    """Smooth and constrain leg geometry after DP has resolved L/R identity.
+
+    Leg bone lengths are deliberately not normalized: on-screen thigh/shank
+    length changes with camera distance and foreshortening, so pulling it back
+    to a per-video median moves correct ankles.
+    """
     person_count, frame_count = recon.shape[:2]
     keypoints = recon[:, :, :, :2].astype(np.float64, copy=True)
     for person_idx in range(person_count):
         _smooth_leg_trajectories(keypoints, person_idx, frame_count, sg_polyorder)
-        _normalize_leg_bone_lengths(keypoints, person_idx, bone_blend)
         for specification in _KNEE_LIMITS:
             _rotate_ankle_to_minimum_knee_angle(keypoints, person_idx, specification)
     recon[:, :, :, :2] = keypoints
