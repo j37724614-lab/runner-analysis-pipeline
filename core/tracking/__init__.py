@@ -72,7 +72,8 @@ TRACKING_MODE = 'two_pass'
 
 # Optional temporal pre-scan for the two-pass tracking flow.
 # It scans sampled frames with a TensorRT INT8 YOLO engine, finds ranges where
-# a valid person appears, expands the ranges with buffer, and limits both
+# a person moves quickly over a large distance, expands the ranges with buffer,
+# and limits both
 # two-pass Pass 1 and Pass 2 to those original-frame ranges.
 PRESCAN_ENABLED = False
 PRESCAN_ENGINE_PATH = get_model_path("yolo26x_ultralytics_int8.engine")
@@ -80,9 +81,14 @@ PRESCAN_STRIDE = 15
 PRESCAN_IMGSZ = 640
 PRESCAN_CONF = 0.25
 PRESCAN_IOU = 0.7
-PRESCAN_BUFFER_SEC = 0.5
-PRESCAN_MAX_GAP_SEC = 1.0
+PRESCAN_BUFFER_SEC = 0.75
+PRESCAN_MAX_GAP_SEC = 0.75
 PRESCAN_USE_GRAB = True
+PRESCAN_MOTION_MIN_SAMPLES = 3
+PRESCAN_MOTION_MIN_DISPLACEMENT_HEIGHTS = 0.75
+PRESCAN_MOTION_MIN_SPEED_HEIGHTS_PER_SEC = 1.2
+PRESCAN_MOTION_MIN_STRAIGHTNESS = 0.75
+PRESCAN_MOTION_MAX_MATCH_DISTANCE_HEIGHTS = 2.0
 
 # 是否在裁剪畫面上疊加框
 #   True  = 綠色 bbox（已選主跑者）+ 藍色 ROI 框
@@ -187,4 +193,19 @@ _TRACKING_CONFIG_FIELDS = {
     'prescan_buffer_sec':  ('PRESCAN_BUFFER_SEC',  float),
     'prescan_max_gap_sec': ('PRESCAN_MAX_GAP_SEC', float),
     'prescan_use_grab':    ('PRESCAN_USE_GRAB',    bool),
+    'prescan_motion_min_samples': (
+        'PRESCAN_MOTION_MIN_SAMPLES', int,
+    ),
+    'prescan_motion_min_displacement_heights': (
+        'PRESCAN_MOTION_MIN_DISPLACEMENT_HEIGHTS', float,
+    ),
+    'prescan_motion_min_speed_heights_per_sec': (
+        'PRESCAN_MOTION_MIN_SPEED_HEIGHTS_PER_SEC', float,
+    ),
+    'prescan_motion_min_straightness': (
+        'PRESCAN_MOTION_MIN_STRAIGHTNESS', float,
+    ),
+    'prescan_motion_max_match_distance_heights': (
+        'PRESCAN_MOTION_MAX_MATCH_DISTANCE_HEIGHTS', float,
+    ),
 }
