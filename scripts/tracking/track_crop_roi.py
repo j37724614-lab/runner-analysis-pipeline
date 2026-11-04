@@ -322,11 +322,6 @@ def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=12, gap_len=8)
         drawing = not drawing
 
 
-def _point_in_quad(point, quad_pts):
-    """判斷 point 是否在四邊形內（含邊界）。quad_pts 為 np.float32 shape=(4,2)。"""
-    return cv2.pointPolygonTest(quad_pts, (float(point[0]), float(point[1])), False) >= 0
-
-
 def _bbox_bottom_center(bbox):
     """回傳 bbox 的底部中心點，較接近跑者落地點。"""
     bx1, by1, bx2, by2 = bbox

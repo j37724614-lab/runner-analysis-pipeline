@@ -9,15 +9,28 @@ per phase can be verified to preserve the returned step_analysis exactly.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.analysis.ankle_step_stride import (  # noqa: E402
+from scripts.analysis import ankle_step_stride as ankle_module
+from scripts.analysis.ankle_step_stride import (
+    StepAnalysisRefreshRequest,
     refresh_step_analysis_after_leg_correction,
 )
+
+
+def _refresh(step_analysis, config, output_dir, keypoints, offsets):
+    return refresh_step_analysis_after_leg_correction(StepAnalysisRefreshRequest(
+        step_analysis=step_analysis,
+        config=config,
+        output_dir=str(output_dir),
+        keypoints_npz=keypoints,
+        offsets_npz=offsets,
+    ))
 
 R_ANKLE, L_ANKLE = 3, 6
 
@@ -63,21 +76,21 @@ def _step_analysis(tmp_path):
 
 def test_returns_input_unchanged_without_step_analysis_or_cameras(tmp_path):
     kp_path, off_path = _write_inputs(tmp_path)
-    assert refresh_step_analysis_after_leg_correction(
-        {}, {"cameras": [{}]}, str(tmp_path), kp_path, off_path
-    ) == {}
+    assert _refresh({}, {"cameras": [{}]}, tmp_path, kp_path, off_path) == {}
     sentinel = {"step_events": _step_events()}
-    assert refresh_step_analysis_after_leg_correction(
-        sentinel, {}, str(tmp_path), kp_path, off_path
-    ) is sentinel
+    assert _refresh(sentinel, {}, tmp_path, kp_path, off_path) is sentinel
 
 
 def test_events_rederived_from_corrected_keypoints_pixel_mode(tmp_path):
     kp_path, off_path = _write_inputs(tmp_path)
     step_analysis = _step_analysis(tmp_path)
 
-    result = refresh_step_analysis_after_leg_correction(
-        step_analysis, {"cameras": [{}]}, str(tmp_path), kp_path, off_path,
+    result = _refresh(
+        step_analysis,
+        {"cameras": [{}]},
+        tmp_path,
+        kp_path,
+        off_path,
     )
 
     assert result is step_analysis  # mutated in place and returned
@@ -106,10 +119,12 @@ def test_long_jump_flag_without_a_detected_flight_is_a_noop(tmp_path):
     kp_path, off_path = _write_inputs(tmp_path)
     step_analysis = _step_analysis(tmp_path)
 
-    result = refresh_step_analysis_after_leg_correction(
+    result = _refresh(
         step_analysis,
         {"cameras": [{}], "long_jump_final_landing": True},
-        str(tmp_path), kp_path, off_path,
+        tmp_path,
+        kp_path,
+        off_path,
     )
 
     events = result["step_events"]
@@ -117,3 +132,249 @@ def test_long_jump_flag_without_a_detected_flight_is_a_noop(tmp_path):
         (6, "right", None), (18, "left", 48.0), (30, "right", 72.0),
     ]
     assert result["avg_cadence_spm"] == pytest.approx(276.923077, abs=1e-5)
+
+
+def test_opt_in_hybrid_algorithm_writes_result_and_adapts_touchdown(
+    tmp_path, monkeypatch,
+):
+    kp_path, off_path = _write_inputs(tmp_path)
+    step_analysis = _step_analysis(tmp_path)
+
+    def fake_detector(request):
+        row = request.ankle_rows[30]
+        return {
+            "detected": True,
+            "algorithm": "anchor_step_hybrid_longest_flight",
+            "camera_id": 0,
+            "takeoff": {"seq_frame": 18},
+            "first_airborne": {"seq_frame": 19},
+            "last_airborne": {"seq_frame": 29},
+            "touchdown": {
+                "seq_frame": 30,
+                "orig_frame": 30,
+                "time_s": 0.5,
+                "seq_time_s": 0.5,
+                "kind": "observed",
+                "foot": "right",
+                "contact_joint": "heel",
+                "contact_x": float(row["right_ankle_x"]),
+                "contact_y": float(row["right_ankle_y"]),
+                "contact_conf": 0.9,
+            },
+            "max_compression": {"seq_frame": 32},
+            "flight_duration_frames": 11,
+            "flight_duration_seconds": 11 / 60,
+            "ground_model": {"source": "anchor_step_hybrid"},
+            "candidates": [],
+            "debug_trace": [],
+            "quality_score": 1.0,
+            "needs_review": False,
+            "reasons": [],
+        }
+
+    monkeypatch.setattr(ankle_module, "detect_running_long_jump", fake_detector)
+    monkeypatch.setattr(
+        ankle_module,
+        "_detect_long_jump_final_landing",
+        lambda *_args: pytest.fail("legacy detector must not run in hybrid mode"),
+    )
+    monkeypatch.setattr(
+        ankle_module,
+        "_recover_terminal_preflight_contacts",
+        lambda *_args: pytest.fail("single-pass hybrid mode must not redetect steps"),
+    )
+
+    result = _refresh(
+        step_analysis,
+        {
+            "cameras": [{}],
+            "long_jump_final_landing": True,
+            "running_long_jump": {
+                "enabled": True,
+                "algorithm": "anchor_step_hybrid_longest_flight",
+            },
+        },
+        tmp_path,
+        kp_path,
+        off_path,
+    )
+
+    landing = result["step_events"][-1]
+    assert landing["event_type"] == "final_landing"
+    assert landing["seq_frame"] == 30
+    assert landing["contact_selection_reason"] == (
+        "long_jump_hybrid_longest_bilateral_flight"
+    )
+    assert result["running_long_jump_result"]["max_compression"]["seq_frame"] == 32
+    result_json = Path(result["running_long_jump_result_json"])
+    assert result_json.exists()
+    assert "anchor_step_hybrid_longest_flight" in result_json.read_text()
+    diagnostic_logs = result["running_long_jump_diagnostic_logs"]
+    for path in diagnostic_logs.values():
+        assert Path(path).exists()
+    frame_log = Path(diagnostic_logs["frame_decisions"]).read_text()
+    assert "decision_reason" in frame_log
+    assert "left_distance_px" in frame_log
+    candidate_log = Path(diagnostic_logs["candidate_decisions"]).read_text()
+    assert "selected" in candidate_log
+
+
+def test_multicamera_boundary_flight_replaces_terminal_false_steps(monkeypatch):
+    rows = [
+        {
+            "seq_frame": frame,
+            "orig_frame": frame,
+            "time_s": frame / 60,
+            "seq_time_s": frame / 60,
+            "cam": 1,
+            "lower_foot": "left",
+            "left_ankle_x": 100.0,
+            "left_ankle_y": 200.0,
+            "left_ankle_conf": 0.9,
+        }
+        for frame in (20, 40)
+    ]
+    prior_contact = {"seq_frame": 19, "cam": 0, "foot": "right"}
+    terminal_false_contact = {"seq_frame": 30, "cam": 1, "foot": "left"}
+    context = SimpleNamespace(
+        ankle_rows=rows,
+        foot_contacts_by_seq={},
+        fps=60.0,
+    )
+
+    def fake_detector(request):
+        assert request.config["allow_initial_airborne_at_camera_boundary"] is True
+        return {
+            "detected": True,
+            "algorithm": "anchor_step_hybrid_longest_flight",
+            "camera_id": 1,
+            "takeoff": None,
+            "first_airborne": {"seq_frame": 20},
+            "last_airborne": {"seq_frame": 39},
+            "touchdown": {
+                "seq_frame": 40,
+                "orig_frame": 40,
+                "time_s": 40 / 60,
+                "seq_time_s": 40 / 60,
+                "kind": "observed",
+                "foot": "left",
+                "contact_joint": "heel",
+                "contact_x": 100.0,
+                "contact_y": 200.0,
+                "contact_conf": 0.9,
+            },
+            "flight_duration_frames": 20,
+        }
+
+    monkeypatch.setattr(ankle_module, "detect_running_long_jump", fake_detector)
+    events, result = ankle_module._apply_hybrid_running_long_jump(
+        [prior_contact, terminal_false_contact],
+        context,
+        [{}, {}],
+        {"enabled": True},
+    )
+
+    assert result["takeoff"]["seq_frame"] == 19
+    assert result["takeoff"]["kind"] == "previous_camera_contact"
+    assert result["event_filter_trace"] == [
+        {
+            "seq_frame": 19,
+            "cam": 0,
+            "foot": "right",
+            "event_type": "run_step",
+            "decision": "retained",
+            "reason": "outside_terminal_camera",
+        },
+        {
+            "seq_frame": 30,
+            "cam": 1,
+            "foot": "left",
+            "event_type": "run_step",
+            "decision": "dropped",
+            "reason": "after_takeoff_reference_frame_19",
+        },
+        {
+            "seq_frame": 40,
+            "cam": 1,
+            "foot": "left",
+            "event_type": "final_landing",
+            "decision": "added",
+            "reason": "selected_running_long_jump_touchdown",
+        },
+    ]
+    assert [(event["cam"], event["seq_frame"]) for event in events] == [
+        (0, 19),
+        (1, 40),
+    ]
+
+
+def test_preflight_recovery_replaces_adjacent_duplicate_with_better_contact(
+    monkeypatch,
+):
+    existing = {
+        "seq_frame": 3,
+        "cam": 0,
+        "foot": "left",
+        "contact_joint": "left_heel",
+        "contact_x": 10.0,
+        "contact_y": 20.0,
+        "contact_conf": 0.80,
+    }
+    row = {
+        "seq_frame": 4,
+        "orig_frame": 53,
+        "time_s": 53 / 60,
+        "seq_time_s": 4 / 60,
+        "cam": 0,
+    }
+    candidate = {
+        "seq_frame": 4,
+        "foot": "left",
+        "ankle_x": 10.05,
+        "ankle_y": 20.0,
+        "ankle_conf": 0.95,
+    }
+    calibration = {
+        "mode": "homography",
+        "homography": np.eye(3),
+    }
+    context = SimpleNamespace(
+        calibrations={0: calibration},
+        ankle_rows=[row],
+        rows_by_seq={4: row},
+        foot_contacts_by_seq={},
+        contact_contexts={0: None},
+        fps=60.0,
+    )
+    recovered_contact = {
+        "contact_valid": True,
+        "contact_joint": "left_heel",
+        "contact_x": 10.05,
+        "contact_y": 20.0,
+        "contact_conf": 0.95,
+        "contact_selection_reason": "heel_confidence_ge_0.50",
+    }
+    monkeypatch.setattr(
+        ankle_module,
+        "detect_steps",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(
+        ankle_module,
+        "select_contact_point",
+        lambda *_args, **_kwargs: recovered_contact,
+    )
+
+    events = [existing]
+    ankle_module._recover_terminal_preflight_contacts(
+        ankle_module._TerminalPreflightRecoveryRequest(
+            refreshed_events=events,
+            context=context,
+            terminal_camera=0,
+            keep_through_sequence=10,
+        )
+    )
+
+    assert len(events) == 1
+    assert events[0]["seq_frame"] == 4
+    assert events[0]["contact_conf"] == pytest.approx(0.95)

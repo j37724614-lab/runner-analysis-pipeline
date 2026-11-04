@@ -81,14 +81,18 @@
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["total_time_seconds", "average_speed_mps", "average_acceleration_mps2", "detected_steps", "average_cadence_spm", "average_step_length_m"],
+      "required": ["total_time_seconds", "average_speed_mps", "average_acceleration_mps2", "detected_steps", "average_cadence_spm", "average_step_length_m", "maximum_speed_mps", "official_jump_distance_m", "takeoff_speed_mps", "flight_time_seconds"],
       "properties": {
         "total_time_seconds": {"type": "number", "minimum": 0},
         "average_speed_mps": {"type": ["number", "null"]},
         "average_acceleration_mps2": {"type": ["number", "null"]},
         "detected_steps": {"type": ["integer", "null"], "minimum": 0},
         "average_cadence_spm": {"type": ["number", "null"], "minimum": 0},
-        "average_step_length_m": {"type": ["number", "null"], "minimum": 0}
+        "average_step_length_m": {"type": ["number", "null"], "minimum": 0},
+        "maximum_speed_mps": {"type": ["number", "null"], "minimum": 0},
+        "official_jump_distance_m": {"type": ["number", "null"], "minimum": 0},
+        "takeoff_speed_mps": {"type": ["number", "null"], "minimum": 0},
+        "flight_time_seconds": {"type": ["number", "null"], "minimum": 0}
       }
     },
     "artifacts": {
@@ -104,7 +108,7 @@
       "required": ["artifact_id", "type", "media_type", "relative_path", "sha256", "size_bytes"],
       "properties": {
         "artifact_id": {"type": "string", "format": "uuid"},
-        "type": {"enum": ["metrics", "angles", "steps", "pose2d", "pose3d", "overlay", "timing", "diagnostics", "other"]},
+        "type": {"enum": ["metrics", "angles", "steps", "leg_identity", "contacts", "long_jump", "pose2d", "pose3d", "overlay", "timing", "diagnostics", "other"]},
         "media_type": {"type": "string", "minLength": 1},
         "relative_path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
         "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},

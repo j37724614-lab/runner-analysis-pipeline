@@ -12,7 +12,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 
-from core.pipeline import AnalysisOptions, run_analysis
+from core import tracking
+from core.pipeline import AnalysisOptions, run_analysis_with_manifest
+from core.utils import REPO_ROOT
 
 
 class ReusableHTTPServer(HTTPServer):
@@ -281,9 +283,23 @@ if __name__ == "__main__":
         "tracking_mode": "two_pass",
     }
 
-    run_analysis(
-        config_dict=config_dict,
-        options=AnalysisOptions(gpu="0"),
+    run_analysis_with_manifest(
+        config_dict,
+        AnalysisOptions(gpu="0"),
+        engine_version="dev",
+        model_files={
+            "yolo_tracking": tracking.MODEL_PATH,
+            "hrnet_wholebody23": str(
+                REPO_ROOT
+                / "data"
+                / "runner_wholebody23"
+                / "exports"
+                / "pose_hrnet_w48_wholebody23_384x288_dark_jump_broadcast_long_triple_pilot300_headonly_epoch3.pth"
+            ),
+            "motionagformer": str(
+                REPO_ROOT / "MotionAGFormer" / "checkpoint" / "motionagformer-s-ap3d.pth.tr"
+            ),
+        },
     )
 
     elapsed = time.perf_counter() - start_time

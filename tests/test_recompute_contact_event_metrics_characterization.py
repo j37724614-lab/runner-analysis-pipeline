@@ -153,3 +153,36 @@ def test_two_camera_line_cross_camera_bridge():
     assert [e["step_length_px"] for e in events] == [None, 200.0, None, 200.0]
     # Step 3 spans the camera cut: measured in the shared global metre coordinate.
     assert [e["step_length_m"] for e in events] == pytest.approx([None, 4.0, 3.0, 4.0])
+
+
+def test_homography_boundary_extrapolation_uses_calibrated_edge_for_step_length():
+    previous = _homography_cal(offset_m=20.0)
+    terminal = _homography_cal(offset_m=32.0)
+    events = [
+        _event(1, 10, 0, 605.0, 330.0, 0.10),  # 10.1 m in prior camera
+        _event(2, 22, 1, 25.0, 330.0, 0.10),   # -1.5 m before next start
+    ]
+
+    _recompute_contact_event_metrics(events, {0: previous, 1: terminal}, {})
+
+    assert events[1]["world_x_m"] == pytest.approx(-1.5, abs=1e-4)
+    assert events[1]["step_length_m"] == pytest.approx(1.9, abs=1e-4)
+    assert events[1]["homography_lateral_valid"] is True
+    assert events[1]["contact_rejection_reason"] == "world_x_clamped_to_calibrated_range"
+
+
+def test_retimed_boundary_contact_reports_clamped_world_position():
+    previous = _homography_cal(offset_m=20.0)
+    terminal = _homography_cal(offset_m=32.0)
+    events = [
+        _event(1, 10, 0, 605.0, 330.0, 0.10),
+        {
+            **_event(2, 22, 1, 25.0, 330.0, 0.10),
+            "contact_selection_reason": "heel_confidence_ge_0.50;boundary_raw_peak_retimed",
+        },
+    ]
+
+    _recompute_contact_event_metrics(events, {0: previous, 1: terminal}, {})
+
+    assert events[1]["world_x_m"] == pytest.approx(0.0, abs=1e-4)
+    assert events[1]["step_length_m"] == pytest.approx(1.9, abs=1e-4)

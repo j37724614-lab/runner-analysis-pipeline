@@ -30,6 +30,7 @@ class PoseEstimationRequest:
     video_output: VideoOutput = VideoOutput.GENERATE
     timings: list | None = None
     pose_model_path: str | None = None
+    pose_backend: str = "hrnet"
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ def _execute_pose_estimation(
             bbox_csv=workspace.bbox_csv_path,
             skip_video=not generates_video,
             model_path=request.pose_model_path,
+            pose_backend=request.pose_backend,
         )
         _record_timing(
             request.timings,

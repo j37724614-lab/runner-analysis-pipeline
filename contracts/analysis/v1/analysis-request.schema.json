@@ -21,6 +21,7 @@
       "minItems": 1,
       "items": {"$ref": "#/$defs/camera"}
     },
+    "kinematics_policy": {"$ref": "#/$defs/kinematics_policy"},
     "output_policy": {
       "type": "object",
       "additionalProperties": false,
@@ -45,6 +46,24 @@
       "minItems": 2,
       "maxItems": 2
     },
+    "range": {
+      "type": "array",
+      "prefixItems": [{"type": "number"}, {"type": "number"}],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "kinematics_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["speed_mode", "butterworth_cutoff_hz", "flat_interpolation_epsilon_m", "lane_width_m"],
+      "properties": {
+        "speed_mode": {"enum": ["auto", "pixel", "homography"]},
+        "butterworth_cutoff_hz": {"type": "number", "exclusiveMinimum": 0},
+        "flat_interpolation_epsilon_m": {"type": "number", "minimum": 0},
+        "lane_width_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
     "video": {
       "type": "object",
       "additionalProperties": false,
@@ -66,6 +85,8 @@
         "start_line": {"$ref": "#/$defs/line"},
         "end_line": {"$ref": "#/$defs/line"},
         "distance_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "roi_x": {"$ref": "#/$defs/range"},
+        "roi_y": {"$ref": "#/$defs/range"},
         "homography_image_points": {
           "type": "array",
           "items": {"$ref": "#/$defs/point"},

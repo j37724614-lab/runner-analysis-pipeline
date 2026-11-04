@@ -43,7 +43,11 @@
     "average_acceleration_mps2": 0.4,
     "detected_steps": 14,
     "average_cadence_spm": 281.56,
-    "average_step_length_m": 1.85
+    "average_step_length_m": 1.85,
+    "maximum_speed_mps": 10.2,
+    "official_jump_distance_m": null,
+    "takeoff_speed_mps": null,
+    "flight_time_seconds": null
   },
   "artifacts": [
     {

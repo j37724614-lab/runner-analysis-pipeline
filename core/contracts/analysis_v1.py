@@ -329,6 +329,7 @@ def _stage_descriptors(
 
 def _summary(result: Mapping[str, Any]) -> dict[str, Any]:
     step_analysis = result.get("step_analysis") or {}
+    long_jump = step_analysis.get("running_long_jump_result") or {}
     return {
         "total_time_seconds": max(0.0, float(result.get("total_time") or 0.0)),
         "average_speed_mps": _optional_float(result.get("avg_velocity")),
@@ -338,6 +339,12 @@ def _summary(result: Mapping[str, Any]) -> dict[str, Any]:
         "average_step_length_m": _optional_float(
             result.get("avg_step_length", step_analysis.get("avg_step_length_m"))
         ),
+        "maximum_speed_mps": _optional_float(result.get("max_velocity")),
+        "official_jump_distance_m": _optional_float(
+            long_jump.get("official_distance_m")
+        ),
+        "takeoff_speed_mps": _optional_float(long_jump.get("takeoff_speed_mps")),
+        "flight_time_seconds": _optional_float(long_jump.get("flight_time_seconds")),
     }
 
 

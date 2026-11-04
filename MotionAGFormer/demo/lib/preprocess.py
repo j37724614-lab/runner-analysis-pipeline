@@ -44,11 +44,9 @@ def coco_h36m(keypoints):
         keypoints_h36m[:, 7, 0]
         - np.mean(keypoints_h36m[:, [0, 8], 0], axis=1, dtype=np.float32)
     )
-    keypoints_h36m[:, 8, 1] -= (
-        (np.mean(keypoints[:, 1:3, 1], axis=1, dtype=np.float32) - keypoints[:, 0, 1])
-        * 2
-        / 3
-    )
+    # 原本這裡還有一段用 COCO 眼睛 y 座標（index 1,2）微調 thorax(8) 垂直
+    # 位置的修正，但眼睛對 MogaNet 來說是沒訓練過的不可靠通道，刻意移除，
+    # thorax 僅靠肩膀中點 + 鼻子方向的那段（上面 htps_keypoints 計算）定位。
 
     # half body: the joint of ankle and knee equal to hip
     # keypoints_h36m[:, [2, 3]] = keypoints_h36m[:, [1, 1]]

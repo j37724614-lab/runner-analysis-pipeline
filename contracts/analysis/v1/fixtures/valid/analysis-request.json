@@ -19,11 +19,19 @@
         "start_line": [[100, 700], [100, 900]],
         "end_line": [[1800, 700], [1800, 900]],
         "distance_m": 20,
+        "roi_x": [80, 1840],
+        "roi_y": [650, 950],
         "homography_image_points": [[100, 700], [100, 900], [1800, 700], [1800, 900]],
         "homography_world_points_m": [[0, 0], [0, 1.22], [20, 0], [20, 1.22]]
       }
     }
   ],
+  "kinematics_policy": {
+    "speed_mode": "auto",
+    "butterworth_cutoff_hz": 3.5,
+    "flat_interpolation_epsilon_m": 0.001,
+    "lane_width_m": 1.22
+  },
   "output_policy": {
     "include_pose_data": true,
     "include_overlays": true

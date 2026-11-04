@@ -101,6 +101,7 @@ class TrackingRunContext:
     timings: list | None = None
     stream_pose: bool = False
     pose_model_path: str | None = None
+    pose_backend: str = "hrnet"
     write_tracked_video: bool = True
     gpu: str = "0"
 
@@ -299,6 +300,7 @@ def _render_two_pass_tracking(
                 ),
                 gpu=context.gpu,
                 model_path=context.pose_model_path,
+                pose_backend=context.pose_backend,
             )
         if pose_stream is not None:
             print("two_pass 模式：第二遍追焦影格送入 HRNet（快取模式，跳過 YOLO）...")
@@ -405,6 +407,7 @@ class Step1TrackingRequest:
     timings: list | None = None
     stream_pose: bool = False
     pose_model_path: str | None = None
+    pose_backend: str = "hrnet"
     write_tracked_video: bool = True
 
 
@@ -440,6 +443,7 @@ def _step1_track_impl(request: Step1TrackingRequest) -> str:
         timings=request.timings,
         stream_pose=request.stream_pose,
         pose_model_path=request.pose_model_path,
+        pose_backend=request.pose_backend,
         write_tracked_video=request.write_tracked_video,
         gpu=request.gpu,
     )

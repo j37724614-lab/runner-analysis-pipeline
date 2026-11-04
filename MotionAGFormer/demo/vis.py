@@ -39,6 +39,7 @@ for _p in [str(_REPO_ROOT), str(_DEMO_DIR)]:
 import cv2
 from lib.preprocess import h36m_coco_format, revise_kpts
 from lib.hrnet.gen_kpts import gen_video_kpts as hrnet_pose
+from lib.hrnet.gen_kpts_moganet import gen_video_kpts_moganet as moganet_pose
 import numpy as np
 import pandas as pd
 import torch
@@ -1219,11 +1220,15 @@ def _apply_anatomical_limits_2d(keypoints, limits=None):
 
 
 def show2Dpose(kps, img, foot_kps=None, foot_scores=None):
+    # Neck/Nose -> Head 與 Thorax -> Neck/Nose 刻意省略（跟 core/overlay.py
+    # 的 _OriginalPoseRenderer.BODY_CONNECTIONS 一致）：H36M 的 head(10) 座標
+    # 是直接用 COCO 眼睛+耳朵算出來的，MogaNet 沒訓練過這 4 個點，畫出來
+    # 會變成亂飄的尖刺。
     connections = [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5],
-                   [5, 6], [0, 7], [7, 8], [8, 9], [9, 10],
+                   [5, 6], [0, 7], [7, 8],
                    [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16]]
 
-    LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
+    LR = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
 
     lcolor = (255, 0, 0)
     rcolor = (0, 0, 255)
@@ -1296,7 +1301,7 @@ def show3Dpose(vals, ax):
 
 
 def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None,
-               frame_source=None, profiling=None):
+               frame_source=None, profiling=None, backend='hrnet'):
     if frame_source is None:
         cap = cv2.VideoCapture(video_path)
         cap.release()
@@ -1304,9 +1309,16 @@ def get_pose2D(video_path, output_dir, bbox_csv=None, model_path=None,
     print('\nGenerating 2D pose...')
     if bbox_csv:
         print(f'Using external bbox CSV: {bbox_csv}')
-    if model_path:
-        print(f'Using HRNet experiment checkpoint: {model_path}')
-    keypoints, scores = hrnet_pose(
+    if backend == 'moganet':
+        print('Using MogaNet (AthletePose3D fine-tuned) 2D backend')
+        pose_fn = moganet_pose
+    elif backend == 'hrnet':
+        if model_path:
+            print(f'Using HRNet experiment checkpoint: {model_path}')
+        pose_fn = hrnet_pose
+    else:
+        raise ValueError(f"Unknown 2D pose backend: {backend!r} (expected 'hrnet' or 'moganet')")
+    keypoints, scores = pose_fn(
         video_path,
         det_dim=416,
         num_peroson=1,
@@ -1515,35 +1527,37 @@ def showimage(ax, img):
     ax.imshow(img)
 
 
-def resample(n_frames):
-    even = np.linspace(0, n_frames, num=243, endpoint=False)
+def resample(n_frames, clip_length=243):
+    even = np.linspace(0, n_frames, num=clip_length, endpoint=False)
     result = np.floor(even)
     result = np.clip(result, a_min=0, a_max=n_frames - 1).astype(np.uint32)
     return result
 
 
-def turn_into_clips(keypoints):
+def turn_into_clips(keypoints, clip_length=243):
+    """clip_length 要跟目前載入的 MotionAGFormer 模型 config 的 n_frames 一致
+    （large=243，small/ap3d=81），兩邊對不上會在 graph 模組的 BatchNorm 炸掉。"""
     clips = []
     n_frames = keypoints.shape[1]
     downsample_indices = []
 
-    if n_frames <= 243:
-        new_indices = resample(n_frames)
+    if n_frames <= clip_length:
+        new_indices = resample(n_frames, clip_length)
         clips.append(keypoints[:, new_indices, ...])
         _, unique_idx = np.unique(new_indices, return_index=True)
         downsample_indices.append(unique_idx)
     else:
-        for start_idx in range(0, n_frames, 243):
-            keypoints_clip = keypoints[:, start_idx:start_idx + 243, ...]
-            clip_length = keypoints_clip.shape[1]
-            if clip_length < 243:
-                new_indices = resample(clip_length)
+        for start_idx in range(0, n_frames, clip_length):
+            keypoints_clip = keypoints[:, start_idx:start_idx + clip_length, ...]
+            this_clip_length = keypoints_clip.shape[1]
+            if this_clip_length < clip_length:
+                new_indices = resample(this_clip_length, clip_length)
                 clips.append(keypoints_clip[:, new_indices, ...])
                 _, unique_idx = np.unique(new_indices, return_index=True)
                 downsample_indices.append(unique_idx)
             else:
                 clips.append(keypoints_clip)
-                downsample_indices.append(np.arange(243))
+                downsample_indices.append(np.arange(clip_length))
 
     return clips, downsample_indices
 
@@ -1755,7 +1769,7 @@ def compute_angles(npz_path, output_dir, fps=30.0):
 @torch.no_grad()
 def get_pose3D(video_path, output_dir, skip_video=False, video_metadata=None):
     # 從此腳本所在位置推算 config 絕對路徑，不受工作目錄影響
-    config_path = str(_REPO_ROOT / "configs" / "h36m" / "MotionAGFormer-large.yaml")
+    config_path = str(_REPO_ROOT / "configs" / "h36m" / "MotionAGFormer-small.yaml")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -1782,7 +1796,7 @@ def get_pose3D(video_path, output_dir, skip_video=False, video_metadata=None):
 
     # 從此腳本所在位置推算 checkpoint 絕對路徑
     checkpoint_dir = str(_REPO_ROOT / "checkpoint")
-    model_path = sorted(glob.glob(os.path.join(checkpoint_dir, 'motionagformer-l-h36m.pth.tr')))[0]
+    model_path = sorted(glob.glob(os.path.join(checkpoint_dir, 'motionagformer-s-ap3d.pth.tr')))[0]
 
     pre_dict = torch.load(model_path, weights_only=False)
     model.load_state_dict(pre_dict['model'], strict=True)
@@ -1802,7 +1816,7 @@ def get_pose3D(video_path, output_dir, skip_video=False, video_metadata=None):
         foot_keypoints = foot_data['keypoints']  # (M, T, 6, 2)
         foot_scores = foot_data['scores']        # (M, T, 6)
 
-    clips, downsample_indices = turn_into_clips(keypoints)
+    clips, downsample_indices = turn_into_clips(keypoints, clip_length=config['n_frames'])
 
     if video_metadata is not None and skip_video:
         cap = None
@@ -1943,7 +1957,8 @@ def run_pose_estimation(video_path: str, output_dir: str,
                         only_2d: bool = False, gpu: str = "0",
                         bbox_csv: str = None,
                         skip_video: bool = False,
-                        model_path: str = None) -> str:
+                        model_path: str = None,
+                        pose_backend: str = "hrnet") -> str:
     """
     執行完整的 2D/3D 姿態估計流程。
 
@@ -1972,7 +1987,8 @@ def run_pose_estimation(video_path: str, output_dir: str,
 
     pose_total_started_at = time.perf_counter()
     pose2d_started_at = time.perf_counter()
-    get_pose2D(video_path, output_dir, bbox_csv=bbox_csv, model_path=model_path)
+    get_pose2D(video_path, output_dir, bbox_csv=bbox_csv, model_path=model_path,
+               backend=pose_backend)
     _record_pose_timing("Step2/hrnet_2d_pose", pose2d_started_at)
     if not only_2d:
         pose3d_started_at = time.perf_counter()

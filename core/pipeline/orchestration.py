@@ -92,6 +92,7 @@ def _obtain_tracked_video(
                 timings=request.options.timings,
                 stream_pose=stream_pose,
                 pose_model_path=request.extra_config.get("pose_model_path"),
+                pose_backend=request.extra_config.get("pose_backend", "hrnet"),
                 write_tracked_video=not stream_pose,
             )
         )
@@ -126,6 +127,7 @@ def _run_pose_pipeline_step(
             video_output=request.options.video_output,
             timings=request.options.timings,
             pose_model_path=request.extra_config.get("pose_model_path"),
+            pose_backend=request.extra_config.get("pose_backend", "hrnet"),
         )
     )
 

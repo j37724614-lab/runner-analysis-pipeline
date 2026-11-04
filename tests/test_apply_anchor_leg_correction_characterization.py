@@ -14,7 +14,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.analysis.ankle_step_stride import (  # noqa: E402
+from scripts.analysis.ankle_step_stride import (
+    _inherit_foot_labels_across_cameras,
     apply_anchor_leg_correction,
 )
 
@@ -110,3 +111,34 @@ def test_runs_with_keypoint_status_file(tmp_path):
     rewritten = np.load(path, allow_pickle=True)["reconstruction"]
     leg_checksum = float(np.nansum(np.abs(rewritten[0, :, 1:7, :2])))
     assert round(leg_checksum, 4) == _LEG_CHECKSUM
+
+
+def test_camera_handoff_inherits_alternating_foot_identity():
+    events = [
+        {"seq_frame": 442, "cam": 1, "foot": "right"},
+        {"seq_frame": 459, "cam": 1, "foot": "left"},
+        # A new camera currently initializes this independently as left.
+        {"seq_frame": 476, "cam": 2, "foot": "left"},
+        {"seq_frame": 509, "cam": 2, "foot": "right"},
+    ]
+
+    aligned = _inherit_foot_labels_across_cameras(events)
+
+    assert [(event["seq_frame"], event["foot"]) for event in aligned] == [
+        (442, "right"),
+        (459, "left"),
+        (476, "right"),
+        (509, "left"),
+    ]
+
+
+def test_anchor_dp_does_not_solve_across_camera_handoff(tmp_path):
+    path = _write_keypoints(tmp_path, _synthetic_recon())
+    cross_camera_only = [
+        {"seq_frame": 12, "cam": 1, "foot": "left", "seq_time_s": 0.2},
+        {"seq_frame": 20, "cam": 2, "foot": "right", "seq_time_s": 1 / 3},
+    ]
+
+    swapped = apply_anchor_leg_correction(str(path), cross_camera_only)
+
+    assert not swapped.any()

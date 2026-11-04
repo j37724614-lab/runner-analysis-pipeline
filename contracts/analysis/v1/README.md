@@ -13,6 +13,10 @@ Rules:
 - Artifact paths are relative to the result bundle and must not contain `..`.
 - JSON numeric values must be finite. Unknown optional measurements are `null`, never NaN or infinity.
 - A Comparison Report references two Result Manifests; it does not merge or overwrite them.
+- `kinematics_policy` carries the shared speed mode, filter cutoff, flat-segment epsilon, and lane width. It is optional on input for v1 compatibility; adapters use the documented defaults when omitted.
+- Canonical JSON artifacts use dedicated schemas: `kinematics`, `leg-identity`, `contact-events`, `steps`, and `long-jump-result`.
+- A missing measurement is represented by `null`. Producers must not invent gait or long-jump measurements merely to fill a schema.
+- `leg_identity`, `contacts`, and `long_jump` are separate manifest artifact types so each stage can be generated, validated, and compared independently.
 
 Run contract tests with:
 

@@ -25,14 +25,25 @@ import csv
 import json
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 from ultralytics import YOLO
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENGINE = REPO_ROOT / "models" / "yolo26x_ultralytics_int8.engine"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output_cut" / "prescan_valid_segments"
+
+
+class PrescanRangeFilter(NamedTuple):
+    """Temporal evidence required before a detected range receives buffering."""
+
+    stride: int
+    buffer_frames: int
+    max_gap_frames: int
+    min_hit_samples: int
+    min_duration_frames: int
+    min_hit_ratio: float
 
 
 def _positive_int(value: str) -> int:
@@ -42,38 +53,81 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
 def _seconds_to_frames(seconds: float | None, fps: float) -> int | None:
     if seconds is None:
         return None
-    return max(0, int(round(float(seconds) * fps)))
+    return max(0, round(float(seconds) * fps))
 
 
 def _merge_hit_frames(
     hit_frames: list[int],
     total_frames: int,
-    stride: int,
-    buffer_frames: int,
-    max_gap_frames: int,
+    range_filter: PrescanRangeFilter,
 ) -> list[dict]:
     if not hit_frames:
         return []
 
-    ranges: list[tuple[int, int]] = []
-    start = end = int(hit_frames[0])
-    for frame_idx in hit_frames[1:]:
-        frame_idx = int(frame_idx)
-        if frame_idx - end <= max_gap_frames:
-            end = frame_idx
+    hit_groups: list[list[int]] = []
+    current_group = [int(hit_frames[0])]
+    for frame_index in hit_frames[1:]:
+        frame_index = int(frame_index)
+        if frame_index - current_group[-1] <= range_filter.max_gap_frames:
+            current_group.append(frame_index)
         else:
-            ranges.append((start, end))
-            start = end = frame_idx
-    ranges.append((start, end))
+            hit_groups.append(current_group)
+            current_group = [frame_index]
+    hit_groups.append(current_group)
+
+    stable_groups = [
+        group for group in hit_groups if _hit_group_is_stable(group, range_filter)
+    ]
+    return _expand_and_merge_hit_groups(stable_groups, total_frames, range_filter)
+
+
+def _hit_group_is_stable(
+    hit_group: list[int],
+    range_filter: PrescanRangeFilter,
+) -> bool:
+    if len(hit_group) < range_filter.min_hit_samples:
+        return False
+    observed_duration = hit_group[-1] - hit_group[0] + range_filter.stride
+    if observed_duration < range_filter.min_duration_frames:
+        return False
+    sampled_slots = (hit_group[-1] - hit_group[0]) // range_filter.stride + 1
+    hit_ratio = len(hit_group) / max(1, sampled_slots)
+    return hit_ratio >= range_filter.min_hit_ratio
+
+
+def _expand_and_merge_hit_groups(
+    hit_groups: list[list[int]],
+    total_frames: int,
+    range_filter: PrescanRangeFilter,
+) -> list[dict]:
+    if not hit_groups:
+        return []
 
     expanded: list[tuple[int, int]] = []
     last_start = last_end = None
-    for start, end in ranges:
-        start = max(0, start - buffer_frames)
-        end = min(max(total_frames - 1, 0), end + buffer_frames + stride - 1)
+    for hit_group in hit_groups:
+        start = max(0, hit_group[0] - range_filter.buffer_frames)
+        end = min(
+            max(total_frames - 1, 0),
+            hit_group[-1] + range_filter.buffer_frames + range_filter.stride - 1,
+        )
         if last_start is None:
             last_start, last_end = start, end
         elif start <= last_end + 1:
@@ -93,7 +147,9 @@ def _merge_hit_frames(
     ]
 
 
-def _scan_valid_ranges(args, fps: float, total_frames: int) -> tuple[list[dict], list[dict], float]:
+def _scan_valid_ranges(
+    args, fps: float, total_frames: int
+) -> tuple[list[dict], list[dict], float]:
     model = YOLO(str(args.engine), task="detect")
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -128,7 +184,7 @@ def _scan_valid_ranges(args, fps: float, total_frames: int) -> tuple[list[dict],
                 xyxy = result.boxes.xyxy.detach().cpu().numpy()
                 confs = result.boxes.conf.detach().cpu().numpy()
                 for box, conf in zip(xyxy, confs):
-                    x1, y1, x2, y2 = map(float, box[:4])
+                    _, y1, _, y2 = map(float, box[:4])
                     height = y2 - y1
                     max_height = max(max_height, height)
                     max_conf = max(max_conf, float(conf))
@@ -161,9 +217,14 @@ def _scan_valid_ranges(args, fps: float, total_frames: int) -> tuple[list[dict],
     ranges = _merge_hit_frames(
         hit_frames=hit_frames,
         total_frames=total_frames,
-        stride=args.stride,
-        buffer_frames=args.buffer_frames,
-        max_gap_frames=args.max_gap_frames,
+        range_filter=PrescanRangeFilter(
+            stride=args.stride,
+            buffer_frames=args.buffer_frames,
+            max_gap_frames=args.max_gap_frames,
+            min_hit_samples=args.min_hit_samples,
+            min_duration_frames=args.min_duration_frames,
+            min_hit_ratio=args.min_hit_ratio,
+        ),
     )
     for item in ranges:
         item["start_time_s"] = item["start_frame"] / fps if fps > 0 else None
@@ -178,7 +239,9 @@ def _scan_valid_ranges(args, fps: float, total_frames: int) -> tuple[list[dict],
     return ranges, sampled_rows, elapsed
 
 
-def _write_kept_video(args, ranges: list[dict], fps: float, width: int, height: int) -> tuple[Path | None, float]:
+def _write_kept_video(
+    args, ranges: list[dict], fps: float, width: int, height: int
+) -> tuple[Path | None, float]:
     if not ranges:
         return None, 0.0
 
@@ -210,8 +273,26 @@ def _write_kept_video(args, ranges: list[dict], fps: float, width: int, height: 
                 break
             if args.draw_range_label:
                 text = f"src frame {frame_idx}  kept range {start}-{end}"
-                cv2.putText(frame, text, (18, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5, cv2.LINE_AA)
-                cv2.putText(frame, text, (18, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    text,
+                    (18, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 0),
+                    5,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    text,
+                    (18, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
             writer.write(frame)
             written += 1
             frame_idx += 1
@@ -239,7 +320,14 @@ def _write_reports(
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["frame", "time_s", "hit", "valid_boxes", "max_conf", "max_height"],
+            fieldnames=[
+                "frame",
+                "time_s",
+                "hit",
+                "valid_boxes",
+                "max_conf",
+                "max_height",
+            ],
         )
         writer.writeheader()
         writer.writerows(sampled_rows)
@@ -264,6 +352,10 @@ def _write_reports(
             "min_height": args.min_height,
             "buffer_frames": args.buffer_frames,
             "max_gap_frames": args.max_gap_frames,
+            "min_hit_samples": args.min_hit_samples,
+            "min_duration_sec": args.min_duration_sec,
+            "min_duration_frames": args.min_duration_frames,
+            "min_hit_ratio": args.min_hit_ratio,
             "use_grab": args.use_grab,
         },
         "ranges": ranges,
@@ -278,7 +370,9 @@ def _write_reports(
     }
 
     json_path = args.output_dir / f"{args.video.stem}_valid_ranges.json"
-    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"[report] {json_path}")
     print(f"[report] {csv_path}")
     return json_path
@@ -293,13 +387,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", default=640, type=_positive_int)
     parser.add_argument("--conf", default=0.25, type=float)
     parser.add_argument("--iou", default=0.7, type=float)
-    parser.add_argument("--min-height", default=40, type=float)
+    parser.add_argument("--min-height", default=70, type=float)
     parser.add_argument("--device", default=0)
     parser.add_argument("--buffer-frames", default=None, type=int)
     parser.add_argument("--buffer-sec", default=1.0, type=float)
     parser.add_argument("--max-gap-frames", default=None, type=int)
     parser.add_argument("--max-gap-sec", default=1.0, type=float)
-    parser.add_argument("--no-grab", action="store_true", help="Decode skipped frames instead of using cap.grab().")
+    parser.add_argument(
+        "--min-hit-samples",
+        default=4,
+        type=_positive_int,
+        help="Minimum sampled detections required before keeping a range",
+    )
+    parser.add_argument(
+        "--min-duration-sec",
+        default=0.5,
+        type=_non_negative_float,
+        help="Minimum unbuffered detection duration in seconds",
+    )
+    parser.add_argument(
+        "--min-hit-ratio",
+        default=0.6,
+        type=_ratio,
+        help="Minimum detected-sample ratio inside a candidate range",
+    )
+    parser.add_argument(
+        "--no-grab",
+        action="store_true",
+        help="Decode skipped frames instead of using cap.grab().",
+    )
     parser.add_argument("--draw-range-label", action="store_true")
     args = parser.parse_args()
 
@@ -332,6 +448,7 @@ def main() -> None:
         args.buffer_frames = _seconds_to_frames(args.buffer_sec, fps)
     if args.max_gap_frames is None:
         args.max_gap_frames = _seconds_to_frames(args.max_gap_sec, fps)
+    args.min_duration_frames = _seconds_to_frames(args.min_duration_sec, fps)
 
     print(f"[video] {args.video}")
     print(f"[video] frames={total_frames}, fps={fps:.3f}, size={width}x{height}")
@@ -339,7 +456,10 @@ def main() -> None:
     print(
         "[params] "
         f"stride={args.stride}, buffer_frames={args.buffer_frames}, "
-        f"max_gap_frames={args.max_gap_frames}, imgsz={args.imgsz}"
+        f"max_gap_frames={args.max_gap_frames}, "
+        f"min_hits={args.min_hit_samples}, "
+        f"min_duration={args.min_duration_sec:g}s, "
+        f"min_hit_ratio={args.min_hit_ratio:g}, imgsz={args.imgsz}"
     )
 
     ranges, sampled_rows, prescan_elapsed = _scan_valid_ranges(args, fps, total_frames)
