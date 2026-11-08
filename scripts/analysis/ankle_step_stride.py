@@ -1501,32 +1501,85 @@ def _dedupe_short_contacts(candidates, ctx):
     return deduped
 
 
-def _apply_alternating_foot_labels(candidates, ankle_rows, peak_distance):
-    # 跑步必定左右交替落地。逐幀計算的 lower_foot 只在單一幀比較左右腳踝
-    # y 座標，容易被雜訊誤判，因此只信任它來決定「第一步」（用峰值附近一
-    # 個小視窗做多數決，降低錨點本身判斷錯誤的機率）。第二步以後一律直接
-    # 取前一步的相反腳，不再重新讀取 lower_foot。落地時間點與
-    # ankle_x/ankle_y（實際偵測到的踝關節位置）完全不變，只修正 foot 這個標籤欄位。
-    if not candidates:
-        return candidates
+# A touchdown gap of ~k regular steps implies k-1 undetected touchdowns.  Only
+# gaps clearly near 2x / 3x a regular step count; anything else keeps strict
+# alternation (touchdown timing jitter is common, missed steps are rarer).
+_MISSED_STEP_GAP_RANGES = ((3, 2.75, 3.5), (2, 1.75, 2.5))
+# The alternating sequence is flipped only when the per-touchdown lower-foot
+# votes contradict it by at least this many touchdowns.
+_PARITY_FLIP_MIN_MARGIN = 2
 
-    anchor_window_radius = max(1, peak_distance // 3)
-    anchor_row_idx = candidates[0]["row_idx"]
-    lo = max(0, anchor_row_idx - anchor_window_radius)
-    hi = min(len(ankle_rows) - 1, anchor_row_idx + anchor_window_radius)
+
+def _regular_step_gap(frames):
+    """Typical touchdown gap, estimated from the first (approach) gaps only.
+
+    Later gaps can include flight / sand landing, and a single jittery short
+    gap must not become the reference, so take the first three gaps, drop any
+    longer than twice the shortest of them, and use their median.
+    """
+    gaps = np.diff(np.asarray(frames, dtype=float))
+    if gaps.size == 0:
+        return 0.0
+    first = gaps[:3]
+    return float(np.median(first[first <= 2.0 * first.min()]))
+
+
+def _gap_step_multiple(gap, regular_gap):
+    if regular_gap <= 0:
+        return 1
+    ratio = gap / regular_gap
+    for multiple, low, high in _MISSED_STEP_GAP_RANGES:
+        if low <= ratio < high:
+            return multiple
+    return 1
+
+
+def _lower_foot_vote(ankle_rows, row_idx, radius):
+    lo = max(0, row_idx - radius)
+    hi = min(len(ankle_rows) - 1, row_idx + radius)
     votes = [ankle_rows[i]["lower_foot"] for i in range(lo, hi + 1)]
     left_votes = votes.count("left")
     right_votes = votes.count("right")
     if left_votes > right_votes:
-        anchor_foot = "left"
-    elif right_votes > left_votes:
-        anchor_foot = "right"
-    else:
-        anchor_foot = candidates[0]["foot"]  # tie: 保留原本單幀判斷值
+        return "left"
+    if right_votes > left_votes:
+        return "right"
+    return None
 
-    candidates[0]["foot"] = anchor_foot
-    for i in range(1, len(candidates)):
-        candidates[i]["foot"] = "left" if candidates[i - 1]["foot"] == "right" else "right"
+
+def _other_foot(foot):
+    return "left" if foot == "right" else "right"
+
+
+def _apply_alternating_foot_labels(candidates, ankle_rows, peak_distance):
+    # 跑步必定左右交替落地。逐幀的 lower_foot 只比較單一幀左右腳踝 y 座標，
+    # 容易被雜訊誤判，所以不直接拿來當每一步的標籤，而是：
+    #   1. 依交替規則排出整串標籤；兩次落地間隔明顯接近 2 倍 / 3 倍正常步距時，
+    #      視為中間漏偵測 1 / 2 步，交替相位跟著前進，避免漏一步後整串反向。
+    #   2. 每一步都用峰值附近小視窗的 lower_foot 多數決投票；若整串標籤反過來
+    #      能多吻合至少 _PARITY_FLIP_MIN_MARGIN 步，就整串翻轉。
+    #      （舊版只用第一步決定整串相位，第一步誤判時後面全部反向。）
+    # 落地時間點與 ankle_x/ankle_y 完全不變，只修正 foot 這個標籤欄位。
+    if not candidates:
+        return candidates
+
+    radius = max(1, peak_distance // 3)
+    votes = [_lower_foot_vote(ankle_rows, c["row_idx"], radius) for c in candidates]
+    frames = [int(c["row"]["seq_frame"]) for c in candidates]
+    regular_gap = _regular_step_gap(frames)
+
+    labels = [votes[0] or candidates[0]["foot"]]  # tie: 保留原本單幀判斷值
+    for previous_frame, frame in pairwise(frames):
+        multiple = _gap_step_multiple(frame - previous_frame, regular_gap)
+        labels.append(labels[-1] if multiple % 2 == 0 else _other_foot(labels[-1]))
+
+    agree = sum(1 for label, vote in zip(labels, votes) if vote and label == vote)
+    disagree = sum(1 for label, vote in zip(labels, votes) if vote and label != vote)
+    if disagree - agree >= _PARITY_FLIP_MIN_MARGIN:
+        labels = [_other_foot(label) for label in labels]
+
+    for candidate, label in zip(candidates, labels):
+        candidate["foot"] = label
     return candidates
 
 
@@ -1982,8 +2035,18 @@ def _persist_corrected_reconstruction(recon, valid_frames, swapped, keypoints_np
     )
 
 
-def _leg_identity_anchors(step_events):
-    return sorted(
+# Long jump: the first same-camera touchdown gap longer than this many regular
+# steps is the flight.  Later "touchdowns" (flight, sand landing, sitting in the
+# pit) are ankle-height peaks where "the lower ankle is the stance foot" does
+# not hold, so they must not anchor leg identity.
+_FLIGHT_GAP_RATIO = 1.6
+# If the DP wants to swap more than this fraction of all anchored frames, the
+# anchors themselves are the likely error; keep the pose-stage identity.
+_DP_MAX_SWAP_FRACTION = 0.5
+
+
+def _leg_identity_anchors(step_events, truncate_after_flight=False):
+    anchors = sorted(
         (
             (
                 int(event["seq_frame"]),
@@ -1994,6 +2057,19 @@ def _leg_identity_anchors(step_events):
         ),
         key=lambda anchor: anchor[0],
     )
+    if not truncate_after_flight or len(anchors) < 3:
+        return anchors
+
+    regular_gap = _regular_step_gap([frame for frame, _, _ in anchors])
+    if regular_gap <= 0:
+        return anchors
+    for index, ((t_a, _, camera_a), (t_b, _, camera_b)) in enumerate(pairwise(anchors)):
+        if (
+            _same_camera_anchor_segment(camera_a, camera_b)
+            and t_b - t_a > _FLIGHT_GAP_RATIO * regular_gap
+        ):
+            return anchors[:index + 1]
+    return anchors
 
 
 def _same_camera_anchor_segment(camera_a, camera_b):
@@ -2016,7 +2092,7 @@ def _apply_leg_segment_states(source, target, swapped, states, start_frame, end_
             target[frame, left_leg] = source[frame, left_leg]
 
 
-def apply_anchor_leg_correction(keypoints_npz_path, step_events):
+def apply_anchor_leg_correction(keypoints_npz_path, step_events, truncate_after_flight=False):
     """Refine 2D keypoint L/R leg identity using confirmed touchdown events.
 
     step_events (from detect_steps(), already guaranteed to alternate feet)
@@ -2028,6 +2104,14 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
     hard boundaries because image coordinates from different viewpoints are
     not directly comparable. Segments without two same-camera anchors keep
     the identity assigned by the pose-estimation stage.
+
+    truncate_after_flight (long jump): anchors after the first flight-sized
+    touchdown gap are ignored, so flight / landing frames keep the
+    pose-stage identity (see _leg_identity_anchors).
+
+    Guard: if the solved segments would swap more than _DP_MAX_SWAP_FRACTION
+    of all anchored frames, the anchors are treated as unreliable and no
+    frame is swapped; post-DP gap fill / smoothing still run.
 
     Overwrites keypoints_npz_path in place with the refined array and returns
     a boolean mask where True means that frame's left/right leg identity was
@@ -2050,16 +2134,30 @@ def apply_anchor_leg_correction(keypoints_npz_path, step_events):
         _median_smoothed_ankle_velocity(kp),
         _estimate_seq_fps(step_events),
     )
-    swapped = np.zeros(frame_count, dtype=bool)
+    solved_segments = []
     for (t_a, foot_a, camera_a), (t_b, foot_b, camera_b) in pairwise(
-        _leg_identity_anchors(step_events),
+        _leg_identity_anchors(step_events, truncate_after_flight),
     ):
         if (
             t_b <= t_a
             or not _same_camera_anchor_segment(camera_a, camera_b)
         ):
             continue
-        states = solver.solve_segment(t_a, foot_a, t_b, foot_b)
+        solved_segments.append((solver.solve_segment(t_a, foot_a, t_b, foot_b), t_a, t_b))
+
+    anchored_frames = sum(t_b - t_a + 1 for _, t_a, t_b in solved_segments)
+    swap_votes = sum(sum(states.values()) for states, _, _ in solved_segments)
+    if anchored_frames and swap_votes / anchored_frames > _DP_MAX_SWAP_FRACTION:
+        print(
+            f"  [leg DP] {swap_votes}/{anchored_frames} anchored frames would be swapped "
+            f"(> {_DP_MAX_SWAP_FRACTION:.0%}); anchors look unreliable, keeping pose-stage identity"
+        )
+        solved_segments = [
+            ({frame: 0 for frame in states}, t_a, t_b) for states, t_a, t_b in solved_segments
+        ]
+
+    swapped = np.zeros(frame_count, dtype=bool)
+    for states, t_a, t_b in solved_segments:
         _apply_leg_segment_states(kp, result, swapped, states, t_a, t_b)
 
     recon[0, :, :, :2] = result

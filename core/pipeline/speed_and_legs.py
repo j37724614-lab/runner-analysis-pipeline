@@ -262,9 +262,14 @@ def _correct_leg_identity(
     assert state.keypoints_npz is not None
     assert state.step_analysis is not None
 
+    long_jump = bool(
+        context.config.get("long_jump_final_landing")
+        or (context.config.get("running_long_jump") or {}).get("enabled")
+    )
     anchor_swapped_mask = apply_anchor_leg_correction(
         state.keypoints_npz,
         state.step_analysis["step_events"],
+        truncate_after_flight=long_jump,
     )
     return _sync_leg_identity_outputs(context, state, anchor_swapped_mask)
 

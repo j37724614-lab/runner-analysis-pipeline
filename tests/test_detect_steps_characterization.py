@@ -137,10 +137,14 @@ def test_low_confidence_touchdown_is_neither_kept_nor_rescued():
 
     events = detect_steps(rows, PIXEL_CAL, fps=60.0)
 
+    # The dropped touchdown at 36 leaves a 2x gap (24 -> 48).  Labels must keep
+    # the true stance foot after it (the synthetic lower_foot is right at 48);
+    # strict alternation used to flip every label after the gap.
     assert [(e["seq_frame"], e["foot"]) for e in events] == [
-        (12, "left"), (24, "right"), (48, "left"),
-        (60, "right"), (72, "left"), (84, "right"),
+        (12, "left"), (24, "right"), (48, "right"),
+        (60, "left"), (72, "right"), (84, "left"),
     ]
+    assert all(e["foot"] == rows[e["seq_frame"]]["lower_foot"] for e in events)
 
 
 def test_narrow_touchdown_in_flattened_stride_is_still_recovered():
